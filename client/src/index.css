@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+@font-face {
+    font-family: "Minecraftia";
+    src: url("/assets/fonts/Minecraftia.ttf") format("truetype");
+    font-weight: normal;
+    font-style: normal;
+    font-display: swap;
+}
+
+
+/* ВАЖНО: растягиваем и убираем любые внешние поля */
+
+html,
+body,
+#root {
+    height: 100%;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+
+/* Общая палитра и вспомогательные классы */
+
+:root {
+    --glass-bg: linear-gradient( to bottom right, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.08));
+    --glass-border: rgba(255, 255, 255, 0.18);
+    --panel: rgba(255, 255, 255, 0.06);
+}
+
+body {
+    color: #f3f4f6;
+}
+
+
+/* Фон всего приложения (без «рамок») */
+
+.app-bg {
+    background: radial-gradient(50% 40% at 20% 10%, rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0) 60%), radial-gradient(60% 50% at 80% 85%, rgba(255, 255, 255, 0.06), rgba(0, 0, 0, 0) 60%), linear-gradient(180deg, #0e0f12 0%, #0b0c0f 100%);
+}
+
+
+/* Стеклянные панели */
+
+.glass {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+    box-shadow: 0 12px 60px rgba(0, 0, 0, 0.48), inset 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.panel {
+    background: var(--panel);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(10px) saturate(140%);
+    -webkit-backdrop-filter: blur(10px) saturate(140%);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+}
+
+
+/* Прокрутка и drag-зоны */
+
+.scroll-thin::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+.scroll-thin::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.18);
+    border-radius: 9999px;
+}
+
+.drag {
+    -webkit-app-region: drag;
+}
+
+.no-drag {
+    -webkit-app-region: no-drag;
+}
