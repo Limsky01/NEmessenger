@@ -1,62 +1,64 @@
 {
-  "name": "lgm-client",
-  "version": "1.1.0",
-  "private": true,
-  "main": "electron/main.js",
-  "type": "module",
-  "scripts": {
-    "dev": "vite --strictPort --port 5173",
-    "start": "electron .",
-    "electron-dev": "concurrently -k -n vite,electron -c cyan,green \"vite --strictPort --port 5173\" \"npx wait-on http://localhost:5173 && npx cross-env ELECTRON_START_URL=http://localhost:5173 electron .\"",
-    "build": "vite build && electron-builder",
-    "postinstall": "electron-builder install-app-deps"
-  },
-  "dependencies": {
-    "axios": "^1.7.7",
-    "socket.io-client": "^4.7.5",
-    "zustand": "^4.5.2",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "styled-components": "^6.0.8",
-    "framer-motion": "^10.16.4",
-    "react-router-dom": "^6.16.0",
-    "react-icons": "^4.11.0"
-  },
-  "devDependencies": {
-    "electron": "^30.0.7",
-    "electron-builder": "^24.13.3",
-    "vite": "^5.4.7",
-    "tailwindcss": "^3.4.9",
-    "postcss": "^8.4.44",
-    "autoprefixer": "^10.4.20",
-    "concurrently": "^8.2.2",
-    "cross-env": "^7.0.3",
-    "wait-on": "^7.2.0"
-  },
-  "build": {
-    "appId": "com.example.lgm",
-    "productName": "Liquid Glass Messenger",
-    "files": [
-      "dist/**",
-      "electron/**",
-      "assets/**",
-      "package.json"
-    ],
+    "name": "lgm-client",
+    "version": "0.0.3",
+    "private": true,
+    "main": "electron/main.js",
+    "type": "module",
+    "scripts": {
+        "dev": "vite --strictPort --port 5173",
+        "start": "electron .",
+        "electron-dev": "concurrently -k -n vite,electron -c cyan,green \"vite --strictPort --port 5173\" \"npx wait-on http://localhost:5173 && npx cross-env ELECTRON_START_URL=http://localhost:5173 electron .\"",
+        "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder -w",
+        "release": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder -w --publish always"
+    },
+    "dependencies": {
+        "axios": "^1.7.7",
+        "electron-updater": "^6.6.2",
+        "framer-motion": "^11.2.6",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "socket.io-client": "^4.7.5",
+        "tweetnacl": "^1.0.3",
+        "tweetnacl-util": "^0.15.1",
+        "zustand": "^4.5.2"
+    },
+    "devDependencies": {
+        "autoprefixer": "^10.4.20",
+        "concurrently": "^8.2.2",
+        "cross-env": "^7.0.3",
+        "electron": "^30.0.7",
+        "electron-builder": "^24.13.3",
+        "postcss": "^8.4.44",
+        "tailwindcss": "^3.4.9",
+        "vite": "^5.4.7",
+        "wait-on": "^7.2.0"
+    },
+    "build": {
+        "appId": "com.NEmesenger.lgm",
+        "productName": "NE Messenger",
+        "files": ["dist/**", "electron/**", "assets/**", "package.json"],
+        "asar": true,
+        "win": { "target": ["nsis"] },
+        "publish": [{
+            "provider": "github",
+            "owner": "limsky01",
+            "repo": "liquid-glass-messenger"
+        }]
+    },
     "asar": true,
     "mac": {
-      "target": [
-        "dmg"
-      ]
+        "target": [
+            "dmg"
+        ]
     },
     "win": {
-      "target": [
-        "nsis"
-      ]
+        "target": [
+            "nsis"
+        ]
     },
     "linux": {
-      "target": [
-        "AppImage"
-      ]
+        "target": [
+            "AppImage"
+        ]
     }
-  }
 }
