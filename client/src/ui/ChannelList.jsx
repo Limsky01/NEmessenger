@@ -10,8 +10,8 @@ export default function ChannelList(){
   return (
     <div className="w-[280px] border-r border-white/10 bg-white/5 backdrop-blur-md h-full flex flex-col">
       <div className="p-4 panel sticky top-0">
-        <div className="text-[13px] tracking-widest opacity-80">HOME</div>
-        <div className="text-xs text-white/60">Channels</div>
+        <div className="text-[13px] tracking-widest opacity-80">ГЛАВНАЯ</div>
+        <div className="text-xs text-white/60">Каналы</div>
       </div>
       <div className="px-3 py-3 overflow-y-auto scroll-thin space-y-2">
         {channels.map(ch=>{
@@ -50,20 +50,21 @@ function E2EEControls({ channelId }){
     return b64
   }
   const save = ()=>{
-    const input = prompt('Enter shared channel key (Base64). Leave empty to generate a new one.', '')
+    const input = prompt('Введите общий ключ канала (Base64). Оставьте поле пустым, чтобы создать новый.', '')
     const value = input && input.trim().length ? input.trim() : gen()
     setKey(channelId, value)
-    alert('Key set for this channel. Share it securely with peers.')
+    alert('Ключ установлен для этого канала. Передайте его собеседникам безопасным способом.')
   }
   const show = ()=>{
-    const val = getKey(channelId) || '(none)'
-    alert('Channel key: '+val)
+    const val = getKey(channelId) || 'отсутствует'
+    alert('Ключ канала: '+val)
   }
   return (
     <div className="flex items-center gap-2 text-xs">
-      <button onClick={save} className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20">Set/Generate key</button>
-      <button onClick={show} className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20">Show key</button>
-      <span className="text-white/60">E2EE is client-side. Server stores ciphertext.</span>
+      <button onClick={save} className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20">Установить ключ</button>
+      <button onClick={show} className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20">Показать ключ</button>
+      <span className="text-white/60">Конечное шифрование выполняется на клиенте. Сервер хранит только зашифрованные данные.</span>
     </div>
   )
 }
+

@@ -1,6 +1,6 @@
 {
-    "name": "lgm-client",
-    "version": "0.0.3",
+    "name": "NE-client",
+    "version": "0.1.2",
     "private": true,
     "main": "electron/main.js",
     "type": "module",
@@ -8,8 +8,9 @@
         "dev": "vite --strictPort --port 5173",
         "start": "electron .",
         "electron-dev": "concurrently -k -n vite,electron -c cyan,green \"vite --strictPort --port 5173\" \"npx wait-on http://localhost:5173 && npx cross-env ELECTRON_START_URL=http://localhost:5173 electron .\"",
-        "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder -w",
-        "release": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder -w --publish always"
+        "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && electron-builder -w",
+        "release": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && electron-builder -w --publish always",
+        "build": "vite build"
     },
     "dependencies": {
         "axios": "^1.7.7",
@@ -36,14 +37,28 @@
     "build": {
         "appId": "com.NEmesenger.lgm",
         "productName": "NE Messenger",
-        "files": ["dist/**", "electron/**", "assets/**", "package.json"],
+        "files": [
+            "renderer/**",
+            "electron/**",
+            "assets/**",
+            "package.json"
+        ],
         "asar": true,
-        "win": { "target": ["nsis"] },
-        "publish": [{
-            "provider": "github",
-            "owner": "limsky01",
-            "repo": "liquid-glass-messenger"
-        }]
+        "win": {
+            "target": [
+                "nsis"
+            ]
+        },
+        "publish": [
+            {
+                "provider": "github",
+                "owner": "limsky01",
+                "repo": "liquid-glass-messenger"
+            }
+        ],
+        "directories": {
+            "output": "release"
+        }
     },
     "asar": true,
     "mac": {

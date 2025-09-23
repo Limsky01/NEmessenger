@@ -7,6 +7,55 @@ import * as u8 from 'tweetnacl-util'
 const encoder = new TextEncoder()
 const storageKeyForChannel = (cid) => `chkey:${cid}`
 
+export const buildDirectChannelId = (a, b) => {
+  if (!a || !b) return null
+  const [first, second] = [a, b].sort()
+  return `dm:${first}:${second}`
+}
+
+const parseDirectChannelId = (channelId) => {
+  if (!channelId || typeof channelId !== 'string') return null
+  if (!channelId.startsWith('dm:')) return null
+  const parts = channelId.split(':')
+  if (parts.length !== 3) return null
+  const [, rawA, rawB] = parts
+  if (!rawA || !rawB) return null
+  const [first, second] = [rawA, rawB].sort()
+  return { first, second }
+}
+
+const peerFromDirectChannel = (channelId, selfId) => {
+  if (!selfId) return null
+  const parsed = parseDirectChannelId(channelId)
+  if (!parsed) return null
+  if (parsed.first === selfId) return parsed.second
+  if (parsed.second === selfId) return parsed.first
+  return null
+}
+
+const normalizeUser = (raw) => {
+  if (!raw) return null
+  return {
+    id: raw.id,
+    username: raw.username,
+    role: raw.role,
+    avatarSeed: raw.avatarSeed ?? raw.avatar_seed ?? '',
+    avatarUrl: raw.avatarUrl ?? raw.avatar_url ?? '',
+    avatarUpdatedAt: raw.avatarUpdatedAt ?? raw.avatar_updated_at ?? 0,
+  }
+}
+
+const normalizeFileMeta = (raw) => {
+  if (!raw) return null
+  const name = raw.name ?? raw.originalName ?? raw.original_name ?? raw.filename ?? 'file'
+  return {
+    id: raw.id,
+    name,
+    mime: raw.mime || raw.type || '',
+    size: raw.size ?? 0,
+  }
+}
+
 const deriveKey = (cid) => {
   if (!cid) return null
   const source = encoder.encode(String(cid))
@@ -20,10 +69,7 @@ const deriveKey = (cid) => {
 
 const enc = {
   setKeyForChannel: (cid, keyStr) => localStorage.setItem(storageKeyForChannel(cid), keyStr),
-  getKeyForChannel: (cid) => {
-    const stored = localStorage.getItem(storageKeyForChannel(cid))
-    return stored || deriveKey(cid)
-  },
+  getKeyForChannel: (cid) => localStorage.getItem(storageKeyForChannel(cid)) || deriveKey(cid),
   ensureKey: (cid) => {
     if (!cid) return null
     const keyName = storageKeyForChannel(cid)
@@ -47,9 +93,9 @@ const enc = {
     const keyStr = enc.ensureKey(cid)
     if (!keyStr) return '[Encrypted]'
     try {
-      const [, nB, bB] = payload.split(':')
-      const nonce = u8.decodeBase64(nB)
-      const box = u8.decodeBase64(bB)
+      const [, nonceB, boxB] = payload.split(':')
+      const nonce = u8.decodeBase64(nonceB)
+      const box = u8.decodeBase64(boxB)
       const key = u8.decodeBase64(keyStr)
       const opened = nacl.secretbox.open(box, nonce, key)
       return opened ? u8.encodeUTF8(opened) : '[Decryption failed]'
@@ -58,14 +104,30 @@ const enc = {
       return '[Decryption failed]'
     }
   },
-  generateKey: () => u8.encodeBase64(nacl.randomBytes(32))
 }
+
+const formatMessage = (fallbackChannelId) => (raw) => {
+  if (!raw) return null
+  const channelId = raw.channelId ?? raw.channel_id ?? fallbackChannelId
+  const senderId = raw.senderId ?? raw.sender_id ?? raw.user_id ?? null
+  const createdAt = raw.createdAt ?? raw.created_at ?? Date.now()
+  return {
+    id: raw.id,
+    channelId,
+    senderId,
+    createdAt,
+    content: enc.decrypt(channelId, raw.content),
+  }
+}
+
+const buildAuthHeaders = (token) => ({ Authorization: `Bearer ${token}` })
 
 const useStore = create((set, get) => ({
   serverUrl: import.meta.env.VITE_LGM_SERVER || 'http://localhost:4000',
   token: null,
   user: null,
   users: [],
+  view: 'chat',
   socket: null,
   workspaces: [],
   channels: [],
@@ -75,112 +137,308 @@ const useStore = create((set, get) => ({
   onlineUserIds: [],
   historyLoading: {},
   historyComplete: {},
-  setAuth: (token, user) => set({ token, user }),
+  directPeers: {},
+  files: {},
+
+  setAuth: (token, user) => set((state) => {
+    const normalized = normalizeUser(user)
+    let list = state.users
+    if (normalized) {
+      const exists = list.some((u) => u.id === normalized.id)
+      list = exists ? list.map((u) => (u.id === normalized.id ? normalized : u)) : [...list, normalized]
+    }
+    return {
+      token,
+      user: normalized,
+      users: list,
+      view: 'chat',
+    }
+  }),
+  setView: (view) => set({ view }),
+  openProfile: () => set({ view: 'profile' }),
+  openChat: () => set({ view: 'chat' }),
   setChannelKey: (cid, keyStr) => enc.setKeyForChannel(cid, keyStr),
   getChannelKey: (cid) => enc.getKeyForChannel(cid),
+  buildAvatarUrl: (user) => {
+    if (!user?.avatarUrl) return null
+    try {
+      const server = get().serverUrl
+      const base = server.endsWith('/') ? server : server + '/'
+      const url = new URL(user.avatarUrl, base)
+      if (user.avatarUpdatedAt) url.searchParams.set('v', user.avatarUpdatedAt)
+      return url.toString()
+    } catch (err) {
+      console.error('avatar url build failed', err)
+      return null
+    }
+  },
 
   connect: async () => {
     const token = get().token
+    if (!token) return
     const server = get().serverUrl
-    const s = io(server, { auth: { token } })
-    set({ socket: s })
-    s.on('connect', async () => {
-      s.emit('init:request', {})
-      const users = await axios.get(`${server}/api/users`, { headers: { Authorization: `Bearer ${get().token}` } })
-      set({ users: users.data.users })
+    const socket = io(server, { auth: { token } })
+    set({ socket })
+
+    socket.on('connect', async () => {
+      socket.emit('init:request', {})
+      try {
+        const { data } = await axios.get(`${server}/api/users`, { headers: buildAuthHeaders(get().token) })
+        const normalized = (data.users || []).map(normalizeUser).filter(Boolean)
+        set((state) => {
+          const current = state.user ? normalized.find((u) => u.id === state.user.id) || state.user : state.user
+          return { users: normalized, user: current }
+        })
+      } catch (err) {
+        console.error('users fetch failed', err)
+      }
     })
-    s.on('init:response', ({ workspaces, channels, activeChannelId, messages }) => {
-      const dec = (m) => ({ ...m, content: enc.decrypt(activeChannelId, m.content) })
+
+    socket.on('init:response', ({ workspaces, channels, activeChannelId, messages }) => {
+      const normalize = formatMessage(activeChannelId)
       set({
         workspaces,
         channels,
         activeChannelId,
-        messages: activeChannelId ? { [activeChannelId]: messages.map(dec) } : {},
+        messages: activeChannelId ? { [activeChannelId]: messages.map(normalize).filter(Boolean) } : {},
         unread: {},
         historyComplete: activeChannelId ? { [activeChannelId]: messages.length < 50 } : {},
-        historyLoading: {}
+        historyLoading: {},
       })
     })
-    s.on('channel:opened', ({ channelId, messages }) => {
-      const dec = (m) => ({ ...m, content: enc.decrypt(channelId, m.content) })
-      set((st) => ({
-        activeChannelId: channelId,
-        messages: { ...st.messages, [channelId]: messages.map(dec) },
-        unread: { ...st.unread, [channelId]: 0 },
-        historyLoading: { ...st.historyLoading, [channelId]: false },
-        historyComplete: { ...st.historyComplete, [channelId]: messages.length < 50 }
-      }))
+
+    socket.on('channel:opened', ({ channelId, messages }) => {
+      const normalize = formatMessage(channelId)
+      set((state) => {
+        const payload = {
+          activeChannelId: channelId,
+          messages: { ...state.messages, [channelId]: messages.map(normalize).filter(Boolean) },
+          unread: { ...state.unread, [channelId]: 0 },
+          historyLoading: { ...state.historyLoading, [channelId]: false },
+          historyComplete: { ...state.historyComplete, [channelId]: messages.length < 50 },
+        }
+        if (channelId?.startsWith('dm:')) {
+          const peerId = peerFromDirectChannel(channelId, state.user?.id)
+          if (peerId) payload.directPeers = { ...state.directPeers, [channelId]: peerId }
+        }
+        return payload
+      })
     })
-    s.on('messages:page', ({ channelId, messages, limit = 50 }) => {
-      const dec = messages.map((m) => ({ ...m, content: enc.decrypt(channelId, m.content) }))
-      set((st) => {
-        const existing = st.messages[channelId] || []
+
+    socket.on('messages:page', ({ channelId, messages, limit = 50 }) => {
+      const page = messages.map(formatMessage(channelId)).filter(Boolean)
+      set((state) => {
+        const existing = state.messages[channelId] || []
         const known = new Set(existing.map((m) => m.id))
-        const merged = [...dec.filter((m) => !known.has(m.id)), ...existing]
+        const merged = [...page.filter((m) => !known.has(m.id)), ...existing]
+        const payload = {
+          messages: { ...state.messages, [channelId]: merged },
+          historyLoading: { ...state.historyLoading, [channelId]: false },
+          historyComplete: { ...state.historyComplete, [channelId]: page.length < limit },
+        }
+        if (channelId?.startsWith('dm:')) {
+          const peerId = peerFromDirectChannel(channelId, state.user?.id)
+          if (peerId) payload.directPeers = { ...state.directPeers, [channelId]: peerId }
+        }
+        return payload
+      })
+    })
+
+    socket.on('message:new', (payload) => {
+      const normalized = formatMessage(payload.channelId)(payload)
+      if (!normalized) return
+      set((state) => {
+        const arr = state.messages[payload.channelId] || []
+        const isActive = state.activeChannelId === payload.channelId
+        const nextUnread = isActive ? 0 : (state.unread[payload.channelId] || 0) + 1
+        const result = {
+          messages: { ...state.messages, [payload.channelId]: [...arr, normalized] },
+          unread: { ...state.unread, [payload.channelId]: nextUnread },
+        }
+        if (payload.channelId?.startsWith('dm:')) {
+          const peerId = peerFromDirectChannel(payload.channelId, state.user?.id)
+          if (peerId) result.directPeers = { ...state.directPeers, [payload.channelId]: peerId }
+        }
+        return result
+      })
+    })
+
+    socket.on('message:deleted', ({ id, channelId }) => {
+      if (!id || !channelId) return
+      set((state) => {
+        const existing = state.messages[channelId] || []
+        const filtered = existing.filter((m) => m.id !== id)
+        if (filtered.length === existing.length) return state
+        const unread = { ...state.unread }
+        if (state.activeChannelId !== channelId) {
+          unread[channelId] = Math.max(0, (unread[channelId] || 0) - 1)
+        }
         return {
-          messages: { ...st.messages, [channelId]: merged },
-          historyLoading: { ...st.historyLoading, [channelId]: false },
-          historyComplete: { ...st.historyComplete, [channelId]: dec.length < limit }
+          messages: { ...state.messages, [channelId]: filtered },
+          unread,
         }
       })
     })
-    s.on('message:new', (m) => {
-      const dec = { ...m, content: enc.decrypt(m.channelId, m.content) }
-      set((st) => {
-        const arr = st.messages[m.channelId] || []
-        const isActive = st.activeChannelId === m.channelId
-        return {
-          messages: { ...st.messages, [m.channelId]: [...arr, dec] },
-          unread: { ...st.unread, [m.channelId]: isActive ? 0 : (st.unread[m.channelId] || 0) + 1 }
-        }
+
+    socket.on('user:update', (payload) => {
+      const normalized = normalizeUser(payload)
+      if (!normalized) return
+      set((state) => {
+        const users = state.users.some((u) => u.id === normalized.id)
+          ? state.users.map((u) => (u.id === normalized.id ? { ...u, ...normalized } : u))
+          : [...state.users, normalized]
+        const user = state.user?.id === normalized.id ? { ...state.user, ...normalized } : state.user
+        return { users, user }
       })
     })
-    s.on('presence:update', ({ onlineUserIds }) => set({ onlineUserIds }))
-  },
-  switchChannel: (channelId) => {
-    const s = get().socket
-    if (!s || !channelId) return
-    set((st) => ({
-      activeChannelId: channelId,
-      unread: { ...st.unread, [channelId]: 0 }
-    }))
-    s.emit('channel:switch', { channelId })
-  },
-  sendMessage: (content) => {
-    const s = get().socket
-    const cid = get().activeChannelId
-    if (!s || !cid || !content.trim()) return
-    const encrypted = enc.encrypt(cid, content.trim())
-    s.emit('message:send', { channelId: cid, content: encrypted })
-  },
-  loadMore: () => {
-    const s = get().socket
-    const cid = get().activeChannelId
-    if (!s || !cid) return
-    const { historyLoading, historyComplete, messages } = get()
-    if (historyLoading[cid] || historyComplete[cid]) return
-    const cur = (messages[cid] || []).length
-    set((st) => ({ historyLoading: { ...st.historyLoading, [cid]: true } }))
-    s.emit('messages:load', { channelId: cid, limit: 50, offset: cur })
+
+    socket.on('presence:update', ({ onlineUserIds }) => set({ onlineUserIds }))
   },
 
-  // Admin
+  switchChannel: (channelId) => {
+    const socket = get().socket
+    if (!socket || !channelId) return
+    set((state) => ({
+      activeChannelId: channelId,
+      unread: { ...state.unread, [channelId]: 0 },
+      view: 'chat',
+    }))
+    socket.emit('channel:switch', { channelId })
+  },
+
+  openDirectChat: (userId) => {
+    const socket = get().socket
+    const me = get().user
+    if (!socket || !me?.id || !userId || userId === me.id) return
+    const channelId = buildDirectChannelId(me.id, userId)
+    set((state) => ({
+      activeChannelId: channelId,
+      unread: { ...state.unread, [channelId]: 0 },
+      directPeers: { ...state.directPeers, [channelId]: userId },
+      view: 'chat',
+    }))
+    socket.emit('channel:switch', { channelId })
+  },
+
+  sendMessage: (content) => {
+    const socket = get().socket
+    const channelId = get().activeChannelId
+    if (!socket || !channelId || !content.trim()) return
+    const encrypted = enc.encrypt(channelId, content.trim())
+    socket.emit('message:send', { channelId, content: encrypted })
+  },
+
+  deleteMessage: async (messageId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    await axios.delete(`${get().serverUrl}/api/messages/${messageId}`, { headers: buildAuthHeaders(token) })
+  },
+
+  loadMore: () => {
+    const socket = get().socket
+    const channelId = get().activeChannelId
+    if (!socket || !channelId) return
+    const { historyLoading, historyComplete, messages } = get()
+    if (historyLoading[channelId] || historyComplete[channelId]) return
+    const offset = (messages[channelId] || []).length
+    set((state) => ({ historyLoading: { ...state.historyLoading, [channelId]: true } }))
+    socket.emit('messages:load', { channelId, limit: 50, offset })
+  },
+
+  updateAvatar: async (file) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!file) throw new Error('invalid_avatar')
+    const form = new FormData()
+    form.append('avatar', file)
+    const server = get().serverUrl
+    const endpoint = server.endsWith('/') ? server + 'api/profile/avatar' : server + '/api/profile/avatar'
+    const { data } = await axios.post(
+      endpoint,
+      form,
+      { headers: buildAuthHeaders(token) },
+    )
+    const updated = normalizeUser(data.user ?? data)
+    set((state) => ({
+      user: state.user?.id === updated.id ? updated : state.user,
+      users: state.users.some((u) => u.id === updated.id)
+        ? state.users.map((u) => (u.id === updated.id ? updated : u))
+        : [...state.users, updated],
+    }))
+    return updated
+  },
+
+  changePassword: async (currentPassword, newPassword) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    await axios.post(
+      `${get().serverUrl}/api/profile/password`,
+      { currentPassword, newPassword },
+      { headers: buildAuthHeaders(token) },
+    )
+  },
+
+  // Admin helpers
   fetchFiles: async () => {
-    const { data } = await axios.get(`${get().serverUrl}/api/admin/files`, { headers: { Authorization: `Bearer ${get().token}` } })
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.get(`${get().serverUrl}/api/admin/files`, { headers: buildAuthHeaders(token) })
     return data.files
   },
   deleteFile: async (id) => {
-    await axios.delete(`${get().serverUrl}/api/admin/files/${id}`, { headers: { Authorization: `Bearer ${get().token}` } })
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    await axios.delete(`${get().serverUrl}/api/admin/files/${id}`, { headers: buildAuthHeaders(token) })
   },
   deleteUser: async (id) => {
-    await axios.delete(`${get().serverUrl}/api/admin/users/${id}`, { headers: { Authorization: `Bearer ${get().token}` } })
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    await axios.delete(`${get().serverUrl}/api/admin/users/${id}`, { headers: buildAuthHeaders(token) })
+  },
+
+  registerFileMeta: (file) => {
+    const normalized = normalizeFileMeta(file)
+    if (!normalized) return normalized
+    set((state) => ({ files: { ...state.files, [normalized.id]: normalized } }))
+    return normalized
+  },
+
+  ensureFileMeta: async (fileId) => {
+    if (!fileId) return null
+    const existing = get().files[fileId]
+    if (existing) return existing
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.get(`${get().serverUrl}/api/files/${fileId}/meta`, {
+      headers: buildAuthHeaders(token),
+    })
+    const normalized = normalizeFileMeta(data.file)
+    if (normalized) {
+      set((state) => ({ files: { ...state.files, [normalized.id]: normalized } }))
+    }
+    return normalized
+  },
+
+  buildFileUrl: (fileId, { inline = false } = {}) => {
+    const { serverUrl, token } = get()
+    if (!token || !fileId) return null
+    const path = inline ? `/api/files/${fileId}/view` : `/api/files/${fileId}`
+    const url = new URL(path, serverUrl.endsWith('/') ? serverUrl : `${serverUrl}/`)
+    url.searchParams.set('token', token)
+    return url.toString()
   },
 
   // Upload (chunked)
   uploadFile: async (file, onProgress) => {
     const server = get().serverUrl
     const token = get().token
-    const init = await axios.post(`${server}/api/upload/init`, { filename: file.name, size: file.size, mime: file.type }, { headers: { Authorization: `Bearer ${token}` } })
+    if (!token) throw new Error('not_authenticated')
+    const headers = buildAuthHeaders(token)
+    const init = await axios.post(
+      `${server}/api/upload/init`,
+      { filename: file.name, size: file.size, mime: file.type },
+      { headers },
+    )
     const id = init.data.uploadId
     const chunkSize = 10 * 1024 * 1024
     let uploaded = 0
@@ -191,13 +449,35 @@ const useStore = create((set, get) => ({
       form.append('chunk', slice)
       form.append('uploadId', id)
       form.append('index', String(idx))
-      await fetch(`${server}/api/upload/chunk`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form })
+      await fetch(`${server}/api/upload/chunk`, {
+        method: 'POST',
+        headers: { Authorization: headers.Authorization },
+        body: form,
+      })
       uploaded += slice.size
       idx += 1
-      onProgress && onProgress(Math.round((uploaded / file.size) * 100))
+      if (onProgress) onProgress(Math.round((uploaded / file.size) * 100))
     }
-    const done = await axios.post(`${server}/api/upload/complete`, { uploadId: id, filename: file.name, mime: file.type }, { headers: { Authorization: `Bearer ${token}` } })
-    return done.data.fileId
-  }
+    const done = await axios.post(
+      `${server}/api/upload/complete`,
+      { uploadId: id, filename: file.name, mime: file.type },
+      { headers },
+    )
+    const filePayload = done.data.file || { id: done.data.fileId, name: file.name, mime: file.type, size: file.size }
+    const normalized = normalizeFileMeta(filePayload)
+    if (normalized) {
+      set((state) => ({ files: { ...state.files, [normalized.id]: normalized } }))
+    }
+    return normalized
+  },
 }))
+
 export default useStore
+
+
+
+
+
+
+
+

@@ -1,0 +1,221 @@
+import React, { useEffect, useRef, useState } from 'react'
+import useStore from '../state/store.js'
+import AvatarImage from './AvatarImage.jsx'
+
+export default function Profile() {
+  const user = useStore((s) => s.user)
+  const openChat = useStore((s) => s.openChat)
+  const updateAvatar = useStore((s) => s.updateAvatar)
+  const changePassword = useStore((s) => s.changePassword)
+  const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
+
+  const roleLabel = user?.role === 'admin' ? 'Администратор' : 'Пользователь'
+  const fileInputRef = useRef(null)
+  const [avatarFile, setAvatarFile] = useState(null)
+  const [avatarPreview, setAvatarPreview] = useState(null)
+  const [avatarStatus, setAvatarStatus] = useState(null)
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [passwordStatus, setPasswordStatus] = useState(null)
+
+  useEffect(() => () => {
+    if (avatarPreview) URL.revokeObjectURL(avatarPreview)
+  }, [avatarPreview])
+
+  const handleAvatarSelect = (event) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    if (!file.type?.startsWith('image/')) {
+      setAvatarStatus({ type: 'error', message: 'Можно выбрать только изображение' })
+      return
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setAvatarStatus({ type: 'error', message: 'Размер изображения не должен превышать 5 МБ' })
+      return
+    }
+    if (avatarPreview) URL.revokeObjectURL(avatarPreview)
+    setAvatarFile(file)
+    setAvatarPreview(URL.createObjectURL(file))
+    setAvatarStatus(null)
+  }
+
+  const handleAvatarSubmit = async (event) => {
+    event.preventDefault()
+    if (!avatarFile) {
+      setAvatarStatus({ type: 'error', message: 'Сначала выберите изображение' })
+      return
+    }
+    setAvatarStatus(null)
+    try {
+      await updateAvatar(avatarFile)
+      if (avatarPreview) {
+        URL.revokeObjectURL(avatarPreview)
+        setAvatarPreview(null)
+      }
+      setAvatarFile(null)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+      setAvatarStatus({ type: 'success', message: 'Аватар обновлён' })
+    } catch (err) {
+      console.error(err)
+      const code = err?.response?.data?.error
+      const message =
+        code === 'avatar_too_large'
+          ? 'Размер изображения не должен превышать 5 МБ'
+          : 'Не удалось обновить аватар'
+      setAvatarStatus({ type: 'error', message })
+    }
+  }
+
+  const handleAvatarReset = () => {
+    if (avatarPreview) URL.revokeObjectURL(avatarPreview)
+    setAvatarPreview(null)
+    setAvatarFile(null)
+    setAvatarStatus(null)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  const handlePasswordSubmit = async (event) => {
+    event.preventDefault()
+    setPasswordStatus(null)
+    if (!newPassword || newPassword.length < 6) {
+      setPasswordStatus({ type: 'error', message: 'Пароль должен содержать не менее 6 символов' })
+      return
+    }
+    try {
+      await changePassword(currentPassword, newPassword)
+      setCurrentPassword('')
+      setNewPassword('')
+      setPasswordStatus({ type: 'success', message: 'Пароль успешно изменён' })
+    } catch (err) {
+      console.error(err)
+      const code = err?.response?.data?.error
+      const message =
+        code === 'invalid_current_password'
+          ? 'Неверный текущий пароль'
+          : 'Не удалось изменить пароль'
+      setPasswordStatus({ type: 'error', message })
+    }
+  }
+
+  if (!user) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-white/60">
+        Профиль недоступен
+      </div>
+    )
+  }
+
+  const persistentAvatarSrc = buildAvatarUrl?.(user) || null
+  const previewSrc = avatarPreview || persistentAvatarSrc
+
+  return (
+    <div className="flex-1 h-full overflow-y-auto p-10 space-y-8 text-sm">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <AvatarImage user={user} size={72} src={previewSrc} />
+          <div>
+            <div className="text-2xl font-semibold">Профиль</div>
+            <div className="text-white/60">Управление учётной записью</div>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={openChat}
+          className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+        >
+          Вернуться в чат
+        </button>
+      </div>
+
+      <section className="panel rounded-3xl px-6 py-5 space-y-4">
+        <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Аккаунт</div>
+        <div className="grid gap-2 text-white/80">
+          <div><span className="text-white/40">Имя пользователя:</span> @{user.username}</div>
+          <div><span className="text-white/40">ID:</span> {user.id}</div>
+          <div><span className="text-white/40">Роль:</span> {roleLabel}</div>
+        </div>
+      </section>
+
+      <section className="panel rounded-3xl px-6 py-5 space-y-4">
+        <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Аватар</div>
+        <form onSubmit={handleAvatarSubmit} className="space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+            <AvatarImage user={user} size={108} src={previewSrc} className="flex-shrink-0" />
+            <div className="space-y-2 text-white/60 text-xs sm:text-sm">
+              <p>Выберите изображение в формате JPG, PNG или WEBP. Максимальный размер — 5 МБ.</p>
+              {avatarFile && <p className="text-white/70 text-sm">Выбрано: {avatarFile.name}</p>}
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-4 py-2 rounded-2xl bg-white/15 hover:bg-white/25 transition"
+                >
+                  Выбрать изображение
+                </button>
+                <button
+                  type="submit"
+                  disabled={!avatarFile}
+                  className="px-4 py-2 rounded-2xl bg-white/20 hover:bg-white/30 transition disabled:opacity-50"
+                >
+                  Сохранить аватар
+                </button>
+                {avatarFile && (
+                  <button
+                    type="button"
+                    onClick={handleAvatarReset}
+                    className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+                  >
+                    Отменить выбор
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+          {avatarStatus && (
+            <div className={avatarStatus.type === 'success' ? 'text-emerald-400 text-xs' : 'text-red-400 text-xs'}>
+              {avatarStatus.message}
+            </div>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={handleAvatarSelect}
+          />
+        </form>
+      </section>
+
+      <section className="panel rounded-3xl px-6 py-5 space-y-4">
+        <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Пароль</div>
+        <form onSubmit={handlePasswordSubmit} className="space-y-3">
+          <input
+            type="password"
+            value={currentPassword}
+            onChange={(e) => setCurrentPassword(e.target.value)}
+            className="w-full rounded-2xl px-4 py-2 bg-white/10 outline-none"
+            placeholder="Текущий пароль"
+          />
+          <input
+            type="password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            className="w-full rounded-2xl px-4 py-2 bg-white/10 outline-none"
+            placeholder="Новый пароль"
+          />
+          {passwordStatus && (
+            <div className={passwordStatus.type === 'success' ? 'text-emerald-400 text-xs' : 'text-red-400 text-xs'}>
+              {passwordStatus.message}
+            </div>
+          )}
+          <button
+            type="submit"
+            className="px-4 py-2 rounded-2xl bg-white/20 hover:bg-white/30 transition"
+          >
+            Сохранить пароль
+          </button>
+        </form>
+      </section>
+    </div>
+  )
+}

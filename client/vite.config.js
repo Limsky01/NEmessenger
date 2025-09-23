@@ -4,7 +4,7 @@ import tailwind from 'tailwindcss'
 import autoprefixer from 'autoprefixer'
 export default defineConfig({
   root: '.', base: './',
-  build: { outDir: 'dist', emptyOutDir: true },
+  build: { outDir: 'renderer', emptyOutDir: true },
   resolve: { alias: { '@': path.resolve(__dirname, 'src') } },
   css: { postcss: { plugins: [tailwind(), autoprefixer()] } }
 })

@@ -1,14 +1,14 @@
-let contextBridge, ipcRenderer;
-try {
-    ({ contextBridge, ipcRenderer } = require('electron')) } catch (_) {}
-if (!contextBridge) {
-    const electron = await
-    import ('electron');
-    contextBridge = electron.contextBridge;
-    ipcRenderer = electron.ipcRenderer;
-}
+const { contextBridge, ipcRenderer } = require('electron')
+
 contextBridge.exposeInMainWorld('electronAPI', {
-    minimize: () => ipcRenderer.send('window:minimize'),
-    maximize: () => ipcRenderer.send('window:maximize'),
-    close: () => ipcRenderer.send('window:close'),
-});
+  minimize: () => ipcRenderer.send('window:minimize'),
+  toggleMaximize: () => ipcRenderer.send('window:toggle-maximize'),
+  close: () => ipcRenderer.send('window:close'),
+  getWindowState: () => ipcRenderer.invoke('window:get-state'),
+  onWindowState: (callback) => {
+    if (typeof callback !== 'function') return () => {}
+    const handler = (_event, state) => callback(state)
+    ipcRenderer.on('window:state', handler)
+    return () => ipcRenderer.removeListener('window:state', handler)
+  },
+})

@@ -1,0 +1,6 @@
+client/dist/
+client/release/
+client/renderer/
+server/uploads/
+server/messenger_v4.db*
+*.exe
