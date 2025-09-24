@@ -42,6 +42,8 @@ const resolveEncryptionKey = () => {
 
 const DATA_ENCRYPTION_KEY = resolveEncryptionKey()
 const ENCRYPTED_PREFIX = 'ENC1:'
+const INVITE_CODE_LENGTH = 10
+const INVITE_DEFAULT_TTL = parseInt(process.env.INVITE_TTL_MS || '', 10) || 1000 * 60 * 60 * 24 * 7
 
 const encryptText = (plain) => {
   const text = typeof plain === 'string' ? plain : String(plain ?? '')
@@ -207,6 +209,17 @@ CREATE TABLE IF NOT EXISTS voice_rooms (
   created_at INTEGER NOT NULL,
   created_by TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS invites (
+  id TEXT PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  claim_token TEXT DEFAULT '',
+  claimed_at INTEGER,
+  used_by TEXT,
+  used_at INTEGER
+);
 `)
 
 try {
@@ -227,6 +240,18 @@ try {
 try {
   db.prepare('ALTER TABLE files ADD COLUMN auth_tag TEXT DEFAULT ""').run()
 } catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN claim_token TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN claimed_at INTEGER').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN used_by TEXT').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN used_at INTEGER').run()
+} catch (err) {}
 
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
@@ -239,6 +264,13 @@ const listVoiceRoomsStmt = db.prepare('SELECT id, name, created_at, created_by F
 const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
 const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
 const selectVoiceRoomStmt = db.prepare('SELECT id, name FROM voice_rooms WHERE id=?')
+const insertInviteStmt = db.prepare('INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at) VALUES (?,?,?,?,?,?,NULL,NULL,NULL)')
+const selectInviteByCodeStmt = db.prepare('SELECT * FROM invites WHERE code=?')
+const selectInviteByIdStmt = db.prepare('SELECT * FROM invites WHERE id=?')
+const listInvitesByCreatorStmt = db.prepare('SELECT * FROM invites WHERE created_by=? ORDER BY created_at DESC')
+const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, claimed_at=? WHERE id=?')
+const clearInviteClaimStmt = db.prepare('UPDATE invites SET claim_token="", claimed_at=NULL WHERE id=?')
+const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='' WHERE id=?")
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
 
@@ -787,6 +819,36 @@ const emitVoiceRoomsUpdate = () => {
   cachedVoiceRooms = listVoiceRoomsStmt.all()
   io.emit('voice:rooms:update', { rooms: cachedVoiceRooms.map(formatVoiceRoom) })
 }
+
+const generateInviteCode = (length = INVITE_CODE_LENGTH) => {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  const bytes = crypto.randomBytes(length)
+  let code = ''
+  for (let i = 0; i < length; i += 1) {
+    code += alphabet[bytes[i] % alphabet.length]
+  }
+  return code
+}
+
+const getInviteStatus = (invite) => {
+  const now = Date.now()
+  if (invite.used_by) return 'used'
+  if (invite.expires_at && invite.expires_at < now) return 'expired'
+  if (invite.claim_token) return 'claimed'
+  return 'active'
+}
+
+const formatInvite = (invite) => ({
+  id: invite.id,
+  code: invite.code,
+  createdAt: invite.created_at,
+  expiresAt: invite.expires_at,
+  createdBy: invite.created_by,
+  claimedAt: invite.claimed_at || 0,
+  usedAt: invite.used_at || 0,
+  usedBy: invite.used_by || '',
+  status: getInviteStatus(invite),
+})
 
 const broadcastVoiceState = (roomId) => {
   const state = getVoiceRoomState(roomId)
