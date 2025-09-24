@@ -201,6 +201,12 @@ CREATE TABLE IF NOT EXISTS files (
   path TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS voice_rooms (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  created_by TEXT DEFAULT ''
+);
 `)
 
 try {
@@ -229,6 +235,10 @@ const updateAvatarInfoStmt = db.prepare('UPDATE users SET avatar_url=?, avatar_u
 const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id=?')
 const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
 const countAdminsStmt = db.prepare("SELECT COUNT(*) as count FROM users WHERE role='admin'")
+const listVoiceRoomsStmt = db.prepare('SELECT id, name, created_at, created_by FROM voice_rooms ORDER BY created_at ASC')
+const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
+const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
+const selectVoiceRoomStmt = db.prepare('SELECT id, name FROM voice_rooms WHERE id=?')
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
 
@@ -247,6 +257,13 @@ if (!defaultWs) {
   const chId = uuidv4()
   db.prepare('INSERT INTO channels (id,workspace_id,name,created_at) VALUES (?,?,?,?)').run(chId, wsId, 'general', Date.now())
   defaultWs = { id: wsId }
+}
+
+let cachedVoiceRooms = listVoiceRoomsStmt.all()
+if (!cachedVoiceRooms.length) {
+  const vrId = uuidv4()
+  insertVoiceRoomStmt.run(vrId, 'Общий голосовой', Date.now(), '')
+  cachedVoiceRooms = listVoiceRoomsStmt.all()
 }
 
 const publicUser = (u) => {
@@ -515,6 +532,39 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
   res.json({ ok: true })
 })
 
+app.get('/api/voice-rooms', auth, (req, res) => {
+  const rooms = listVoiceRoomsStmt.all().map(formatVoiceRoom)
+  res.json({ rooms })
+})
+
+app.post('/api/voice-rooms', auth, adminOnly, (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : ''
+  if (!name) return res.status(400).json({ error: 'invalid_name' })
+  const id = uuidv4()
+  const now = Date.now()
+  insertVoiceRoomStmt.run(id, name, now, req.user.id)
+  emitVoiceRoomsUpdate()
+  res.status(201).json({ room: formatVoiceRoom({ id, name, created_at: now, created_by: req.user.id }) })
+})
+
+app.delete('/api/voice-rooms/:id', auth, adminOnly, (req, res) => {
+  const room = selectVoiceRoomStmt.get(req.params.id)
+  if (!room) return res.status(404).json({ error: 'not_found' })
+  const participants = voiceParticipants.get(room.id)
+  if (participants) {
+    for (const participant of participants.values()) {
+      const targetSocket = io.sockets.sockets.get(participant.socketId)
+      if (targetSocket) {
+        targetSocket.emit('voice:room-closed', { roomId: room.id })
+        leaveVoiceRoom(targetSocket, { silent: true })
+      }
+    }
+  }
+  deleteVoiceRoomStmt.run(room.id)
+  emitVoiceRoomsUpdate()
+  res.json({ ok: true })
+})
+
 app.patch('/api/admin/users/:id/role', auth, adminOnly, (req, res) => {
   const id = req.params.id
   const { role } = req.body || {}
@@ -714,6 +764,55 @@ const onlineUsers = new Map()
 const listChannels = db.prepare('SELECT * FROM channels WHERE workspace_id=? ORDER BY created_at ASC')
 const listMessages = db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
 const insertMessage = db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+const voiceParticipants = new Map()
+
+const getVoiceRoomState = (roomId) => {
+  const participants = voiceParticipants.get(roomId) || new Map()
+  return Array.from(participants.values()).map((entry) => ({
+    socketId: entry.socketId,
+    userId: entry.userId,
+    username: entry.username,
+  }))
+}
+
+const formatVoiceRoom = (room) => ({
+  id: room.id,
+  name: room.name,
+  createdAt: room.created_at,
+  createdBy: room.created_by || '',
+  participantCount: voiceParticipants.get(room.id)?.size || 0,
+})
+
+const emitVoiceRoomsUpdate = () => {
+  cachedVoiceRooms = listVoiceRoomsStmt.all()
+  io.emit('voice:rooms:update', { rooms: cachedVoiceRooms.map(formatVoiceRoom) })
+}
+
+const broadcastVoiceState = (roomId) => {
+  const state = getVoiceRoomState(roomId)
+  io.emit('voice:state', { roomId, participants: state })
+}
+
+const leaveVoiceRoom = (socket, { silent } = {}) => {
+  const roomId = socket.voiceRoomId
+  if (!roomId) return
+  const participants = voiceParticipants.get(roomId)
+  if (participants) {
+    participants.delete(socket.id)
+    if (!participants.size) voiceParticipants.delete(roomId)
+  }
+  socket.leave(`voice:${roomId}`)
+  socket.voiceRoomId = null
+  if (!silent) {
+    socket.to(`voice:${roomId}`).emit('voice:user-left', {
+      roomId,
+      socketId: socket.id,
+      userId: socket.user.id,
+      username: socket.user.username,
+    })
+  }
+  broadcastVoiceState(roomId)
+}
 
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token
@@ -733,6 +832,35 @@ io.on('connection', (socket) => {
   onlineUsers.set(userId, socket.id)
   io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
   log('[SOCKET] connected', 'user=' + userId, 'socket=' + socket.id)
+
+  const joinVoiceRoom = (roomId) => {
+    if (!roomId) return
+    const room = selectVoiceRoomStmt.get(roomId)
+    if (!room) {
+      socket.emit('voice:error', { error: 'not_found' })
+      return
+    }
+    if (socket.voiceRoomId === roomId) return
+    if (socket.voiceRoomId) leaveVoiceRoom(socket)
+    let participants = voiceParticipants.get(roomId)
+    if (!participants) {
+      participants = new Map()
+      voiceParticipants.set(roomId, participants)
+    }
+    const initialState = getVoiceRoomState(roomId)
+    socket.join(`voice:${roomId}`)
+    socket.voiceRoomId = roomId
+    const participant = {
+      socketId: socket.id,
+      userId: socket.user.id,
+      username: socket.user.username,
+    }
+    participants.set(socket.id, participant)
+    socket.emit('voice:participants', { roomId, participants: initialState })
+    socket.emit('voice:joined', { roomId, participant })
+    socket.to(`voice:${roomId}`).emit('voice:user-joined', { roomId, participant })
+    broadcastVoiceState(roomId)
+  }
 
   const wsId = db.prepare('SELECT id FROM workspaces LIMIT 1').get().id
   const channels = listChannels.all(wsId)
@@ -809,9 +937,19 @@ io.on('connection', (socket) => {
   })
 
   socket.on('disconnect', () => {
+    leaveVoiceRoom(socket)
     onlineUsers.delete(userId)
     io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
     log('[SOCKET] disconnected', 'user=' + userId, 'socket=' + socket.id)
+  })
+
+  socket.on('voice:join', ({ roomId }) => joinVoiceRoom(roomId))
+  socket.on('voice:leave', () => leaveVoiceRoom(socket))
+  socket.on('voice:signal', ({ targetId, data }) => {
+    if (!targetId || !data) return
+    const targetSocket = io.sockets.sockets.get(targetId)
+    if (!targetSocket) return
+    targetSocket.emit('voice:signal', { from: socket.id, data })
   })
 })
 

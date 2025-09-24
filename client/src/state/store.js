@@ -6,6 +6,96 @@ import * as u8 from 'tweetnacl-util'
 
 const encoder = new TextEncoder()
 const storageKeyForChannel = (cid) => `chkey:${cid}`
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
+const voicePeerConnections = new Map()
+
+const loadStoredDevice = (key) => {
+  try {
+    return localStorage.getItem(key) || null
+  } catch (err) {
+    console.warn('audio device restore failed', err)
+    return null
+  }
+}
+
+const teardownVoicePeer = (socketId, set) => {
+  const pc = voicePeerConnections.get(socketId)
+  if (pc) {
+    try {
+      pc.onicecandidate = null
+      pc.ontrack = null
+      pc.onconnectionstatechange = null
+      pc.close()
+    } catch (err) {
+      console.warn('peer close failed', err)
+    }
+    voicePeerConnections.delete(socketId)
+  }
+  set((state) => {
+    if (!state.voiceRemoteStreams[socketId]) return state
+    const next = { ...state.voiceRemoteStreams }
+    delete next[socketId]
+    return { voiceRemoteStreams: next }
+  })
+}
+
+const setupVoicePeer = async ({ socket, roomId, participant, initiator, get, set }) => {
+  if (!participant || participant.socketId === socket.id) return null
+  let pc = voicePeerConnections.get(participant.socketId)
+  if (pc) return pc
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+  voicePeerConnections.set(participant.socketId, pc)
+  const stream = get().voiceStream
+  if (stream) {
+    stream.getAudioTracks().forEach((track) => {
+      try {
+        pc.addTrack(track, stream)
+      } catch (err) {
+        console.error('addTrack failed', err)
+      }
+    })
+  }
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      socket.emit('voice:signal', { targetId: participant.socketId, data: { candidate: event.candidate } })
+    }
+  }
+
+  pc.ontrack = (event) => {
+    const [remoteStream] = event.streams
+    if (!remoteStream) return
+    set((state) => ({
+      voiceRemoteStreams: {
+        ...state.voiceRemoteStreams,
+        [participant.socketId]: {
+          stream: remoteStream,
+          userId: participant.userId,
+          username: participant.username,
+        },
+      },
+    }))
+  }
+
+  pc.onconnectionstatechange = () => {
+    const state = pc.connectionState
+    if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+      teardownVoicePeer(participant.socketId, set)
+    }
+  }
+
+  if (initiator) {
+    try {
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      socket.emit('voice:signal', { targetId: participant.socketId, data: { sdp: pc.localDescription } })
+    } catch (err) {
+      console.error('offer create failed', err)
+    }
+  }
+
+  return pc
+}
 
 export const buildDirectChannelId = (a, b) => {
   if (!a || !b) return null
@@ -139,6 +229,15 @@ const useStore = create((set, get) => ({
   historyComplete: {},
   directPeers: {},
   files: {},
+  audioDevices: { inputs: [], outputs: [] },
+  audioInputDeviceId: loadStoredDevice('audioInputDeviceId'),
+  audioOutputDeviceId: loadStoredDevice('audioOutputDeviceId'),
+  voiceRooms: [],
+  voiceParticipants: {},
+  voiceRemoteStreams: {},
+  activeVoiceRoomId: null,
+  voiceStatus: null,
+  voiceStream: null,
 
   setAuth: (token, user) => set((state) => {
     const normalized = normalizeUser(user)
@@ -176,6 +275,95 @@ const useStore = create((set, get) => ({
       return null
     }
   },
+  refreshAudioDevices: async () => {
+    if (!navigator?.mediaDevices?.enumerateDevices) return
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      const inputs = devices.filter((d) => d.kind === 'audioinput')
+      const outputs = devices.filter((d) => d.kind === 'audiooutput')
+      set({ audioDevices: { inputs, outputs } })
+    } catch (err) {
+      console.error('enumerate devices failed', err)
+    }
+  },
+  setAudioDevice: (type, deviceId) => {
+    if (type === 'input') {
+      try {
+        if (deviceId) localStorage.setItem('audioInputDeviceId', deviceId)
+        else localStorage.removeItem('audioInputDeviceId')
+      } catch (err) {
+        console.warn('audio device save failed', err)
+      }
+      set({ audioInputDeviceId: deviceId || null })
+      return
+    }
+    if (type === 'output') {
+      try {
+        if (deviceId) localStorage.setItem('audioOutputDeviceId', deviceId)
+        else localStorage.removeItem('audioOutputDeviceId')
+      } catch (err) {
+        console.warn('audio device save failed', err)
+      }
+      set({ audioOutputDeviceId: deviceId || null })
+    }
+  },
+  joinVoiceRoom: async (roomId) => {
+    const socket = get().socket
+    if (!socket || !roomId) return
+    if (get().activeVoiceRoomId === roomId) return
+    if (get().activeVoiceRoomId) get().leaveVoiceRoom(false)
+    try {
+      if (!navigator?.mediaDevices?.getUserMedia) throw new Error('media_unsupported')
+      const deviceId = get().audioInputDeviceId
+      const constraints = deviceId ? { audio: { deviceId: { exact: deviceId } } } : { audio: true }
+      const stream = await navigator.mediaDevices.getUserMedia(constraints)
+      set({ voiceStream: stream, voiceStatus: 'connecting', activeVoiceRoomId: roomId })
+      socket.emit('voice:join', { roomId })
+    } catch (err) {
+      console.error('joinVoiceRoom failed', err)
+      set({ voiceStatus: 'error' })
+    }
+  },
+  leaveVoiceRoom: (emit = true) => {
+    const socket = get().socket
+    const roomId = get().activeVoiceRoomId
+    if (emit && socket && roomId) socket.emit('voice:leave')
+    voicePeerConnections.forEach((_, id) => teardownVoicePeer(id, set))
+    voicePeerConnections.clear()
+    const stream = get().voiceStream
+    if (stream) stream.getTracks().forEach((track) => track.stop())
+    set((state) => ({
+      activeVoiceRoomId: null,
+      voiceStream: null,
+      voiceStatus: null,
+      voiceRemoteStreams: {},
+      voiceParticipants: roomId ? { ...state.voiceParticipants, [roomId]: [] } : state.voiceParticipants,
+    }))
+  },
+  createVoiceRoom: async (name) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const trimmed = typeof name === 'string' ? name.trim() : ''
+    if (!trimmed) throw new Error('invalid_name')
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/voice-rooms`,
+      { name: trimmed },
+      { headers: buildAuthHeaders(token) },
+    )
+    if (data?.room) {
+      set((state) => ({ voiceRooms: [...state.voiceRooms.filter((room) => room.id !== data.room.id), data.room] }))
+    }
+  },
+  deleteVoiceRoom: async (roomId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    await axios.delete(`${get().serverUrl}/api/voice-rooms/${roomId}`, { headers: buildAuthHeaders(token) })
+    set((state) => ({
+      voiceRooms: state.voiceRooms.filter((room) => room.id !== roomId),
+      voiceParticipants: { ...state.voiceParticipants, [roomId]: [] },
+    }))
+    if (get().activeVoiceRoomId === roomId) get().leaveVoiceRoom(false)
+  },
 
   connect: async () => {
     const token = get().token
@@ -196,6 +384,13 @@ const useStore = create((set, get) => ({
       } catch (err) {
         console.error('users fetch failed', err)
       }
+      try {
+        const { data: voiceData } = await axios.get(`${server}/api/voice-rooms`, { headers: buildAuthHeaders(get().token) })
+        set({ voiceRooms: (voiceData.rooms || []).map((room) => ({ ...room })) })
+      } catch (err) {
+        console.error('voice rooms fetch failed', err)
+      }
+      get().refreshAudioDevices()
     })
 
     socket.on('init:response', ({ workspaces, channels, activeChannelId, messages }) => {
@@ -297,6 +492,101 @@ const useStore = create((set, get) => ({
     })
 
     socket.on('presence:update', ({ onlineUserIds }) => set({ onlineUserIds }))
+    socket.on('voice:rooms:update', ({ rooms }) => {
+      if (Array.isArray(rooms)) set({ voiceRooms: rooms.map((room) => ({ ...room })) })
+    })
+    socket.on('voice:state', ({ roomId, participants }) => {
+      if (!roomId) return
+      set((state) => ({
+        voiceParticipants: { ...state.voiceParticipants, [roomId]: participants || [] },
+        voiceRooms: state.voiceRooms.map((room) => (room.id === roomId ? { ...room, participantCount: (participants || []).length } : room)),
+      }))
+    })
+    socket.on('voice:participants', async ({ roomId, participants }) => {
+      if (!roomId) return
+      set((state) => ({
+        voiceParticipants: { ...state.voiceParticipants, [roomId]: participants || [] },
+      }))
+      if (get().activeVoiceRoomId !== roomId) return
+      const list = participants || []
+      for (const participant of list) {
+        await setupVoicePeer({ socket, roomId, participant, initiator: true, get, set })
+      }
+    })
+    socket.on('voice:user-joined', async ({ roomId, participant }) => {
+      if (!roomId || !participant) return
+      set((state) => ({
+        voiceParticipants: {
+          ...state.voiceParticipants,
+          [roomId]: [...(state.voiceParticipants[roomId] || []), participant],
+        },
+      }))
+      if (get().activeVoiceRoomId !== roomId) return
+      await setupVoicePeer({ socket, roomId, participant, initiator: false, get, set })
+    })
+    socket.on('voice:user-left', ({ roomId, socketId }) => {
+      if (!roomId || !socketId) return
+      set((state) => ({
+        voiceParticipants: {
+          ...state.voiceParticipants,
+          [roomId]: (state.voiceParticipants[roomId] || []).filter((p) => p.socketId !== socketId),
+        },
+      }))
+      teardownVoicePeer(socketId, set)
+    })
+    socket.on('voice:signal', async ({ from, data }) => {
+      if (!from || !data) return
+      const roomId = get().activeVoiceRoomId
+      if (!roomId) return
+      let pc = voicePeerConnections.get(from)
+      if (!pc) {
+        const participant = (get().voiceParticipants[roomId] || []).find((p) => p.socketId === from) || {
+          socketId: from,
+          userId: from,
+          username: 'Участник',
+        }
+        if (!participant) return
+        pc = await setupVoicePeer({ socket, roomId, participant, initiator: false, get, set })
+        if (!pc) return
+      }
+      if (data.sdp) {
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
+          if (data.sdp.type === 'offer') {
+            const answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            socket.emit('voice:signal', { targetId: from, data: { sdp: pc.localDescription } })
+          }
+        } catch (err) {
+          console.error('sdp handling failed', err)
+        }
+      }
+      if (data.candidate) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate))
+        } catch (err) {
+          console.error('candidate add failed', err)
+        }
+      }
+    })
+    socket.on('voice:joined', ({ roomId }) => {
+      if (!roomId) return
+      set((state) => ({ voiceStatus: 'connected', activeVoiceRoomId: roomId }))
+    })
+    socket.on('voice:room-closed', ({ roomId }) => {
+      if (get().activeVoiceRoomId === roomId) {
+        get().leaveVoiceRoom(false)
+        set({ voiceStatus: 'room_closed' })
+      }
+    })
+    socket.on('voice:error', ({ error }) => set({ voiceStatus: error || 'error' }))
+    socket.on('disconnect', () => {
+      const stream = get().voiceStream
+      if (stream) stream.getTracks().forEach((track) => track.stop())
+      voicePeerConnections.forEach((_, id) => teardownVoicePeer(id, set))
+      voicePeerConnections.clear()
+      set({ voiceStream: null, activeVoiceRoomId: null, voiceRemoteStreams: {}, voiceStatus: 'disconnected' })
+    })
   },
 
   switchChannel: (channelId) => {

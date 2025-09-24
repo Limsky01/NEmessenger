@@ -8,6 +8,53 @@ import AdminPanel from './AdminPanel.jsx'
 import useStore from '../state/store.js'
 import { motion, AnimatePresence } from 'framer-motion'
 
+function VoiceAudioLayer() {
+  const remoteStreams = useStore((s) => s.voiceRemoteStreams)
+  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const refs = React.useRef({})
+
+  React.useEffect(() => {
+    const ids = new Set(Object.keys(remoteStreams))
+    Object.keys(refs.current).forEach((id) => {
+      if (!ids.has(id)) delete refs.current[id]
+    })
+  }, [remoteStreams])
+
+  React.useEffect(() => {
+    const sinkId = audioOutputDeviceId || 'default'
+    Object.entries(refs.current).forEach(([id, element]) => {
+      if (!element) return
+      const info = remoteStreams[id]
+      if (info?.stream && element.srcObject !== info.stream) {
+        element.srcObject = info.stream
+      }
+      if (typeof element.setSinkId === 'function') {
+        element
+          .setSinkId(sinkId)
+          .catch((err) => console.warn('setSinkId failed', err))
+      }
+    })
+  }, [remoteStreams, audioOutputDeviceId])
+
+  return (
+    <div style={{ display: 'none' }}>
+      {Object.entries(remoteStreams).map(([socketId, info]) => (
+        <audio
+          key={socketId}
+          ref={(node) => {
+            refs.current[socketId] = node
+            if (node && info?.stream && node.srcObject !== info.stream) {
+              node.srcObject = info.stream
+            }
+          }}
+          autoPlay
+          playsInline
+        />
+      ))}
+    </div>
+  )
+}
+
 export default function App() {
   const token = useStore((s) => s.token)
   const connect = useStore((s) => s.connect)
@@ -50,6 +97,7 @@ export default function App() {
           <Login />
         )}
       </div>
+      <VoiceAudioLayer />
     </div>
   )
 }

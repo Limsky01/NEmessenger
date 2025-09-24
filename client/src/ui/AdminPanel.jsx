@@ -15,6 +15,7 @@ export default function AdminPanel() {
   const deleteUser = useStore((s) => s.adminDeleteUser)
 
   const [status, setStatus] = useState(null)
+  const [passwordDialog, setPasswordDialog] = useState(null)
 
   const sortedUsers = useMemo(() => {
     const list = [...users]
@@ -58,19 +59,31 @@ export default function AdminPanel() {
     }
   }
 
-  const handlePasswordReset = async (user) => {
-    const next = window.prompt(`Введите новый пароль для @${user.username} (минимум 6 символов)`) || ''
-    const trimmed = next.trim()
-    if (!trimmed) return
-    if (trimmed.length < 6) {
-      showStatus('error', 'Пароль должен быть длиной не менее 6 символов')
+  const openPasswordDialog = (user) => {
+    setPasswordDialog({ user, newPassword: '', confirm: '', loading: false, error: null })
+  }
+
+  const closePasswordDialog = () => setPasswordDialog(null)
+
+  const handlePasswordSubmit = async () => {
+    if (!passwordDialog?.user) return
+    const { user, newPassword, confirm } = passwordDialog
+    if (!newPassword || newPassword.length < 6) {
+      setPasswordDialog((state) => ({ ...state, error: 'Пароль должен быть не короче 6 символов' }))
+      return
+    }
+    if (newPassword !== confirm) {
+      setPasswordDialog((state) => ({ ...state, error: 'Пароли не совпадают' }))
       return
     }
     try {
-      await resetPassword(user.id, trimmed)
+      setPasswordDialog((state) => ({ ...state, loading: true, error: null }))
+      await resetPassword(user.id, newPassword)
       showStatus('success', `Пароль для @${user.username} обновлён`)
+      setPasswordDialog(null)
     } catch (err) {
-      showStatus('error', 'Не удалось изменить пароль пользователя')
+      console.error(err)
+      setPasswordDialog((state) => ({ ...state, loading: false, error: 'Не удалось изменить пароль пользователя' }))
     }
   }
 
@@ -79,29 +92,29 @@ export default function AdminPanel() {
       showStatus('error', 'У пользователя нет загруженного аватара')
       return
     }
-    const confirmed = window.confirm(`Удалить аватар для @${user.username}?`)
-    if (!confirmed) return
+    if (!window.confirm(`Удалить аватар для @${user.username}?`)) return
     try {
       await deleteAvatar(user.id)
       showStatus('success', `Аватар пользователя @${user.username} удалён`)
     } catch (err) {
+      console.error(err)
       showStatus('error', 'Не удалось удалить аватар')
     }
   }
 
   const handleUserDelete = async (user) => {
-    const confirmed = window.confirm(`Удалить пользователя @${user.username}? Это действие необратимо.`)
-    if (!confirmed) return
+    if (!window.confirm(`Удалить пользователя @${user.username}? Это действие необратимо.`)) return
     try {
       await deleteUser(user.id)
       showStatus('success', `Пользователь @${user.username} удалён`)
     } catch (err) {
       const code = err?.response?.data?.error || err?.message
       if (code === 'cannot_delete_self') {
-        showStatus('error', 'Нельзя удалить собственную учетную запись')
+        showStatus('error', 'Нельзя удалить собственную учётную запись')
       } else if (code === 'last_admin') {
         showStatus('error', 'Нельзя удалить последнего администратора')
       } else {
+        console.error(err)
         showStatus('error', 'Не удалось удалить пользователя')
       }
     }
@@ -109,7 +122,7 @@ export default function AdminPanel() {
 
   return (
     <div className="flex-1 h-full overflow-y-auto p-10 space-y-6 text-sm">
-      <div className="flex items-center justify-between">
+      <div className="flex.items-center.justify-between">
         <div>
           <div className="text-2xl font-semibold">Админ-панель</div>
           <div className="text-white/60">Управление пользователями и сообщениями</div>
@@ -124,7 +137,15 @@ export default function AdminPanel() {
       </div>
 
       {status && (
-        <div className={status.type === 'success' ? 'panel border border-emerald-500/30 text-emerald-300 px-4 py-3 rounded-2xl' : 'panel border border-red-500/30 text-red-300 px-4 py-3 rounded-2xl'}>
+        <div
+          className={
+            status.type === 'success'
+              ? 'panel border border-emerald-500/30 text-emerald-300 px-4 py-3 rounded-2xl'
+              : status.type === 'error'
+              ? 'panel border border-red-500/30 text-red-300 px-4 py-3 rounded-2xl'
+              : 'panel border border-white/20 text-white/80 px-4 py-3 rounded-2xl'
+          }
+        >
           {status.message}
         </div>
       )}
@@ -156,8 +177,8 @@ export default function AdminPanel() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => handlePasswordReset(user)}
-                    className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+                    onClick={() => openPasswordDialog(user)}
+                    className="px-4 py-2 rounded-2xl bg-white/10 hover.bg-white/20 transition"
                   >
                     Сменить пароль
                   </button>
@@ -184,6 +205,63 @@ export default function AdminPanel() {
           {sortedUsers.length === 0 && <div className="text-white/50 text-sm">Пользователей не найдено</div>}
         </div>
       </section>
+
+      {passwordDialog && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4"
+          onClick={closePasswordDialog}
+        >
+          <div
+            className="panel max-w-md w-full rounded-3xl px-6 py-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-lg font-semibold text-white/90">
+              Сменить пароль @{passwordDialog.user.username}
+            </div>
+            <div className="space-y-3 text-sm">
+              <div className="space-y-1">
+                <label className="text-white/60 text-xs uppercase tracking-[0.2em]">Новый пароль</label>
+                <input
+                  type="password"
+                  value={passwordDialog.newPassword}
+                  onChange={(e) => setPasswordDialog((state) => ({ ...state, newPassword: e.target.value }))}
+                  className="w-full rounded-2xl px-4 py-2 bg-white/10 outline-none"
+                  placeholder="Минимум 6 символов"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-white/60 text-xs uppercase tracking-[0.2em]">Подтверждение</label>
+                <input
+                  type="password"
+                  value={passwordDialog.confirm}
+                  onChange={(e) => setPasswordDialog((state) => ({ ...state, confirm: e.target.value }))}
+                  className="w-full rounded-2xl px-4 py-2.bg-white/10 outline-none"
+                  placeholder="Повторите пароль"
+                />
+              </div>
+              {passwordDialog.error && <div className="text-red-300 text-xs">{passwordDialog.error}</div>}
+            </div>
+            <div className="flex items-center justify-end gap-3 text-sm">
+              <button
+                type="button"
+                onClick={closePasswordDialog}
+                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+                disabled={passwordDialog.loading}
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={handlePasswordSubmit}
+                className="px-4 py-2 rounded-2xl bg-white/20 hover:bg-white/30 transition disabled:opacity-50"
+                disabled={passwordDialog.loading}
+              >
+                {passwordDialog.loading ? 'Сохранение…' : 'Сохранить'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

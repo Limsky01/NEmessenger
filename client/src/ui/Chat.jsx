@@ -74,6 +74,58 @@ const isTokenLikelyImage = (token) => {
   return byMime || byExt
 }
 
+const defaultUploadOptions = { group: false, compress: false, remember: false, comment: '' }
+
+const readStoredUploadOptions = () => {
+  try {
+    const raw = localStorage.getItem('uploadOptions')
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object') {
+      return {
+        group: Boolean(parsed.group),
+        compress: Boolean(parsed.compress),
+        remember: true,
+      }
+    }
+  } catch (err) {
+    console.warn('upload options restore failed', err)
+  }
+  return null
+}
+
+const compressImageFile = async (file, maxDimension = 1920) => {
+  if (!file?.type?.startsWith('image/')) return file
+  const url = URL.createObjectURL(file)
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image()
+      image.onload = () => resolve(image)
+      image.onerror = reject
+      image.src = url
+    })
+    const largestSide = Math.max(img.width, img.height)
+    if (!largestSide || largestSide <= maxDimension) return file
+    const scale = maxDimension / largestSide
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(img.width * scale)
+    canvas.height = Math.round(img.height * scale)
+    const ctx = canvas.getContext('2d', { alpha: true })
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+    const isPng = file.type === 'image/png'
+    const outputType = isPng ? 'image/png' : 'image/jpeg'
+    const quality = isPng ? undefined : 0.85
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, outputType, quality))
+    if (!blob) return file
+    return new File([blob], file.name, { type: blob.type, lastModified: Date.now() })
+  } catch (err) {
+    console.error('compressImageFile failed', err)
+    return file
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
 const useAttachmentMeta = (token) => {
   const meta = useStore((s) => (token?.id ? s.files[token.id] : null))
   const ensureFileMeta = useStore((s) => s.ensureFileMeta)
@@ -88,12 +140,51 @@ const useAttachmentMeta = (token) => {
   const fileName = resolved?.name || token?.name || 'файл'
   const mime = (resolved?.mime || '').toLowerCase()
   const isImage = isTokenLikelyImage({ name: fileName, mime })
-  const inlineUrl = isImage && token?.id ? buildFileUrl?.(token.id, { inline: true }) : null
-  return { fileName, mime, isImage, inlineUrl }
+  const isAudio = mime.startsWith('audio/') || /\.(mp3|wav|ogg)$/i.test(fileName)
+  const inlineUrl = token?.id ? buildFileUrl?.(token.id, { inline: true }) : null
+  return { fileName, mime, isImage, isAudio, inlineUrl }
 }
 
 function FileAttachment({ token, openFile }) {
-  const { fileName } = useAttachmentMeta(token)
+  const { fileName, inlineUrl, isAudio } = useAttachmentMeta(token)
+  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const audioRef = React.useRef(null)
+
+  React.useEffect(() => {
+    if (!isAudio) return
+    const element = audioRef.current
+    if (!element) return
+    if (inlineUrl && element.src !== inlineUrl) {
+      element.src = inlineUrl
+    }
+    if (typeof element.setSinkId === 'function') {
+      const sinkId = audioOutputDeviceId || 'default'
+      element.setSinkId(sinkId).catch((err) => console.warn('setSinkId failed', err))
+    }
+  }, [isAudio, inlineUrl, audioOutputDeviceId])
+
+  if (isAudio) {
+    return (
+      <div className="glass rounded-3xl px-4 py-3 space-y-2 text-white/80">
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span className="truncate">{fileName}</span>
+          <button
+            type="button"
+            onClick={() => openFile(token.id, fileName)}
+            className="px-3 py-1 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+          >
+            Скачать
+          </button>
+        </div>
+        {inlineUrl ? (
+          <audio ref={audioRef} controls preload="metadata" className="w-full" />
+        ) : (
+          <div className="text-xs text-white/50">Загрузка аудио...</div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <button type="button" onClick={() => openFile(token.id, fileName)} className="underline flex items-center gap-2 text-left">
       <PaperclipIcon className="w-4 h-4" />
@@ -102,17 +193,26 @@ function FileAttachment({ token, openFile }) {
   )
 }
 
-function ImageAttachment({ token, openFile, style }) {
+function ImageAttachment({ token, openFile, onPreview, style }) {
   const { fileName, inlineUrl } = useAttachmentMeta(token)
+  const handleClick = () => {
+    if (onPreview) {
+      onPreview({ id: token.id, name: fileName })
+      return
+    }
+    openFile(token.id, fileName)
+  }
+
   return (
     <button
       type="button"
-      onClick={() => openFile(token.id, fileName)}
-      className="relative block overflow-hidden rounded-3xl focus:outline-none focus:ring-2 focus:ring-white/50"
-      style={style}
+      onClick={handleClick}
+      onDoubleClick={() => openFile(token.id, fileName)}
+      className="relative block overflow-hidden rounded-3xl focus:outline-none focus:ring-2 focus:ring-white/50 bg-black/40"
+      style={{ ...style, position: 'relative' }}
     >
       {inlineUrl ? (
-        <img src={inlineUrl} alt={fileName} className="absolute inset-0 w-full h-full object-cover" />
+        <img src={inlineUrl} alt={fileName} className="absolute inset-0 w-full h-full object-contain" />
       ) : (
         <div className="absolute inset-0 w-full h-full bg-white/5 animate-pulse" />
       )}
@@ -162,7 +262,7 @@ function buildGalleryLayout(count) {
   }
 }
 
-function ImageGallery({ tokens, openFile }) {
+function ImageGallery({ tokens, openFile, onPreview }) {
   const count = tokens.length
   if (count === 0) return null
   const { container, item } = buildGalleryLayout(count)
@@ -170,7 +270,13 @@ function ImageGallery({ tokens, openFile }) {
   return (
     <div className="w-full" style={container}>
       {tokens.map((token, index) => (
-        <ImageAttachment key={`img-${token.id}-${index}`} token={token} openFile={openFile} style={item(index)} />
+        <ImageAttachment
+          key={`img-${token.id}-${index}`}
+          token={token}
+          openFile={openFile}
+          onPreview={onPreview}
+          style={item(index)}
+        />
       ))}
     </div>
   )
@@ -220,15 +326,21 @@ export default function Chat() {
   const uploadFile = useStore((s) => s.uploadFile)
   const directPeers = useStore((s) => s.directPeers)
   const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
+  const buildFileUrl = useStore((s) => s.buildFileUrl)
+  const ensureFileMeta = useStore((s) => s.ensureFileMeta)
+  const files = useStore((s) => s.files)
 
   const [text, setText] = useState('')
   const [uploadState, setUploadState] = useState(null)
   const [pendingDelete, setPendingDelete] = useState(null)
+  const [imagePreview, setImagePreview] = useState(null)
+  const [uploadDialog, setUploadDialog] = useState(null)
   const listRef = useRef(null)
   const fileInputRef = useRef(null)
   const textareaRef = useRef(null)
   const prevChannelRef = useRef(null)
   const prevCountRef = useRef(0)
+  const uploadDialogRef = useRef(null)
 
   const userMap = useMemo(() => {
     const map = new Map()
@@ -278,6 +390,103 @@ export default function Chat() {
     return user ? buildAvatarUrl?.(user) : null
   }
 
+  useEffect(() => {
+    if (!imagePreview) return
+    ensureFileMeta(imagePreview.id).catch((err) => console.error('preview meta failed', err))
+  }, [imagePreview, ensureFileMeta])
+
+  useEffect(() => {
+    if (!imagePreview) return undefined
+    const handler = (event) => {
+      if (event.key === 'Escape') setImagePreview(null)
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [imagePreview])
+
+  useEffect(() => {
+    uploadDialogRef.current = uploadDialog
+  }, [uploadDialog])
+
+  useEffect(() => () => {
+    const dialog = uploadDialogRef.current
+    if (dialog?.items) {
+      dialog.items.forEach((item) => {
+        if (item.preview) URL.revokeObjectURL(item.preview)
+      })
+    }
+  }, [])
+
+  const previewMeta = imagePreview ? files[imagePreview.id] : null
+  const previewName = imagePreview?.name || previewMeta?.name || 'Изображение'
+  const previewUrl = imagePreview ? buildFileUrl?.(imagePreview.id, { inline: true }) : null
+  const closeImagePreview = () => setImagePreview(null)
+  const downloadPreview = () => {
+    if (!imagePreview) return
+    openFile(imagePreview.id, previewName)
+  }
+
+  const cleanupUploadDialog = (dialog) => {
+    dialog?.items?.forEach((item) => {
+      if (item.preview) URL.revokeObjectURL(item.preview)
+    })
+  }
+
+  const closeUploadDialog = () => {
+    setUploadDialog((state) => {
+      if (state) cleanupUploadDialog(state)
+      return null
+    })
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  const updateUploadOptions = (patch) => {
+    setUploadDialog((state) => {
+      if (!state) return state
+      return { ...state, options: { ...state.options, ...patch } }
+    })
+  }
+
+  const removePendingFile = (id) => {
+    setUploadDialog((state) => {
+      if (!state) return state
+      const target = state.items.find((item) => item.id === id)
+      if (target?.preview) URL.revokeObjectURL(target.preview)
+      const nextItems = state.items.filter((item) => item.id !== id)
+      return { ...state, items: nextItems }
+    })
+  }
+
+  const uploadAttachments = async (filesToUpload, comment = '') => {
+    if (!filesToUpload.length) return
+    const attachments = []
+    try {
+      for (let index = 0; index < filesToUpload.length; index += 1) {
+        const file = filesToUpload[index]
+        setUploadState({ current: index + 1, total: filesToUpload.length, progress: 0 })
+        const uploaded = await uploadFile(file, (progress) => {
+          setUploadState((state) => (state ? { ...state, progress } : state))
+        })
+        if (uploaded) attachments.push(uploaded)
+      }
+      if (attachments.length) {
+        setText((prev) => {
+          const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
+          const blocks = []
+          if (comment) blocks.push(comment)
+          blocks.push(tokens.join('\n'))
+          const addition = blocks.filter(Boolean).join('\n')
+          return prev ? `${prev}\n${addition}` : addition
+        })
+      }
+    } catch (err) {
+      console.error(err)
+      alert('Не удалось загрузить файлы')
+    } finally {
+      setUploadState(null)
+    }
+  }
+
   const openFile = async (id, name) => {
     const { serverUrl, token } = useStore.getState()
     if (!token) return
@@ -301,6 +510,48 @@ export default function Chat() {
     }
   }
 
+  const confirmUploadDialog = async () => {
+    const dialog = uploadDialog
+    if (!dialog || dialog.loading) return
+    if (!dialog.items.length) {
+      closeUploadDialog()
+      return
+    }
+    setUploadDialog({ ...dialog, loading: true, error: null })
+    try {
+      const processed = []
+      for (const item of dialog.items) {
+        let file = item.file
+        if (dialog.options.compress && file.type?.startsWith('image/')) {
+          file = await compressImageFile(file)
+        }
+        processed.push(file)
+      }
+      if (dialog.options.remember) {
+        localStorage.setItem(
+          'uploadOptions',
+          JSON.stringify({
+            group: dialog.options.group,
+            compress: dialog.options.compress,
+          }),
+        )
+      } else {
+        localStorage.removeItem('uploadOptions')
+      }
+      await uploadAttachments(processed, dialog.options.comment.trim())
+      cleanupUploadDialog(dialog)
+      setUploadDialog(null)
+    } catch (err) {
+      console.error(err)
+      setUploadDialog((state) => (state ? { ...state, loading: false, error: 'Не удалось загрузить файлы' } : state))
+    }
+  }
+
+  const handleAddMoreFiles = () => {
+    if (uploadDialog?.loading) return
+    fileInputRef.current?.click()
+  }
+
   const handleSend = () => {
     if (!text.trim()) return
     sendMessage(text)
@@ -318,33 +569,30 @@ export default function Chat() {
     fileInputRef.current?.click()
   }
 
-  const handleFileChange = async (ev) => {
+  const handleFileChange = (ev) => {
     const files = Array.from(ev.target.files || [])
     if (!files.length) return
-    try {
-      const attachments = []
-      for (let index = 0; index < files.length; index += 1) {
-        const file = files[index]
-        setUploadState({ current: index + 1, total: files.length, progress: 0 })
-        const uploaded = await uploadFile(file, (progress) => {
-          setUploadState((state) => (state ? { ...state, progress } : state))
-        })
-        if (uploaded) attachments.push(uploaded)
+    const items = files.map((file, index) => ({
+      id:
+        typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${index}`,
+      file,
+      preview: file.type?.startsWith('image/') ? URL.createObjectURL(file) : null,
+    }))
+    setUploadDialog((state) => {
+      if (state) {
+        return { ...state, items: [...state.items, ...items] }
       }
-      if (attachments.length) {
-        setText((prev) => {
-          const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
-          const prefix = prev ? `${prev}\n` : ''
-          return `${prefix}${tokens.join('\n')}`
-        })
+      const stored = readStoredUploadOptions()
+      return {
+        items,
+        options: { ...defaultUploadOptions, ...(stored || {}), comment: '' },
+        loading: false,
+        error: null,
       }
-    } catch (err) {
-      console.error(err)
-      alert('Не удалось загрузить файлы')
-    } finally {
-      setUploadState(null)
-      if (fileInputRef.current) fileInputRef.current.value = ''
-    }
+    })
+    if (ev.target) ev.target.value = ''
   }
 
   const handleDeleteMessage = async (messageId) => {
@@ -412,7 +660,9 @@ export default function Chat() {
                 {textSegments.filter((segment) => segment && segment.trim()).map((segment, idx) => (
                   <div key={`text-${m.id}-${idx}`}>{segment}</div>
                 ))}
-                {imageTokens.length > 0 && <ImageGallery tokens={imageTokens} openFile={openFile} />}
+                {imageTokens.length > 0 && (
+                  <ImageGallery tokens={imageTokens} openFile={openFile} onPreview={setImagePreview} />
+                )}
                 {fileTokens.map((attachment) => (
                   <FileAttachment key={`file-${m.id}-${attachment.id}`} token={attachment} openFile={openFile} />
                 ))}
@@ -451,6 +701,162 @@ export default function Chat() {
         </div>
       </div>
       <input ref={fileInputRef} type="file" className="hidden" multiple onChange={handleFileChange} />
+      {uploadDialog && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
+          onClick={closeUploadDialog}
+        >
+          <div
+            className="panel max-w-5xl w-full max-h-[90vh] overflow-hidden rounded-3xl flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 px-6 py-4 border-b border-white/10">
+              <div>
+                <div className="text-lg font-semibold text-white/90">Выбрано {uploadDialog.items.length} файлов</div>
+                <div className="text-xs text-white/60">Проверьте файлы перед отправкой</div>
+              </div>
+              <button
+                type="button"
+                onClick={closeUploadDialog}
+                className="px-3 py-1.5 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+              >
+                Закрыть
+              </button>
+            </div>
+            {uploadDialog.error && (
+              <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{uploadDialog.error}</div>
+            )}
+            <div className="flex-1 overflow-y-auto px-6 py-4 grid gap-4 md:grid-cols-2">
+              {uploadDialog.items.map((item) => (
+                <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
+                  <button
+                    type="button"
+                    className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
+                    onClick={() => removePendingFile(item.id)}
+                    disabled={uploadDialog.loading}
+                  >
+                    ✕
+                  </button>
+                  <div className="h-40 bg-black/40 rounded-2xl overflow-hidden flex items-center justify-center">
+                    {item.preview ? (
+                      <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
+                    ) : (
+                      <div className="text-white/50 text-sm">{item.file.type || 'Файл'}</div>
+                    )}
+                  </div>
+                  <div className="text-sm text-white/80 truncate">{item.file.name}</div>
+                  <div className="text-xs text-white/50">{(item.file.size / 1024 / 1024).toFixed(2)} МБ</div>
+                </div>
+              ))}
+              {uploadDialog.items.length === 0 && (
+                <div className="col-span-full text-sm text-white/50">Файлы не выбраны</div>
+              )}
+            </div>
+            <div className="px-6 py-4 border-t border-white/10 space-y-4">
+              <div className="flex flex-wrap gap-4 text-sm text-white/70">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={uploadDialog.options.group}
+                    onChange={(e) => updateUploadOptions({ group: e.target.checked })}
+                    disabled={uploadDialog.loading}
+                  />
+                  Группировать
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={uploadDialog.options.compress}
+                    onChange={(e) => updateUploadOptions({ compress: e.target.checked })}
+                    disabled={uploadDialog.loading}
+                  />
+                  Сжать изображения
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={uploadDialog.options.remember}
+                    onChange={(e) => updateUploadOptions({ remember: e.target.checked })}
+                    disabled={uploadDialog.loading}
+                  />
+                  Запомнить выбор
+                </label>
+              </div>
+              <textarea
+                value={uploadDialog.options.comment}
+                onChange={(e) => updateUploadOptions({ comment: e.target.value })}
+                placeholder="Комментарий"
+                className="w-full bg-white/10 rounded-2xl px-4 py-3 text-sm text-white/90 placeholder:text-white/40 outline-none resize-none"
+                rows={3}
+                disabled={uploadDialog.loading}
+              />
+              <div className="flex items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={handleAddMoreFiles}
+                  className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+                  disabled={uploadDialog.loading}
+                >
+                  Добавить ещё
+                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={closeUploadDialog}
+                    className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+                    disabled={uploadDialog.loading}
+                  >
+                    Отмена
+                  </button>
+                  <button
+                    type="button"
+                    onClick={confirmUploadDialog}
+                    className="px-4 py-2 rounded-2xl bg-white/20 hover:bg-white/30 transition disabled:opacity-50"
+                    disabled={uploadDialog.loading || uploadDialog.items.length === 0}
+                  >
+                    {uploadDialog.loading ? 'Отправка...' : 'Отправить'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {imagePreview && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm px-6 py-8"
+          onClick={closeImagePreview}
+        >
+          <div className="relative max-w-5xl w-full" onClick={(e) => e.stopPropagation()}>
+            {previewUrl ? (
+              <img src={previewUrl} alt={previewName} className="w-full max-h-[70vh] object-contain rounded-3xl" />
+            ) : (
+              <div className="w-full h-[60vh] flex items-center justify-center text-white/60">
+                Загрузка изображения...
+              </div>
+            )}
+            <div className="flex items-center justify-between mt-4 text-white/80 text-sm gap-4">
+              <div className="truncate">{previewName}</div>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={downloadPreview}
+                  className="px-4 py-2 rounded-2xl bg-white/15 hover:bg-white/25 transition"
+                >
+                  Скачать
+                </button>
+                <button
+                  type="button"
+                  onClick={closeImagePreview}
+                  className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+                >
+                  Закрыть
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

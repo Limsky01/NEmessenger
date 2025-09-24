@@ -8,6 +8,11 @@ export default function Profile() {
   const updateAvatar = useStore((s) => s.updateAvatar)
   const changePassword = useStore((s) => s.changePassword)
   const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
+  const audioDevices = useStore((s) => s.audioDevices)
+  const audioInputDeviceId = useStore((s) => s.audioInputDeviceId)
+  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const setAudioDevice = useStore((s) => s.setAudioDevice)
+  const refreshAudioDevices = useStore((s) => s.refreshAudioDevices)
 
   const roleLabel = user?.role === 'admin' ? 'Администратор' : 'Пользователь'
   const fileInputRef = useRef(null)
@@ -17,10 +22,15 @@ export default function Profile() {
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [passwordStatus, setPasswordStatus] = useState(null)
+  const [deviceStatus, setDeviceStatus] = useState(null)
 
   useEffect(() => () => {
     if (avatarPreview) URL.revokeObjectURL(avatarPreview)
   }, [avatarPreview])
+
+  useEffect(() => {
+    refreshAudioDevices()
+  }, [refreshAudioDevices])
 
   const handleAvatarSelect = (event) => {
     const file = event.target.files?.[0]
@@ -72,6 +82,50 @@ export default function Profile() {
     setAvatarFile(null)
     setAvatarStatus(null)
     if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  const handleRefreshDevices = async () => {
+    if (!navigator?.mediaDevices) {
+      setDeviceStatus({ type: 'error', message: 'Браузер не поддерживает работу с устройствами' })
+      setTimeout(() => setDeviceStatus(null), 4000)
+      return
+    }
+    setDeviceStatus({ type: 'info', message: 'Обновление списка устройств...' })
+    try {
+      await refreshAudioDevices()
+      let latest = useStore.getState().audioDevices
+      if (!latest.inputs.length) {
+        await navigator.mediaDevices.getUserMedia({ audio: true })
+        await refreshAudioDevices()
+        latest = useStore.getState().audioDevices
+      }
+      setDeviceStatus({ type: 'success', message: `Обновлено. Найдено микрофонов: ${latest.inputs.length}, динамиков: ${latest.outputs.length}` })
+    } catch (err) {
+      console.error(err)
+      setDeviceStatus({ type: 'error', message: 'Не удалось получить список устройств. Разрешите доступ к микрофону.' })
+    } finally {
+      setTimeout(() => setDeviceStatus(null), 4000)
+    }
+  }
+
+  const handleTestMicrophone = async () => {
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      setDeviceStatus({ type: 'error', message: 'Доступ к микрофону не поддерживается' })
+      setTimeout(() => setDeviceStatus(null), 4000)
+      return
+    }
+    setDeviceStatus({ type: 'info', message: 'Запрос доступа к микрофону...' })
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream.getTracks().forEach((track) => track.stop())
+      await refreshAudioDevices()
+      setDeviceStatus({ type: 'success', message: 'Микрофон доступен и готов к использованию' })
+    } catch (err) {
+      console.error(err)
+      setDeviceStatus({ type: 'error', message: 'Не удалось получить доступ к микрофону' })
+    } finally {
+      setTimeout(() => setDeviceStatus(null), 4000)
+    }
   }
 
   const handlePasswordSubmit = async (event) => {
@@ -215,6 +269,66 @@ export default function Profile() {
             Сохранить пароль
           </button>
         </form>
+      </section>
+
+      <section className="panel rounded-3xl px-6 py-5 space-y-4">
+        <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Аудио</div>
+        <div className="space-y-4 text-sm text-white/80">
+          <div className="space-y-2">
+            <div className="text-xs text-white/50">Входящее устройство</div>
+            <select
+              value={audioInputDeviceId || ''}
+              onChange={(e) => setAudioDevice('input', e.target.value || null)}
+              className="w-full rounded-2xl px-4 py-2 bg-white/10 outline-none"
+            >
+              <option value="">По умолчанию системы</option>
+              {audioDevices.inputs.map((device, index) => (
+                <option key={device.deviceId || index} value={device.deviceId}>
+                  {device.label || `Микрофон ${index + 1}`}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-2">
+            <div className="text-xs text-white/50">Выходное устройство</div>
+            <select
+              value={audioOutputDeviceId || ''}
+              onChange={(e) => setAudioDevice('output', e.target.value || null)}
+              className="w-full rounded-2xl px-4 py-2 bg-white/10 outline-none"
+            >
+              <option value="">По умолчанию системы</option>
+              {audioDevices.outputs.map((device, index) => (
+                <option key={device.deviceId || index} value={device.deviceId}>
+                  {device.label || `Динамики ${index + 1}`}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleRefreshDevices}
+              className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+            >
+              Обновить устройства
+            </button>
+            <button
+              type="button"
+              onClick={handleTestMicrophone}
+              className="px-4 py-2 rounded-2xl bg-white/5 hover:bg-white/15 transition"
+            >
+              Проверить микрофон
+            </button>
+          </div>
+          {deviceStatus && (
+            <div className={deviceStatus.type === 'error' ? 'text-red-300 text-xs' : deviceStatus.type === 'success' ? 'text-emerald-300 text-xs' : 'text-white/60 text-xs'}>
+              {deviceStatus.message}
+            </div>
+          )}
+          <p className="text-xs text-white/50">
+            Совет: если устройства не отображаются или названы по умолчанию, разрешите доступ к микрофону в браузере и нажмите «Обновить устройства».
+          </p>
+        </div>
       </section>
     </div>
   )
