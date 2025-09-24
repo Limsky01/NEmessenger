@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import useStore from '../state/store.js'
 import AvatarImage from './AvatarImage.jsx'
 
@@ -30,6 +30,23 @@ function SendIcon({ className = 'w-5 h-5' }) {
   )
 }
 
+function PlayIcon({ className = 'w-5 h-5' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="currentColor">
+      <path d="M6 4.5v15l12-7.5-12-7.5z" />
+    </svg>
+  )
+}
+
+function PauseIcon({ className = 'w-5 h-5' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="currentColor">
+      <rect x="5" y="4" width="5" height="16" rx="1" />
+      <rect x="14" y="4" width="5" height="16" rx="1" />
+    </svg>
+  )
+}
+
 function TrashIcon({ className = 'w-4 h-4' }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
@@ -38,6 +55,15 @@ function TrashIcon({ className = 'w-4 h-4' }) {
       <path d="M10 11v6" />
       <path d="M14 11v6" />
       <path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" />
+    </svg>
+  )
+}
+
+function EditIcon({ className = 'w-4 h-4' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4 12.5-12.5z" />
     </svg>
   )
 }
@@ -145,59 +171,228 @@ const useAttachmentMeta = (token) => {
   return { fileName, mime, isImage, isAudio, inlineUrl }
 }
 
-function FileAttachment({ token, openFile }) {
-  const { fileName, inlineUrl, isAudio } = useAttachmentMeta(token)
-  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
-  const audioRef = React.useRef(null)
+const formatTime = (seconds) => {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00'
+  const total = Math.floor(seconds)
+  const mins = Math.floor(total / 60)
+  const secs = total % 60
+  return `${mins}:${secs.toString().padStart(2, '0')}`
+}
 
-  React.useEffect(() => {
-    if (!isAudio) return
+const formatFileSize = (bytes) => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 Б'
+  const units = ['Б', 'КБ', 'МБ', 'ГБ']
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value.toFixed(unitIndex === 0 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`
+}
+
+const guessFileGlyph = (file) => {
+  const name = file?.name?.toLowerCase() || ''
+  const type = file?.type?.toLowerCase() || ''
+  if (type.startsWith('audio/')) return '🎵'
+  if (type.startsWith('video/')) return '🎬'
+  if (type.startsWith('image/')) return '🖼️'
+  if (type === 'application/pdf' || name.endsWith('.pdf')) return '📄'
+  if (/\.(zip|rar|7z|tar|gz)$/i.test(name)) return '🗜️'
+  if (/\.(docx?|odt)$/i.test(name)) return '📝'
+  if (/\.(pptx?|pps)$/i.test(name)) return '📊'
+  if (/\.(xlsx?|ods)$/i.test(name)) return '📈'
+  return '📎'
+}
+
+const guessFileDescriptor = (file) => {
+  const type = file?.type || ''
+  if (type.startsWith('image/')) return 'Изображение'
+  if (type.startsWith('audio/')) return 'Аудио'
+  if (type.startsWith('video/')) return 'Видео'
+  if (type === 'application/pdf') return 'PDF-документ'
+  if (type.includes('zip') || type.includes('rar')) return 'Архив'
+  const ext = file?.name?.split('.')?.pop()?.toUpperCase() || ''
+  return ext ? `${ext}-файл` : 'Файл'
+}
+
+function AudioAttachment({ token, openFile }) {
+  const { fileName, inlineUrl } = useAttachmentMeta(token)
+  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const audioRef = useRef(null)
+  const [duration, setDuration] = useState(0)
+  const [currentTime, setCurrentTime] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [playing, setPlaying] = useState(false)
+
+  useEffect(() => {
+    const element = audioRef.current
+    if (!element) return undefined
+
+    const handleLoaded = () => {
+      setDuration(Number.isFinite(element.duration) ? element.duration : 0)
+      setLoading(false)
+    }
+    const handleTime = () => setCurrentTime(element.currentTime || 0)
+    const handlePlay = () => setPlaying(true)
+    const handlePause = () => setPlaying(false)
+    const handleWaiting = () => setLoading(true)
+    const handlePlaying = () => setLoading(false)
+    const handleEnded = () => {
+      setPlaying(false)
+      setCurrentTime(Number.isFinite(element.duration) ? element.duration : 0)
+    }
+
+    element.addEventListener('loadedmetadata', handleLoaded)
+    element.addEventListener('timeupdate', handleTime)
+    element.addEventListener('play', handlePlay)
+    element.addEventListener('pause', handlePause)
+    element.addEventListener('waiting', handleWaiting)
+    element.addEventListener('playing', handlePlaying)
+    element.addEventListener('ended', handleEnded)
+
+    return () => {
+      element.removeEventListener('loadedmetadata', handleLoaded)
+      element.removeEventListener('timeupdate', handleTime)
+      element.removeEventListener('play', handlePlay)
+      element.removeEventListener('pause', handlePause)
+      element.removeEventListener('waiting', handleWaiting)
+      element.removeEventListener('playing', handlePlaying)
+      element.removeEventListener('ended', handleEnded)
+    }
+  }, [])
+
+  useEffect(() => {
     const element = audioRef.current
     if (!element) return
-    if (inlineUrl && element.src !== inlineUrl) {
-      element.src = inlineUrl
+    setLoading(true)
+    setDuration(0)
+    setCurrentTime(0)
+    if (inlineUrl) {
+      if (element.src !== inlineUrl) {
+        element.src = inlineUrl
+      }
+      element.load()
+    } else {
+      element.removeAttribute('src')
     }
+  }, [inlineUrl])
+
+  useEffect(() => {
+    if (!inlineUrl) return
+    const element = audioRef.current
+    if (!element) return
     if (typeof element.setSinkId === 'function') {
       const sinkId = audioOutputDeviceId || 'default'
       element.setSinkId(sinkId).catch((err) => console.warn('setSinkId failed', err))
     }
-  }, [isAudio, inlineUrl, audioOutputDeviceId])
+  }, [inlineUrl, audioOutputDeviceId])
 
-  if (isAudio) {
-    return (
-      <div className="glass rounded-3xl px-4 py-3 space-y-2 text-white/80">
-        <div className="flex items-center justify-between gap-3 text-sm">
-          <span className="truncate">{fileName}</span>
-          <button
-            type="button"
-            onClick={() => openFile(token.id, fileName)}
-            className="px-3 py-1 rounded-2xl bg-white/10 hover:bg-white/20 transition"
-          >
-            Скачать
-          </button>
+  useEffect(
+    () => () => {
+      const element = audioRef.current
+      if (element) element.pause()
+    },
+    [],
+  )
+
+  const handleToggle = () => {
+    const element = audioRef.current
+    if (!element || !inlineUrl) return
+    if (playing) {
+      element.pause()
+    } else {
+      element.play().catch((err) => {
+        console.warn('audio play failed', err)
+      })
+    }
+  }
+
+  const handleSeek = (event) => {
+    const element = audioRef.current
+    if (!element) return
+    const value = Number(event.target.value)
+    if (Number.isFinite(value)) {
+      element.currentTime = Math.max(0, Math.min(value, element.duration || value))
+    }
+  }
+
+  const progress = duration > 0 ? (currentTime / duration) * 100 : 0
+
+  return (
+    <div className="glass rounded-3xl px-4 py-3 text-white/80">
+      <div className="flex items-center gap-4">
+        <button
+          type="button"
+          onClick={handleToggle}
+          disabled={!inlineUrl}
+          className="w-11 h-11 flex items-center justify-center rounded-full bg-white/20 hover:bg-white/30 transition disabled:opacity-50"
+        >
+          {playing ? <PauseIcon className="w-4 h-4 text-black" /> : <PlayIcon className="w-4 h-4 text-black" />}
+        </button>
+        <div className="flex-1 space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <span className="truncate text-sm">{fileName}</span>
+            <span className="text-xs text-white/50 whitespace-nowrap">
+              {formatTime(currentTime)} / {formatTime(duration)}
+            </span>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="relative flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden">
+              <div className="absolute inset-y-0 left-0 bg-white/70" style={{ width: `${progress}%` }} />
+              <input
+                type="range"
+                min="0"
+                max={duration || 0}
+                step="0.1"
+                value={Math.min(currentTime, duration || currentTime)}
+                onChange={handleSeek}
+                disabled={!inlineUrl || duration <= 0}
+                className="absolute inset-0 w-full opacity-0 cursor-pointer"
+                aria-label="Перемотка аудио"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => openFile(token.id, fileName)}
+              className="px-3 py-1.5 rounded-2xl bg-white/10 hover:bg-white/20 transition text-xs"
+            >
+              Скачать
+            </button>
+          </div>
+          {loading && inlineUrl && <div className="text-[11px] text-white/40">Буферизация...</div>}
+          {!inlineUrl && <div className="text-[11px] text-white/40">Загрузка аудио...</div>}
         </div>
-        {inlineUrl ? (
-          <audio ref={audioRef} controls preload="metadata" className="w-full" />
-        ) : (
-          <div className="text-xs text-white/50">Загрузка аудио...</div>
-        )}
       </div>
-    )
+      <audio ref={audioRef} preload="metadata" className="hidden" />
+    </div>
+  )
+}
+
+function FileAttachment({ token, openFile }) {
+  const meta = useAttachmentMeta(token)
+
+  if (meta.isAudio) {
+    return <AudioAttachment token={token} openFile={openFile} />
   }
 
   return (
-    <button type="button" onClick={() => openFile(token.id, fileName)} className="underline flex items-center gap-2 text-left">
+    <button
+      type="button"
+      onClick={() => openFile(token.id, meta.fileName)}
+      className="underline flex items-center gap-2 text-left"
+    >
       <PaperclipIcon className="w-4 h-4" />
-      <span>{fileName}</span>
+      <span>{meta.fileName}</span>
     </button>
   )
 }
 
-function ImageAttachment({ token, openFile, onPreview, style }) {
+function ImageAttachment({ token, openFile, onPreview, style, index = 0, siblings = [] }) {
   const { fileName, inlineUrl } = useAttachmentMeta(token)
   const handleClick = () => {
     if (onPreview) {
-      onPreview({ id: token.id, name: fileName })
+      onPreview({ id: token.id, name: fileName, index, siblings })
       return
     }
     openFile(token.id, fileName)
@@ -266,6 +461,7 @@ function ImageGallery({ tokens, openFile, onPreview }) {
   const count = tokens.length
   if (count === 0) return null
   const { container, item } = buildGalleryLayout(count)
+  const siblingList = tokens.map((entry) => ({ id: entry.id, name: entry.name }))
 
   return (
     <div className="w-full" style={container}>
@@ -275,6 +471,8 @@ function ImageGallery({ tokens, openFile, onPreview }) {
           token={token}
           openFile={openFile}
           onPreview={onPreview}
+          index={index}
+          siblings={siblingList}
           style={item(index)}
         />
       ))}
@@ -321,6 +519,7 @@ export default function Chat() {
   const sendMessage = useStore((s) => s.sendMessage)
   const loadMore = useStore((s) => s.loadMore)
   const deleteMessage = useStore((s) => s.deleteMessage)
+  const editMessage = useStore((s) => s.editMessage)
   const users = useStore((s) => s.users)
   const me = useStore((s) => s.user)
   const uploadFile = useStore((s) => s.uploadFile)
@@ -329,18 +528,33 @@ export default function Chat() {
   const buildFileUrl = useStore((s) => s.buildFileUrl)
   const ensureFileMeta = useStore((s) => s.ensureFileMeta)
   const files = useStore((s) => s.files)
+  const channelMembersMap = useStore((s) => s.channelMembers)
+  const fetchChannelMembers = useStore((s) => s.fetchChannelMembers)
+  const addChannelMember = useStore((s) => s.addChannelMember)
+  const removeChannelMember = useStore((s) => s.removeChannelMember)
+  const typingMap = useStore((s) => s.typing)
+  const socket = useStore((s) => s.socket)
 
   const [text, setText] = useState('')
   const [uploadState, setUploadState] = useState(null)
-  const [pendingDelete, setPendingDelete] = useState(null)
+  const [deleteDialog, setDeleteDialog] = useState(null)
+  const [editDialog, setEditDialog] = useState(null)
   const [imagePreview, setImagePreview] = useState(null)
   const [uploadDialog, setUploadDialog] = useState(null)
+  const [membersDialogOpen, setMembersDialogOpen] = useState(false)
+  const [membersLoading, setMembersLoading] = useState(false)
+  const [membersError, setMembersError] = useState(null)
+  const [selectedNewMembers, setSelectedNewMembers] = useState([])
+  const [selfTyping, setSelfTyping] = useState(false)
   const listRef = useRef(null)
   const fileInputRef = useRef(null)
   const textareaRef = useRef(null)
   const prevChannelRef = useRef(null)
   const prevCountRef = useRef(0)
   const uploadDialogRef = useRef(null)
+  const typingTimeoutRef = useRef(null)
+  const selfTypingRef = useRef(false)
+  const prevTypingChannelRef = useRef(null)
 
   const userMap = useMemo(() => {
     const map = new Map()
@@ -357,6 +571,79 @@ export default function Chat() {
     return directPeers[activeChannelId] || extractPeerIdFromChannel(activeChannelId, me?.id)
   }, [isDirectChannel, directPeers, activeChannelId, me?.id])
   const directPeer = directPeerId ? userMap.get(directPeerId) : null
+  const channelMembers = currentChannel?.id ? channelMembersMap[currentChannel.id] || [] : []
+  const typingUsersRaw = useMemo(() => (activeChannelId ? typingMap[activeChannelId] || [] : []), [typingMap, activeChannelId])
+  const typingUsers = useMemo(
+    () => typingUsersRaw.filter((entry) => entry.userId !== me?.id),
+    [typingUsersRaw, me?.id],
+  )
+  const typingLabel = useMemo(() => {
+    if (!typingUsers.length) return ''
+    const names = typingUsers.map((entry) => {
+      const user = entry.userId ? userMap.get(entry.userId) : null
+      const username = entry.username || user?.username || entry.userId
+      return username?.startsWith('@') ? username : `@${username}`
+    })
+    if (names.length === 1) return `${names[0]} печатает...`
+    if (names.length === 2) return `${names[0]} и ${names[1]} печатают...`
+    if (names.length === 3) return `${names[0]}, ${names[1]} и ${names[2]} печатают...`
+    return `${names[0]}, ${names[1]} и еще ${names.length - 2} печатают...`
+  }, [typingUsers, userMap])
+  const deletePreviewText = useMemo(() => {
+    if (!deleteDialog?.message) return ''
+    const { textSegments, attachments } = extractTextAndAttachments(deleteDialog.message.content)
+    const text = textSegments.join(' ').trim()
+    if (text) return text
+    if (attachments.length) {
+      return `Вложений: ${attachments.length}`
+    }
+    return 'Без текста'
+  }, [deleteDialog])
+  const canManageMembers = Boolean(
+    currentChannel?.isPrivate && (me?.role === 'admin' || ['owner', 'admin'].includes(currentChannel?.membershipRole || '')),
+  )
+  const canModerateChannel = Boolean(
+    currentChannel &&
+      (me?.role === 'admin' ||
+        (currentChannel.isPrivate && ['owner', 'admin'].includes(currentChannel.membershipRole || ''))),
+  )
+  const availableMemberCandidates = useMemo(() => {
+    if (!currentChannel?.id) return []
+    const existing = new Set(channelMembers.map((entry) => entry.user.id))
+    if (me?.id) existing.add(me.id)
+    return users.filter((user) => !existing.has(user.id))
+  }, [channelMembers, users, currentChannel?.id, me?.id])
+
+  useEffect(() => {
+    setMembersDialogOpen(false)
+    setMembersError(null)
+    setSelectedNewMembers([])
+    setMembersLoading(false)
+  }, [activeChannelId])
+
+  useEffect(() => {
+    setSelectedNewMembers((current) =>
+      current.filter((userId) => availableMemberCandidates.some((candidate) => candidate.id === userId)),
+    )
+  }, [availableMemberCandidates])
+
+  useEffect(() => {
+    if (!membersDialogOpen || !currentChannel?.id || !currentChannel.isPrivate) return undefined
+    let cancelled = false
+    setMembersLoading(true)
+    setMembersError(null)
+    fetchChannelMembers(currentChannel.id)
+      .catch((err) => {
+        console.error('fetch members failed', err)
+        if (!cancelled) setMembersError('Не удалось загрузить участников')
+      })
+      .finally(() => {
+        if (!cancelled) setMembersLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [membersDialogOpen, currentChannel?.id, currentChannel?.isPrivate, fetchChannelMembers])
 
   useEffect(() => {
     const list = listRef.current
@@ -380,6 +667,22 @@ export default function Chat() {
     el.style.height = `${Math.min(el.scrollHeight, 140)}px`
   }, [text])
 
+  useEffect(() => {
+    const previousChannel = prevTypingChannelRef.current
+    if (previousChannel && previousChannel !== activeChannelId && socket && selfTypingRef.current) {
+      socket.emit('typing', { channelId: previousChannel, state: false })
+    }
+    prevTypingChannelRef.current = activeChannelId
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current)
+      typingTimeoutRef.current = null
+    }
+    if (selfTypingRef.current) {
+      selfTypingRef.current = false
+      setSelfTyping(false)
+    }
+  }, [activeChannelId, socket])
+
   const onScroll = (e) => {
     if (e.currentTarget.scrollTop === 0) loadMore()
   }
@@ -396,17 +699,22 @@ export default function Chat() {
   }, [imagePreview, ensureFileMeta])
 
   useEffect(() => {
-    if (!imagePreview) return undefined
-    const handler = (event) => {
-      if (event.key === 'Escape') setImagePreview(null)
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [imagePreview])
-
-  useEffect(() => {
     uploadDialogRef.current = uploadDialog
   }, [uploadDialog])
+
+  useEffect(
+    () => () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current)
+        typingTimeoutRef.current = null
+      }
+      if (selfTypingRef.current && socket && activeChannelId) {
+        socket.emit('typing', { channelId: activeChannelId, state: false })
+        selfTypingRef.current = false
+      }
+    },
+    [socket, activeChannelId],
+  )
 
   useEffect(() => () => {
     const dialog = uploadDialogRef.current
@@ -420,11 +728,53 @@ export default function Chat() {
   const previewMeta = imagePreview ? files[imagePreview.id] : null
   const previewName = imagePreview?.name || previewMeta?.name || 'Изображение'
   const previewUrl = imagePreview ? buildFileUrl?.(imagePreview.id, { inline: true }) : null
+  const stepPreview = useCallback((delta) => {
+    setImagePreview((current) => {
+      if (!current) return current
+      const siblings = current.siblings || []
+      if (!siblings.length) return current
+      const baseIndex =
+        typeof current.index === 'number' ? current.index : siblings.findIndex((item) => item.id === current.id)
+      if (baseIndex < 0) return current
+      const nextIndex = baseIndex + delta
+      if (nextIndex < 0 || nextIndex >= siblings.length) return current
+      const nextItem = siblings[nextIndex]
+      return { ...current, ...nextItem, index: nextIndex }
+    })
+  }, [])
+  const previewSiblings = imagePreview?.siblings || []
+  const previewIndex = useMemo(() => {
+    if (!imagePreview) return -1
+    if (typeof imagePreview.index === 'number') return imagePreview.index
+    const idx = previewSiblings.findIndex((item) => item.id === imagePreview.id)
+    return idx
+  }, [imagePreview, previewSiblings])
+  const hasPrev = previewIndex > 0
+  const hasNext = previewIndex >= 0 && previewIndex < previewSiblings.length - 1
+  const goPrevPreview = () => stepPreview(-1)
+  const goNextPreview = () => stepPreview(1)
   const closeImagePreview = () => setImagePreview(null)
   const downloadPreview = () => {
     if (!imagePreview) return
     openFile(imagePreview.id, previewName)
   }
+
+  useEffect(() => {
+    if (!imagePreview) return undefined
+    const handler = (event) => {
+      if (event.key === 'Escape') setImagePreview(null)
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault()
+        goPrevPreview()
+      }
+      if (event.key === 'ArrowRight') {
+        event.preventDefault()
+        goNextPreview()
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [imagePreview, goNextPreview, goPrevPreview])
 
   const cleanupUploadDialog = (dialog) => {
     dialog?.items?.forEach((item) => {
@@ -470,14 +820,14 @@ export default function Chat() {
         if (uploaded) attachments.push(uploaded)
       }
       if (attachments.length) {
-        setText((prev) => {
-          const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
-          const blocks = []
-          if (comment) blocks.push(comment)
-          blocks.push(tokens.join('\n'))
-          const addition = blocks.filter(Boolean).join('\n')
-          return prev ? `${prev}\n${addition}` : addition
-        })
+        const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
+        const blocks = []
+        if (comment) blocks.push(comment)
+        blocks.push(tokens.join('\n'))
+        const addition = blocks.filter(Boolean).join('\n')
+        const currentValue = textareaRef.current ? textareaRef.current.value : text
+        const nextValue = currentValue ? `${currentValue}\n${addition}` : addition
+        handleTextChange(nextValue)
       }
     } catch (err) {
       console.error(err)
@@ -552,10 +902,58 @@ export default function Chat() {
     fileInputRef.current?.click()
   }
 
+  const emitTypingState = (state) => {
+    if (!socket || !activeChannelId) return
+    socket.emit('typing', { channelId: activeChannelId, state })
+  }
+
+  const scheduleTypingStop = () => {
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
+    typingTimeoutRef.current = setTimeout(() => {
+      if (selfTypingRef.current) {
+        emitTypingState(false)
+        selfTypingRef.current = false
+        setSelfTyping(false)
+      }
+    }, 2500)
+  }
+
+  const handleTextChange = (value) => {
+    setText(value)
+    if (!socket || !activeChannelId) return
+    if (!selfTypingRef.current) {
+      emitTypingState(true)
+      selfTypingRef.current = true
+      setSelfTyping(true)
+    }
+    scheduleTypingStop()
+  }
+
+  const handleInputBlur = () => {
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current)
+      typingTimeoutRef.current = null
+    }
+    if (selfTypingRef.current) {
+      emitTypingState(false)
+      selfTypingRef.current = false
+      setSelfTyping(false)
+    }
+  }
+
   const handleSend = () => {
     if (!text.trim()) return
     sendMessage(text)
     setText('')
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current)
+      typingTimeoutRef.current = null
+    }
+    if (selfTypingRef.current) {
+      emitTypingState(false)
+      selfTypingRef.current = false
+      setSelfTyping(false)
+    }
   }
 
   const handleKeyDown = (e) => {
@@ -595,16 +993,116 @@ export default function Chat() {
     if (ev.target) ev.target.value = ''
   }
 
-  const handleDeleteMessage = async (messageId) => {
-    setPendingDelete(messageId)
+  const canRemoveMemberEntry = (entry) => {
+    if (!canManageMembers) return false
+    if (me?.role === 'admin') return true
+    if (entry.role === 'owner') return false
+    if (currentChannel?.membershipRole === 'owner') return true
+    if (currentChannel?.membershipRole === 'admin') {
+      return entry.role === 'member'
+    }
+    return false
+  }
+
+  const handleSelectedMemberToggle = (userId) => {
+    setSelectedNewMembers((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
+  }
+
+  const handleAddMembers = async () => {
+    if (!currentChannel?.id || !selectedNewMembers.length) return
+    setMembersLoading(true)
+    setMembersError(null)
     try {
-      await deleteMessage(messageId)
+      for (const userId of selectedNewMembers) {
+        // eslint-disable-next-line no-await-in-loop
+        await addChannelMember(currentChannel.id, userId)
+      }
+      setSelectedNewMembers([])
+    } catch (err) {
+      console.error('add member failed', err)
+      setMembersError('Не удалось добавить участника')
+    } finally {
+      setMembersLoading(false)
+    }
+  }
+
+  const handleRemoveMember = async (userId) => {
+    if (!currentChannel?.id) return
+    setMembersLoading(true)
+    setMembersError(null)
+    try {
+      await removeChannelMember(currentChannel.id, userId)
+      if (userId === me?.id) {
+        setMembersDialogOpen(false)
+      }
+    } catch (err) {
+      console.error('remove member failed', err)
+      setMembersError('Не удалось удалить участника')
+    } finally {
+      setMembersLoading(false)
+    }
+  }
+
+  const handleRequestDelete = (message) => {
+    setDeleteDialog({ message, loading: false, error: null })
+  }
+
+  const confirmDeleteMessage = async () => {
+    if (!deleteDialog?.message) return
+    setDeleteDialog((state) => (state ? { ...state, loading: true, error: null } : state))
+    try {
+      await deleteMessage(deleteDialog.message.id)
+      setDeleteDialog(null)
     } catch (err) {
       console.error(err)
-      alert('Не удалось удалить сообщение')
-    } finally {
-      setPendingDelete(null)
+      setDeleteDialog((state) => (state ? { ...state, loading: false, error: 'Не удалось удалить сообщение' } : state))
     }
+  }
+
+  const handleRequestEdit = (message) => {
+    setEditDialog({ message, value: message.content, loading: false, error: null })
+  }
+
+  const confirmEditMessage = async () => {
+    if (!editDialog?.message) return
+    const value = editDialog.value || ''
+    if (!value.trim()) {
+      setEditDialog((state) => (state ? { ...state, error: 'Введите текст сообщения' } : state))
+      return
+    }
+    setEditDialog((state) => (state ? { ...state, loading: true, error: null } : state))
+    try {
+      await editMessage(editDialog.message.id, editDialog.message.channelId, value)
+      setEditDialog(null)
+    } catch (err) {
+      console.error(err)
+      setEditDialog((state) => (state ? { ...state, loading: false, error: 'Не удалось сохранить изменения' } : state))
+    }
+  }
+
+  const closeDeleteDialog = () => {
+    if (deleteDialog?.loading) return
+    setDeleteDialog(null)
+  }
+
+  const closeEditDialog = () => {
+    if (editDialog?.loading) return
+    setEditDialog(null)
+  }
+
+  const openMembersDialog = () => {
+    if (!currentChannel?.id) return
+    setMembersDialogOpen(true)
+    setMembersError(null)
+    setSelectedNewMembers([])
+  }
+
+  const closeMembersDialog = () => {
+    if (membersLoading) return
+    setMembersDialogOpen(false)
+    setMembersError(null)
+    setSelectedNewMembers([])
+    setMembersLoading(false)
   }
 
   const headerTitle = isDirectChannel
@@ -621,12 +1119,23 @@ export default function Chat() {
           <div className="text-sm font-medium">{headerTitle}</div>
           <div className="text-xs text-white/60">{headerSubtitle}</div>
         </div>
-        {uploadState && (
-          <div className="text-xs text-white/60">
-            Загрузка {uploadState.current}/{uploadState.total}
-            {uploadState.progress != null ? ` · ${uploadState.progress}%` : ''}
-          </div>
-        )}
+        <div className="flex items-center gap-3">
+          {canManageMembers && currentChannel && (
+            <button
+              type="button"
+              onClick={openMembersDialog}
+              className="px-3 py-1.5 text-xs rounded-xl bg-white/10 hover:bg-white/20 transition"
+            >
+              Участники
+            </button>
+          )}
+          {uploadState && (
+            <div className="text-xs text-white/60">
+              Загрузка {uploadState.current}/{uploadState.total}
+              {uploadState.progress != null ? ` · ${uploadState.progress}%` : ''}
+            </div>
+          )}
+        </div>
       </div>
 
       <div ref={listRef} onScroll={onScroll} className="flex-1 overflow-y-auto p-6 space-y-3 scroll-thin">
@@ -637,23 +1146,41 @@ export default function Chat() {
           const imageTokens = attachments.map((token) => ({ ...token, ...useStore.getState().files[token.id] })).filter(isTokenLikelyImage)
           const fileTokens = attachments.filter((token) => !isTokenLikelyImage(token))
           const avatarSrc = avatarSrcById(m.senderId)
+          const canDelete = mine || me?.role === 'admin' || canModerateChannel
+          const canEdit = mine || canModerateChannel
+          const edited = m.updatedAt && m.updatedAt > (m.createdAt || 0)
           return (
             <div key={m.id} className={`max-w-[72%] px-4 py-3 rounded-3xl shadow-glass ${mine ? 'ml-auto panel' : 'glass'}`}>
               <div className="flex items-center justify-between text-[11px] text-white/70 mb-2">
                 <div className="flex items-center gap-2">
                   <AvatarImage user={author} size={28} src={avatarSrc} />
                   <span>@{nameById(m.senderId)}</span>
-                  <span className="opacity-60">{new Date(m.createdAt || m.created_at).toLocaleTimeString()}</span>
+                  <span className="opacity-60">
+                    {new Date(m.createdAt || m.created_at).toLocaleTimeString()}
+                    {edited ? ' · изменено' : ''}
+                  </span>
                 </div>
-                {(mine || me?.role === 'admin') && (
-                  <button
-                    type="button"
-                    className="text-white/40 hover:text-red-400 transition flex items-center gap-1"
-                    onClick={() => handleDeleteMessage(m.id)}
-                    disabled={pendingDelete === m.id}
-                  >
-                    <TrashIcon />
-                  </button>
+                {(canEdit || canDelete) && (
+                  <div className="flex items-center gap-2 text-white/40">
+                    {canEdit && (
+                      <button
+                        type="button"
+                        className="hover:text-white transition"
+                        onClick={() => handleRequestEdit(m)}
+                      >
+                        <EditIcon />
+                      </button>
+                    )}
+                    {canDelete && (
+                      <button
+                        type="button"
+                        className="hover:text-red-400 transition"
+                        onClick={() => handleRequestDelete(m)}
+                      >
+                        <TrashIcon />
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
               <div className="whitespace-pre-wrap leading-relaxed break-words space-y-3">
@@ -675,6 +1202,12 @@ export default function Chat() {
         )}
       </div>
 
+      {(selfTyping || typingLabel) && (
+        <div className="px-6 pb-2 text-xs text-white/60 italic">
+          {[selfTyping ? 'Вы печатаете...' : null, typingLabel].filter(Boolean).join(' ')}
+        </div>
+      )}
+
       <div className="px-6 py-4 border-t border-white/10">
         <div className="panel rounded-3xl px-4 py-2 flex items-center gap-3">
           <IconButton onClick={handleFilePick} title="Прикрепить файлы">
@@ -683,8 +1216,9 @@ export default function Chat() {
           <textarea
             ref={textareaRef}
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => handleTextChange(e.target.value)}
             onKeyDown={handleKeyDown}
+            onBlur={handleInputBlur}
             placeholder="Напишите сообщение..."
             className="flex-1 bg-transparent text-sm text-white/90 placeholder:text-white/40 outline-none border-none resize-none max-h-36"
             style={{ marginTop: '-10px' }}
@@ -701,6 +1235,232 @@ export default function Chat() {
         </div>
       </div>
       <input ref={fileInputRef} type="file" className="hidden" multiple onChange={handleFileChange} />
+      {deleteDialog && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
+          onClick={closeDeleteDialog}
+        >
+          <div className="panel w-full max-w-md rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-white/10">
+              <div className="text-lg font-semibold text-white/90">Удалить сообщение?</div>
+              <div className="text-xs text-white/60 mt-1">Действие нельзя отменить.</div>
+            </div>
+            {deleteDialog.error && <div className="px-5 py-3 text-sm text-red-300 bg-red-500/10">{deleteDialog.error}</div>}
+            <div className="px-5 py-4 space-y-3">
+              {deleteDialog.message && (
+                <div className="glass rounded-2xl px-4 py-3 space-y-2">
+                  <div className="text-xs text-white/50 uppercase tracking-[0.2em]">Сообщение</div>
+                  <div className="text-sm text-white/80 whitespace-pre-wrap break-words">{deletePreviewText}</div>
+                  <div className="text-xs text-white/40">
+                    @{nameById(deleteDialog.message.senderId)} ·{' '}
+                    {new Date(deleteDialog.message.createdAt || deleteDialog.message.created_at || Date.now()).toLocaleString()}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeDeleteDialog}
+                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
+                disabled={deleteDialog.loading}
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteMessage}
+                className="px-4 py-2 rounded-2xl bg-red-500/80 hover:bg-red-500 transition text-sm text-white disabled:opacity-60"
+                disabled={deleteDialog.loading}
+              >
+                {deleteDialog.loading ? 'Удаление...' : 'Удалить'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {editDialog && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
+          onClick={closeEditDialog}
+        >
+          <div className="panel w-full max-w-lg rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
+              <div>
+                <div className="text-lg font-semibold text-white/90">Редактирование сообщения</div>
+                {editDialog.message && (
+                  <div className="text-xs text-white/60 mt-1">@{nameById(editDialog.message.senderId)}</div>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={closeEditDialog}
+                className="text-white/40 hover:text-white/80 transition"
+                disabled={editDialog.loading}
+              >
+                ✕
+              </button>
+            </div>
+            {editDialog.error && <div className="px-5 py-3 text-sm text-red-300 bg-red-500/10">{editDialog.error}</div>}
+            <div className="px-5 py-4 space-y-4">
+              <textarea
+                value={editDialog.value}
+                onChange={(e) =>
+                  setEditDialog((state) => (state ? { ...state, value: e.target.value } : state))
+                }
+                rows={5}
+                className="w-full bg-white/10 rounded-2xl px-4 py-3 text-sm text-white/90 placeholder:text-white/40 outline-none resize-none focus:ring-2 focus:ring-white/40"
+                placeholder="Введите сообщение"
+                disabled={editDialog.loading}
+              />
+              <div className="text-xs text-white/40">
+                Изменённое сообщение увидят все участники чата.
+              </div>
+            </div>
+            <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeEditDialog}
+                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
+                disabled={editDialog.loading}
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={confirmEditMessage}
+                className="px-4 py-2 rounded-2xl bg-white/80 text-black hover:bg-white transition text-sm disabled:bg-white/40 disabled:text-white/60"
+                disabled={editDialog.loading}
+              >
+                {editDialog.loading ? 'Сохранение...' : 'Сохранить'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {membersDialogOpen && currentChannel && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
+          onClick={closeMembersDialog}
+        >
+          <div className="panel w-full max-w-3xl rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-6 py-4 border-b border-white/10">
+              <div>
+                <div className="text-lg font-semibold text-white/90">Участники #{currentChannel.name}</div>
+                <div className="text-xs text-white/60 mt-1">Управление доступом к приватной комнате</div>
+              </div>
+              <button
+                type="button"
+                onClick={closeMembersDialog}
+                className="text-white/40 hover:text-white/80 transition"
+                disabled={membersLoading}
+              >
+                ✕
+              </button>
+            </div>
+            {membersError && <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{membersError}</div>}
+            <div className="px-6 py-4 space-y-6 max-h-[70vh] overflow-y-auto scroll-thin">
+              <div>
+                <div className="text-xs uppercase tracking-[0.2em] text-white/40 mb-2">Текущие участники</div>
+                {membersLoading && channelMembers.length === 0 ? (
+                  <div className="text-sm text-white/50 py-4">Загрузка участников...</div>
+                ) : channelMembers.length ? (
+                  <div className="space-y-2">
+                    {channelMembers.map((entry) => (
+                      <div
+                        key={entry.user.id}
+                        className="flex items-center justify-between gap-3 glass px-3 py-2 rounded-2xl"
+                      >
+                        <div className="flex items-center gap-3">
+                          <AvatarImage user={entry.user} size={32} src={buildAvatarUrl?.(entry.user)} />
+                          <div>
+                            <div className="text-sm text-white/90">@{entry.user.username}</div>
+                            <div className="text-[11px] text-white/40">
+                              {entry.role === 'owner'
+                                ? 'Создатель'
+                                : entry.role === 'admin'
+                                ? 'Админ'
+                                : 'Участник'}
+                            </div>
+                          </div>
+                        </div>
+                        {canRemoveMemberEntry(entry) && (
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveMember(entry.user.id)}
+                            className="text-xs text-red-300 hover:text-red-200 transition"
+                            disabled={membersLoading}
+                          >
+                            Удалить
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-sm text-white/50 py-4">Участников пока нет</div>
+                )}
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-[0.2em] text-white/40 mb-2">Добавить участников</div>
+                {availableMemberCandidates.length ? (
+                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                    {availableMemberCandidates.map((user) => {
+                      const checked = selectedNewMembers.includes(user.id)
+                      return (
+                        <label
+                          key={user.id}
+                          className="flex items-center justify-between gap-3 glass px-3 py-2 rounded-2xl cursor-pointer hover:bg-white/10 transition"
+                        >
+                          <div className="flex items-center gap-3">
+                            <AvatarImage user={user} size={28} src={buildAvatarUrl?.(user)} />
+                            <div className="text-sm text-white/80">@{user.username}</div>
+                          </div>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => handleSelectedMemberToggle(user.id)}
+                            disabled={membersLoading}
+                          />
+                        </label>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <div className="text-sm text-white/50 py-2">Нет доступных пользователей</div>
+                )}
+              </div>
+            </div>
+            <div className="px-6 py-4 border-t border-white/10 flex items-center justify-between gap-3">
+              <div className="text-xs text-white/40">
+                {membersLoading
+                  ? 'Обновление списка...'
+                  : selectedNewMembers.length
+                  ? `${selectedNewMembers.length} выбран(о)`
+                  : ''}
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={closeMembersDialog}
+                  className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
+                  disabled={membersLoading}
+                >
+                  Закрыть
+                </button>
+                <button
+                  type="button"
+                  onClick={handleAddMembers}
+                  className="px-4 py-2 rounded-2xl bg-white/80 text-black hover:bg-white transition text-sm disabled:bg-white/40 disabled:text-white/60"
+                  disabled={membersLoading || selectedNewMembers.length === 0}
+                >
+                  {membersLoading ? 'Сохранение...' : 'Добавить'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       {uploadDialog && (
         <div
           className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
@@ -727,27 +1487,50 @@ export default function Chat() {
               <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{uploadDialog.error}</div>
             )}
             <div className="flex-1 overflow-y-auto px-6 py-4 grid gap-4 md:grid-cols-2">
-              {uploadDialog.items.map((item) => (
-                <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
-                  <button
-                    type="button"
-                    className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
-                    onClick={() => removePendingFile(item.id)}
-                    disabled={uploadDialog.loading}
-                  >
-                    ✕
-                  </button>
-                  <div className="h-40 bg-black/40 rounded-2xl overflow-hidden flex items-center justify-center">
-                    {item.preview ? (
-                      <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
-                    ) : (
-                      <div className="text-white/50 text-sm">{item.file.type || 'Файл'}</div>
-                    )}
+              {uploadDialog.items.map((item, index) => {
+                const isImage = item.file.type?.startsWith('image/')
+                const descriptor = guessFileDescriptor(item.file)
+                const glyph = guessFileGlyph(item.file)
+                const sizeLabel = formatFileSize(item.file.size)
+                return (
+                  <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
+                    <button
+                      type="button"
+                      className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
+                      onClick={() => removePendingFile(item.id)}
+                      disabled={uploadDialog.loading}
+                    >
+                      ✕
+                    </button>
+                    <div
+                      className={`h-40 rounded-2xl overflow-hidden flex items-center justify-center relative ${
+                        isImage ? 'bg-black/40' : 'bg-gradient-to-br from-white/10 via-white/5 to-white/0'
+                      }`}
+                    >
+                      {item.preview && isImage ? (
+                        <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
+                      ) : (
+                        <div className="flex flex-col items-center justify-center text-center px-4 text-white/70">
+                          <div className="text-3xl mb-2">{glyph}</div>
+                          <div className="text-xs uppercase tracking-[0.3em] text-white/50">{descriptor}</div>
+                        </div>
+                      )}
+                      <div className="absolute left-3 top-3 text-[11px] uppercase tracking-[0.3em] text-white/50">
+                        {String(index + 1).padStart(2, '0')}
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-sm text-white/90 truncate" title={item.file.name}>
+                        {item.file.name}
+                      </div>
+                      <div className="flex items-center justify-between text-xs text-white/50">
+                        <span>{descriptor}</span>
+                        <span>{sizeLabel}</span>
+                      </div>
+                    </div>
                   </div>
-                  <div className="text-sm text-white/80 truncate">{item.file.name}</div>
-                  <div className="text-xs text-white/50">{(item.file.size / 1024 / 1024).toFixed(2)} МБ</div>
-                </div>
-              ))}
+                )
+              })}
               {uploadDialog.items.length === 0 && (
                 <div className="col-span-full text-sm text-white/50">Файлы не выбраны</div>
               )}
@@ -828,6 +1611,32 @@ export default function Chat() {
           onClick={closeImagePreview}
         >
           <div className="relative max-w-5xl w-full" onClick={(e) => e.stopPropagation()}>
+            {hasPrev && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  goPrevPreview()
+                }}
+                className="absolute left-2 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-black/60 hover:bg-black/70 text-white flex items-center justify-center transition"
+                aria-label="Предыдущее изображение"
+              >
+                ‹
+              </button>
+            )}
+            {hasNext && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  goNextPreview()
+                }}
+                className="absolute right-2 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-black/60 hover:bg-black/70 text-white flex items-center justify-center transition"
+                aria-label="Следующее изображение"
+              >
+                ›
+              </button>
+            )}
             {previewUrl ? (
               <img src={previewUrl} alt={previewName} className="w-full max-h-[70vh] object-contain rounded-3xl" />
             ) : (
@@ -836,7 +1645,14 @@ export default function Chat() {
               </div>
             )}
             <div className="flex items-center justify-between mt-4 text-white/80 text-sm gap-4">
-              <div className="truncate">{previewName}</div>
+              <div className="truncate">
+                {previewName}
+                {previewSiblings.length > 1 && previewIndex >= 0 && (
+                  <span className="ml-2 text-white/40 text-xs">
+                    {previewIndex + 1} / {previewSiblings.length}
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-3">
                 <button
                   type="button"
