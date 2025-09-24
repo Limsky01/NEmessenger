@@ -228,7 +228,7 @@ const selectUserById = db.prepare('SELECT * FROM users WHERE id=?')
 const updateAvatarInfoStmt = db.prepare('UPDATE users SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?')
 const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id=?')
 const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
-const countAdminsStmt = db.prepare('SELECT COUNT(*) as count FROM users WHERE role="admin"')
+const countAdminsStmt = db.prepare("SELECT COUNT(*) as count FROM users WHERE role='admin'")
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
 
