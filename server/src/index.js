@@ -10,6 +10,7 @@ import { v4 as uuidv4 } from 'uuid'
 import fs from 'fs'
 import path from 'path'
 import multer from 'multer'
+import crypto from 'crypto'
 
 const app = express()
 const server = http.createServer(app)
@@ -20,6 +21,120 @@ const timestamp = () => new Date().toISOString()
 const log = (...args) => console.log(timestamp(), ...args)
 const warn = (...args) => console.warn(timestamp(), ...args)
 const logError = (...args) => console.error(timestamp(), ...args)
+
+const resolveEncryptionKey = () => {
+  const raw = process.env.ENCRYPTION_KEY || ''
+  if (!raw) throw new Error('ENCRYPTION_KEY environment variable is required for encryption')
+  let candidate = null
+  try {
+    const buf = Buffer.from(raw, 'base64')
+    if (buf.length === 32) candidate = buf
+  } catch (_) {}
+  if (!candidate) {
+    try {
+      const buf = Buffer.from(raw, 'hex')
+      if (buf.length === 32) candidate = buf
+    } catch (_) {}
+  }
+  if (!candidate) throw new Error('ENCRYPTION_KEY must be a 32-byte key encoded in base64 or hex')
+  return candidate
+}
+
+const DATA_ENCRYPTION_KEY = resolveEncryptionKey()
+const ENCRYPTED_PREFIX = 'ENC1:'
+
+const encryptText = (plain) => {
+  const text = typeof plain === 'string' ? plain : String(plain ?? '')
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  const payload = Buffer.concat([iv, tag, encrypted])
+  return ENCRYPTED_PREFIX + payload.toString('base64')
+}
+
+const decryptText = (maybeEncrypted) => {
+  if (!maybeEncrypted || typeof maybeEncrypted !== 'string') return maybeEncrypted
+  if (!maybeEncrypted.startsWith(ENCRYPTED_PREFIX)) return maybeEncrypted
+  try {
+    const payload = Buffer.from(maybeEncrypted.slice(ENCRYPTED_PREFIX.length), 'base64')
+    if (payload.length <= 28) return maybeEncrypted
+    const iv = payload.subarray(0, 12)
+    const tag = payload.subarray(12, 28)
+    const ciphertext = payload.subarray(28)
+    const decipher = crypto.createDecipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
+    decipher.setAuthTag(tag)
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+    return decrypted.toString('utf8')
+  } catch (err) {
+    warn('[ENCRYPTION] decrypt text failed', err.message)
+    return maybeEncrypted
+  }
+}
+
+const createFileCipher = () => {
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
+  return { cipher, iv }
+}
+
+const createFileDecipher = (ivBase64, tagBase64) => {
+  if (!ivBase64 || !tagBase64) return null
+  try {
+    const iv = Buffer.from(ivBase64, 'base64')
+    const tag = Buffer.from(tagBase64, 'base64')
+    if (iv.length !== 12 || tag.length !== 16) return null
+    const decipher = crypto.createDecipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
+    decipher.setAuthTag(tag)
+    return decipher
+  } catch (err) {
+    warn('[ENCRYPTION] init file decipher failed', err.message)
+    return null
+  }
+}
+
+const pipeFileToResponse = (file, res) => {
+  const stream = fs.createReadStream(file.path)
+  const handleStreamError = (err) => {
+    warn('[FILES] stream error', err?.message || err)
+    if (!res.headersSent) {
+      try {
+        res.status(500).end()
+      } catch (_) {}
+    } else {
+      res.destroy(err)
+    }
+  }
+  stream.on('error', handleStreamError)
+  if (!file.iv || !file.auth_tag) {
+    stream.pipe(res)
+    return
+  }
+  const decipher = createFileDecipher(file.iv, file.auth_tag)
+  if (!decipher) {
+    stream.destroy()
+    if (!res.headersSent) {
+      try {
+        res.status(500).end()
+      } catch (_) {}
+    } else {
+      res.destroy(new Error('decrypt_init_failed'))
+    }
+    return
+  }
+  decipher.on('error', (err) => {
+    warn('[ENCRYPTION] file decrypt failed', err?.message || err)
+    stream.destroy(err)
+    if (!res.headersSent) {
+      try {
+        res.status(500).end()
+      } catch (_) {}
+    } else {
+      res.destroy(err)
+    }
+  })
+  stream.pipe(decipher).pipe(res)
+}
 
 app.use(cors({ origin: origins, credentials: true }))
 app.use(express.json({ limit: '5mb' }))
@@ -100,6 +215,12 @@ try {
 try {
   db.prepare('ALTER TABLE users ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
 } catch (err) {}
+try {
+  db.prepare('ALTER TABLE files ADD COLUMN iv TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE files ADD COLUMN auth_tag TEXT DEFAULT ""').run()
+} catch (err) {}
 
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
@@ -108,6 +229,14 @@ const updateAvatarInfoStmt = db.prepare('UPDATE users SET avatar_url=?, avatar_u
 const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id=?')
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
+
+const decryptMessageRow = (row) => {
+  if (!row) return row
+  if (typeof row.content === 'undefined') return row
+  return { ...row, content: decryptText(row.content) }
+}
+
+const decryptMessages = (rows) => rows.map(decryptMessageRow)
 
 let defaultWs = db.prepare('SELECT id FROM workspaces LIMIT 1').get()
 if (!defaultWs) {
@@ -416,36 +545,41 @@ app.post('/api/upload/complete', auth, (req, res) => {
   const safeName = filename.replace(/[^a-zA-Z0-9_.-]/g, '_')
   const finalId = uuidv4()
   const finalPath = path.join(UPLOAD_DIR, `${finalId}_${safeName}`)
-
+  const { cipher, iv } = createFileCipher()
+  let authTagBase64 = ''
+  let plaintextSize = 0
+  let fd
   try {
-    const fd = fs.openSync(finalPath, 'w')
-    try {
-      for (const chunkName of chunks) {
-        const chunkPath = path.join(tmpDir, chunkName)
-        const data = fs.readFileSync(chunkPath)
-        fs.writeSync(fd, data)
-      }
-    } finally {
-      fs.closeSync(fd)
+    fd = fs.openSync(finalPath, 'w')
+    for (const chunkName of chunks) {
+      const chunkPath = path.join(tmpDir, chunkName)
+      const data = fs.readFileSync(chunkPath)
+      plaintextSize += data.length
+      const encryptedPart = cipher.update(data)
+      if (encryptedPart.length) fs.writeSync(fd, encryptedPart)
     }
+    const finalEncrypted = cipher.final()
+    if (finalEncrypted.length) fs.writeSync(fd, finalEncrypted)
+    authTagBase64 = cipher.getAuthTag().toString('base64')
   } catch (err) {
+    warn('[UPLOAD] encryption failed', err.message)
+    try {
+      if (fd) fs.closeSync(fd)
+    } catch (_) {}
     try { fs.unlinkSync(finalPath) } catch (_) {}
+    fs.rmSync(tmpDir, { recursive: true, force: true })
     return res.status(500).json({ error: 'merge_failed' })
   } finally {
+    try {
+      if (fd) fs.closeSync(fd)
+    } catch (_) {}
     fs.rmSync(tmpDir, { recursive: true, force: true })
   }
 
-  let size = 0
-  try {
-    size = fs.statSync(finalPath).size
-  } catch (err) {
-    return res.status(500).json({ error: 'stat_failed' })
-  }
-
-  db.prepare('INSERT INTO files (id,uploader_id,original_name,mime,size,path,created_at) VALUES (?,?,?,?,?,?,?)')
-    .run(finalId, req.user.id, filename, mime || '', size, finalPath, Date.now())
-  log('[UPLOAD] complete', 'user=' + req.user.id, 'upload=' + uploadId, 'file=' + finalId, 'name=' + filename, 'size=' + size)
-  res.json({ file: { id: finalId, name: filename, mime: mime || '', size } })
+  db.prepare('INSERT INTO files (id,uploader_id,original_name,mime,size,path,created_at,iv,auth_tag) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(finalId, req.user.id, filename, mime || '', plaintextSize, finalPath, Date.now(), iv.toString('base64'), authTagBase64)
+  log('[UPLOAD] complete', 'user=' + req.user.id, 'upload=' + uploadId, 'file=' + finalId, 'name=' + filename, 'size=' + plaintextSize)
+  res.json({ file: { id: finalId, name: filename, mime: mime || '', size: plaintextSize } })
 })
 
 app.get('/api/files/:id/meta', auth, (req, res) => {
@@ -462,9 +596,8 @@ app.get('/api/files/:id', auth, (req, res) => {
   log('[FILES] download', 'user=' + req.user.id, 'file=' + req.params.id, 'name=' + file.original_name)
   res.setHeader('Content-Type', file.mime || 'application/octet-stream')
   res.setHeader('Content-Disposition', `attachment; filename="${file.original_name}"`)
-  const stream = fs.createReadStream(file.path)
-  stream.on('error', () => res.status(500).end())
-  stream.pipe(res)
+  if (typeof file.size === 'number' && Number.isFinite(file.size)) res.setHeader('Content-Length', file.size)
+  pipeFileToResponse(file, res)
 })
 
 app.get('/api/files/:id/view', auth, (req, res) => {
@@ -474,9 +607,8 @@ app.get('/api/files/:id/view', auth, (req, res) => {
   log('[FILES] inline', 'user=' + req.user.id, 'file=' + req.params.id, 'name=' + file.original_name)
   res.setHeader('Content-Type', file.mime || 'application/octet-stream')
   res.setHeader('Content-Disposition', `inline; filename="${file.original_name}"`)
-  const stream = fs.createReadStream(file.path)
-  stream.on('error', () => res.status(500).end())
-  stream.pipe(res)
+  if (typeof file.size === 'number' && Number.isFinite(file.size)) res.setHeader('Content-Length', file.size)
+  pipeFileToResponse(file, res)
 })
 
 app.delete('/api/messages/:id', auth, (req, res) => {
@@ -520,7 +652,7 @@ io.on('connection', (socket) => {
 
   socket.on('init:request', ({ limit = 50, offset = 0 } = {}) => {
     log('[SOCKET] init:request', 'user=' + userId, 'limit=' + limit, 'offset=' + offset)
-    const messages = activeChannelId ? listMessages.all(activeChannelId, limit, offset).reverse() : []
+    const messages = activeChannelId ? decryptMessages(listMessages.all(activeChannelId, limit, offset)).reverse() : []
     socket.emit('init:response', { workspaces: [{ id: wsId, name: 'Home' }], channels, activeChannelId, messages })
   })
 
@@ -533,13 +665,13 @@ io.on('connection', (socket) => {
       if (!normalized) return
       for (const room of socket.rooms) if (room !== socket.id) socket.leave(room)
       socket.join(normalized)
-      const msgs = listMessages.all(normalized, 50, 0).reverse()
+      const msgs = decryptMessages(listMessages.all(normalized, 50, 0)).reverse()
       socket.emit('channel:opened', { channelId: normalized, messages: msgs })
       return
     }
     for (const room of socket.rooms) if (room !== socket.id) socket.leave(room)
     socket.join(channelId)
-    const msgs = listMessages.all(channelId, 50, 0).reverse()
+    const msgs = decryptMessages(listMessages.all(channelId, 50, 0)).reverse()
     socket.emit('channel:opened', { channelId, messages: msgs })
   })
 
@@ -557,7 +689,8 @@ io.on('connection', (socket) => {
     }
     const id = uuidv4()
     const now = Date.now()
-    insertMessage.run(id, targetChannel, userId, content, now)
+    const encryptedContent = encryptText(content)
+    insertMessage.run(id, targetChannel, userId, encryptedContent, now)
     const payload = { id, channelId: targetChannel, senderId: userId, content, createdAt: now }
     io.to(targetChannel).emit('message:new', payload)
     log('[MESSAGE] send', 'user=' + userId, 'channel=' + targetChannel, 'bytes=' + Buffer.byteLength(content, 'utf8'))
@@ -582,7 +715,7 @@ io.on('connection', (socket) => {
       if (!normalized) return
       targetChannel = normalized
     }
-    const msgs = listMessages.all(targetChannel, limit, offset).reverse()
+    const msgs = decryptMessages(listMessages.all(targetChannel, limit, offset)).reverse()
     socket.emit('messages:page', { channelId: targetChannel, messages: msgs, offset, limit })
   })
 
