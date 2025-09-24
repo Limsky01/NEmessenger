@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import useStore from '../state/store.js'
 import AvatarImage from './AvatarImage.jsx'
 
@@ -26,6 +26,23 @@ function SendIcon({ className = 'w-5 h-5' }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <line x1="22" y1="2" x2="11" y2="13" />
       <polygon points="22 2 15 22 11 13 2 9 22 2" />
+    </svg>
+  )
+}
+
+function PlayIcon({ className = 'w-5 h-5' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="currentColor">
+      <path d="M6 4.5v15l12-7.5-12-7.5z" />
+    </svg>
+  )
+}
+
+function PauseIcon({ className = 'w-5 h-5' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="currentColor">
+      <rect x="5" y="4" width="5" height="16" rx="1" />
+      <rect x="14" y="4" width="5" height="16" rx="1" />
     </svg>
   )
 }
@@ -154,59 +171,228 @@ const useAttachmentMeta = (token) => {
   return { fileName, mime, isImage, isAudio, inlineUrl }
 }
 
-function FileAttachment({ token, openFile }) {
-  const { fileName, inlineUrl, isAudio } = useAttachmentMeta(token)
-  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
-  const audioRef = React.useRef(null)
+const formatTime = (seconds) => {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00'
+  const total = Math.floor(seconds)
+  const mins = Math.floor(total / 60)
+  const secs = total % 60
+  return `${mins}:${secs.toString().padStart(2, '0')}`
+}
 
-  React.useEffect(() => {
-    if (!isAudio) return
+const formatFileSize = (bytes) => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 Б'
+  const units = ['Б', 'КБ', 'МБ', 'ГБ']
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value.toFixed(unitIndex === 0 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`
+}
+
+const guessFileGlyph = (file) => {
+  const name = file?.name?.toLowerCase() || ''
+  const type = file?.type?.toLowerCase() || ''
+  if (type.startsWith('audio/')) return '🎵'
+  if (type.startsWith('video/')) return '🎬'
+  if (type.startsWith('image/')) return '🖼️'
+  if (type === 'application/pdf' || name.endsWith('.pdf')) return '📄'
+  if (/\.(zip|rar|7z|tar|gz)$/i.test(name)) return '🗜️'
+  if (/\.(docx?|odt)$/i.test(name)) return '📝'
+  if (/\.(pptx?|pps)$/i.test(name)) return '📊'
+  if (/\.(xlsx?|ods)$/i.test(name)) return '📈'
+  return '📎'
+}
+
+const guessFileDescriptor = (file) => {
+  const type = file?.type || ''
+  if (type.startsWith('image/')) return 'Изображение'
+  if (type.startsWith('audio/')) return 'Аудио'
+  if (type.startsWith('video/')) return 'Видео'
+  if (type === 'application/pdf') return 'PDF-документ'
+  if (type.includes('zip') || type.includes('rar')) return 'Архив'
+  const ext = file?.name?.split('.')?.pop()?.toUpperCase() || ''
+  return ext ? `${ext}-файл` : 'Файл'
+}
+
+function AudioAttachment({ token, openFile }) {
+  const { fileName, inlineUrl } = useAttachmentMeta(token)
+  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const audioRef = useRef(null)
+  const [duration, setDuration] = useState(0)
+  const [currentTime, setCurrentTime] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [playing, setPlaying] = useState(false)
+
+  useEffect(() => {
+    const element = audioRef.current
+    if (!element) return undefined
+
+    const handleLoaded = () => {
+      setDuration(Number.isFinite(element.duration) ? element.duration : 0)
+      setLoading(false)
+    }
+    const handleTime = () => setCurrentTime(element.currentTime || 0)
+    const handlePlay = () => setPlaying(true)
+    const handlePause = () => setPlaying(false)
+    const handleWaiting = () => setLoading(true)
+    const handlePlaying = () => setLoading(false)
+    const handleEnded = () => {
+      setPlaying(false)
+      setCurrentTime(Number.isFinite(element.duration) ? element.duration : 0)
+    }
+
+    element.addEventListener('loadedmetadata', handleLoaded)
+    element.addEventListener('timeupdate', handleTime)
+    element.addEventListener('play', handlePlay)
+    element.addEventListener('pause', handlePause)
+    element.addEventListener('waiting', handleWaiting)
+    element.addEventListener('playing', handlePlaying)
+    element.addEventListener('ended', handleEnded)
+
+    return () => {
+      element.removeEventListener('loadedmetadata', handleLoaded)
+      element.removeEventListener('timeupdate', handleTime)
+      element.removeEventListener('play', handlePlay)
+      element.removeEventListener('pause', handlePause)
+      element.removeEventListener('waiting', handleWaiting)
+      element.removeEventListener('playing', handlePlaying)
+      element.removeEventListener('ended', handleEnded)
+    }
+  }, [])
+
+  useEffect(() => {
     const element = audioRef.current
     if (!element) return
-    if (inlineUrl && element.src !== inlineUrl) {
-      element.src = inlineUrl
+    setLoading(true)
+    setDuration(0)
+    setCurrentTime(0)
+    if (inlineUrl) {
+      if (element.src !== inlineUrl) {
+        element.src = inlineUrl
+      }
+      element.load()
+    } else {
+      element.removeAttribute('src')
     }
+  }, [inlineUrl])
+
+  useEffect(() => {
+    if (!inlineUrl) return
+    const element = audioRef.current
+    if (!element) return
     if (typeof element.setSinkId === 'function') {
       const sinkId = audioOutputDeviceId || 'default'
       element.setSinkId(sinkId).catch((err) => console.warn('setSinkId failed', err))
     }
-  }, [isAudio, inlineUrl, audioOutputDeviceId])
+  }, [inlineUrl, audioOutputDeviceId])
 
-  if (isAudio) {
-    return (
-      <div className="glass rounded-3xl px-4 py-3 space-y-2 text-white/80">
-        <div className="flex items-center justify-between gap-3 text-sm">
-          <span className="truncate">{fileName}</span>
-          <button
-            type="button"
-            onClick={() => openFile(token.id, fileName)}
-            className="px-3 py-1 rounded-2xl bg-white/10 hover:bg-white/20 transition"
-          >
-            Скачать
-          </button>
+  useEffect(
+    () => () => {
+      const element = audioRef.current
+      if (element) element.pause()
+    },
+    [],
+  )
+
+  const handleToggle = () => {
+    const element = audioRef.current
+    if (!element || !inlineUrl) return
+    if (playing) {
+      element.pause()
+    } else {
+      element.play().catch((err) => {
+        console.warn('audio play failed', err)
+      })
+    }
+  }
+
+  const handleSeek = (event) => {
+    const element = audioRef.current
+    if (!element) return
+    const value = Number(event.target.value)
+    if (Number.isFinite(value)) {
+      element.currentTime = Math.max(0, Math.min(value, element.duration || value))
+    }
+  }
+
+  const progress = duration > 0 ? (currentTime / duration) * 100 : 0
+
+  return (
+    <div className="glass rounded-3xl px-4 py-3 text-white/80">
+      <div className="flex items-center gap-4">
+        <button
+          type="button"
+          onClick={handleToggle}
+          disabled={!inlineUrl}
+          className="w-11 h-11 flex items-center justify-center rounded-full bg-white/20 hover:bg-white/30 transition disabled:opacity-50"
+        >
+          {playing ? <PauseIcon className="w-4 h-4 text-black" /> : <PlayIcon className="w-4 h-4 text-black" />}
+        </button>
+        <div className="flex-1 space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <span className="truncate text-sm">{fileName}</span>
+            <span className="text-xs text-white/50 whitespace-nowrap">
+              {formatTime(currentTime)} / {formatTime(duration)}
+            </span>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="relative flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden">
+              <div className="absolute inset-y-0 left-0 bg-white/70" style={{ width: `${progress}%` }} />
+              <input
+                type="range"
+                min="0"
+                max={duration || 0}
+                step="0.1"
+                value={Math.min(currentTime, duration || currentTime)}
+                onChange={handleSeek}
+                disabled={!inlineUrl || duration <= 0}
+                className="absolute inset-0 w-full opacity-0 cursor-pointer"
+                aria-label="Перемотка аудио"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => openFile(token.id, fileName)}
+              className="px-3 py-1.5 rounded-2xl bg-white/10 hover:bg-white/20 transition text-xs"
+            >
+              Скачать
+            </button>
+          </div>
+          {loading && inlineUrl && <div className="text-[11px] text-white/40">Буферизация...</div>}
+          {!inlineUrl && <div className="text-[11px] text-white/40">Загрузка аудио...</div>}
         </div>
-        {inlineUrl ? (
-          <audio ref={audioRef} controls preload="metadata" className="w-full" />
-        ) : (
-          <div className="text-xs text-white/50">Загрузка аудио...</div>
-        )}
       </div>
-    )
+      <audio ref={audioRef} preload="metadata" className="hidden" />
+    </div>
+  )
+}
+
+function FileAttachment({ token, openFile }) {
+  const meta = useAttachmentMeta(token)
+
+  if (meta.isAudio) {
+    return <AudioAttachment token={token} openFile={openFile} />
   }
 
   return (
-    <button type="button" onClick={() => openFile(token.id, fileName)} className="underline flex items-center gap-2 text-left">
+    <button
+      type="button"
+      onClick={() => openFile(token.id, meta.fileName)}
+      className="underline flex items-center gap-2 text-left"
+    >
       <PaperclipIcon className="w-4 h-4" />
-      <span>{fileName}</span>
+      <span>{meta.fileName}</span>
     </button>
   )
 }
 
-function ImageAttachment({ token, openFile, onPreview, style }) {
+function ImageAttachment({ token, openFile, onPreview, style, index = 0, siblings = [] }) {
   const { fileName, inlineUrl } = useAttachmentMeta(token)
   const handleClick = () => {
     if (onPreview) {
-      onPreview({ id: token.id, name: fileName })
+      onPreview({ id: token.id, name: fileName, index, siblings })
       return
     }
     openFile(token.id, fileName)
@@ -275,6 +461,7 @@ function ImageGallery({ tokens, openFile, onPreview }) {
   const count = tokens.length
   if (count === 0) return null
   const { container, item } = buildGalleryLayout(count)
+  const siblingList = tokens.map((entry) => ({ id: entry.id, name: entry.name }))
 
   return (
     <div className="w-full" style={container}>
@@ -284,6 +471,8 @@ function ImageGallery({ tokens, openFile, onPreview }) {
           token={token}
           openFile={openFile}
           onPreview={onPreview}
+          index={index}
+          siblings={siblingList}
           style={item(index)}
         />
       ))}
@@ -510,15 +699,6 @@ export default function Chat() {
   }, [imagePreview, ensureFileMeta])
 
   useEffect(() => {
-    if (!imagePreview) return undefined
-    const handler = (event) => {
-      if (event.key === 'Escape') setImagePreview(null)
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [imagePreview])
-
-  useEffect(() => {
     uploadDialogRef.current = uploadDialog
   }, [uploadDialog])
 
@@ -548,11 +728,53 @@ export default function Chat() {
   const previewMeta = imagePreview ? files[imagePreview.id] : null
   const previewName = imagePreview?.name || previewMeta?.name || 'Изображение'
   const previewUrl = imagePreview ? buildFileUrl?.(imagePreview.id, { inline: true }) : null
+  const stepPreview = useCallback((delta) => {
+    setImagePreview((current) => {
+      if (!current) return current
+      const siblings = current.siblings || []
+      if (!siblings.length) return current
+      const baseIndex =
+        typeof current.index === 'number' ? current.index : siblings.findIndex((item) => item.id === current.id)
+      if (baseIndex < 0) return current
+      const nextIndex = baseIndex + delta
+      if (nextIndex < 0 || nextIndex >= siblings.length) return current
+      const nextItem = siblings[nextIndex]
+      return { ...current, ...nextItem, index: nextIndex }
+    })
+  }, [])
+  const previewSiblings = imagePreview?.siblings || []
+  const previewIndex = useMemo(() => {
+    if (!imagePreview) return -1
+    if (typeof imagePreview.index === 'number') return imagePreview.index
+    const idx = previewSiblings.findIndex((item) => item.id === imagePreview.id)
+    return idx
+  }, [imagePreview, previewSiblings])
+  const hasPrev = previewIndex > 0
+  const hasNext = previewIndex >= 0 && previewIndex < previewSiblings.length - 1
+  const goPrevPreview = () => stepPreview(-1)
+  const goNextPreview = () => stepPreview(1)
   const closeImagePreview = () => setImagePreview(null)
   const downloadPreview = () => {
     if (!imagePreview) return
     openFile(imagePreview.id, previewName)
   }
+
+  useEffect(() => {
+    if (!imagePreview) return undefined
+    const handler = (event) => {
+      if (event.key === 'Escape') setImagePreview(null)
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault()
+        goPrevPreview()
+      }
+      if (event.key === 'ArrowRight') {
+        event.preventDefault()
+        goNextPreview()
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [imagePreview, goNextPreview, goPrevPreview])
 
   const cleanupUploadDialog = (dialog) => {
     dialog?.items?.forEach((item) => {
@@ -1265,27 +1487,50 @@ export default function Chat() {
               <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{uploadDialog.error}</div>
             )}
             <div className="flex-1 overflow-y-auto px-6 py-4 grid gap-4 md:grid-cols-2">
-              {uploadDialog.items.map((item) => (
-                <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
-                  <button
-                    type="button"
-                    className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
-                    onClick={() => removePendingFile(item.id)}
-                    disabled={uploadDialog.loading}
-                  >
-                    ✕
-                  </button>
-                  <div className="h-40 bg-black/40 rounded-2xl overflow-hidden flex items-center justify-center">
-                    {item.preview ? (
-                      <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
-                    ) : (
-                      <div className="text-white/50 text-sm">{item.file.type || 'Файл'}</div>
-                    )}
+              {uploadDialog.items.map((item, index) => {
+                const isImage = item.file.type?.startsWith('image/')
+                const descriptor = guessFileDescriptor(item.file)
+                const glyph = guessFileGlyph(item.file)
+                const sizeLabel = formatFileSize(item.file.size)
+                return (
+                  <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
+                    <button
+                      type="button"
+                      className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
+                      onClick={() => removePendingFile(item.id)}
+                      disabled={uploadDialog.loading}
+                    >
+                      ✕
+                    </button>
+                    <div
+                      className={`h-40 rounded-2xl overflow-hidden flex items-center justify-center relative ${
+                        isImage ? 'bg-black/40' : 'bg-gradient-to-br from-white/10 via-white/5 to-white/0'
+                      }`}
+                    >
+                      {item.preview && isImage ? (
+                        <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
+                      ) : (
+                        <div className="flex flex-col items-center justify-center text-center px-4 text-white/70">
+                          <div className="text-3xl mb-2">{glyph}</div>
+                          <div className="text-xs uppercase tracking-[0.3em] text-white/50">{descriptor}</div>
+                        </div>
+                      )}
+                      <div className="absolute left-3 top-3 text-[11px] uppercase tracking-[0.3em] text-white/50">
+                        {String(index + 1).padStart(2, '0')}
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-sm text-white/90 truncate" title={item.file.name}>
+                        {item.file.name}
+                      </div>
+                      <div className="flex items-center justify-between text-xs text-white/50">
+                        <span>{descriptor}</span>
+                        <span>{sizeLabel}</span>
+                      </div>
+                    </div>
                   </div>
-                  <div className="text-sm text-white/80 truncate">{item.file.name}</div>
-                  <div className="text-xs text-white/50">{(item.file.size / 1024 / 1024).toFixed(2)} МБ</div>
-                </div>
-              ))}
+                )
+              })}
               {uploadDialog.items.length === 0 && (
                 <div className="col-span-full text-sm text-white/50">Файлы не выбраны</div>
               )}
@@ -1366,6 +1611,32 @@ export default function Chat() {
           onClick={closeImagePreview}
         >
           <div className="relative max-w-5xl w-full" onClick={(e) => e.stopPropagation()}>
+            {hasPrev && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  goPrevPreview()
+                }}
+                className="absolute left-2 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-black/60 hover:bg-black/70 text-white flex items-center justify-center transition"
+                aria-label="Предыдущее изображение"
+              >
+                ‹
+              </button>
+            )}
+            {hasNext && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  goNextPreview()
+                }}
+                className="absolute right-2 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-black/60 hover:bg-black/70 text-white flex items-center justify-center transition"
+                aria-label="Следующее изображение"
+              >
+                ›
+              </button>
+            )}
             {previewUrl ? (
               <img src={previewUrl} alt={previewName} className="w-full max-h-[70vh] object-contain rounded-3xl" />
             ) : (
@@ -1374,7 +1645,14 @@ export default function Chat() {
               </div>
             )}
             <div className="flex items-center justify-between mt-4 text-white/80 text-sm gap-4">
-              <div className="truncate">{previewName}</div>
+              <div className="truncate">
+                {previewName}
+                {previewSiblings.length > 1 && previewIndex >= 0 && (
+                  <span className="ml-2 text-white/40 text-xs">
+                    {previewIndex + 1} / {previewSiblings.length}
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-3">
                 <button
                   type="button"

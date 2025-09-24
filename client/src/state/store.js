@@ -162,7 +162,6 @@ const normalizeInvite = (raw) => {
   }
 }
 
-
 const normalizeChannel = (raw) => {
   if (!raw) return null
   return {
@@ -1133,11 +1132,3 @@ const useStore = create((set, get) => ({
 }))
 
 export default useStore
-
-
-
-
-
-
-
-
