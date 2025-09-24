@@ -351,8 +351,6 @@ const updateMessageContentStmt = hasMessageUpdatedAtColumn
   ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
   : db.prepare('UPDATE messages SET content=? WHERE id=?')
 
-const updateMessageContentStmt = db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
-
 const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
 const insertChannelStmt = db.prepare(
   'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
@@ -1298,7 +1296,7 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   }
   const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
 
-  const updatedAt = Date.now()
+
   updateMessageContentStmt.run(encryptText(rawContent), updatedAt, message.id)
 
   const payload = {
@@ -1332,9 +1330,7 @@ const insertMessage = hasMessageUpdatedAtColumn
   ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
   : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
 
-const insertMessage = db.prepare(
-  'INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)',
-)
+
 
 const voiceParticipants = new Map()
 const typingState = new Map()
