@@ -146,6 +146,22 @@ const normalizeFileMeta = (raw) => {
   }
 }
 
+const normalizeInvite = (raw) => {
+  if (!raw) return null
+  return {
+    id: raw.id ?? '',
+    code: raw.code ?? '',
+    status: raw.status ?? 'active',
+    createdAt: raw.createdAt ?? raw.created_at ?? 0,
+    expiresAt: raw.expiresAt ?? raw.expires_at ?? 0,
+    claimedAt: raw.claimedAt ?? raw.claimed_at ?? 0,
+    usedAt: raw.usedAt ?? raw.used_at ?? 0,
+    usedBy: raw.usedBy ?? raw.used_by ?? '',
+    revokedAt: raw.revokedAt ?? raw.revoked_at ?? 0,
+    createdBy: raw.createdBy ?? raw.created_by ?? '',
+  }
+}
+
 const deriveKey = (cid) => {
   if (!cid) return null
   const source = encoder.encode(String(cid))
@@ -238,6 +254,7 @@ const useStore = create((set, get) => ({
   activeVoiceRoomId: null,
   voiceStatus: null,
   voiceStream: null,
+  invites: [],
 
   setAuth: (token, user) => set((state) => {
     const normalized = normalizeUser(user)
@@ -670,6 +687,43 @@ const useStore = create((set, get) => ({
       { currentPassword, newPassword },
       { headers: buildAuthHeaders(token) },
     )
+  },
+
+  fetchInvites: async () => {
+    const token = get().token
+    if (!token) return []
+    const { data } = await axios.get(`${get().serverUrl}/api/invites`, { headers: buildAuthHeaders(token) })
+    const invites = Array.isArray(data?.invites) ? data.invites.map(normalizeInvite).filter(Boolean) : []
+    set({ invites })
+    return invites
+  },
+
+  createInvite: async (ttlMs) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const payload = {}
+    if (ttlMs) payload.ttlMs = ttlMs
+    const { data } = await axios.post(`${get().serverUrl}/api/invites`, payload, { headers: buildAuthHeaders(token) })
+    const invite = normalizeInvite(data?.invite)
+    if (invite) {
+      set((state) => ({ invites: [invite, ...state.invites.filter((item) => item.id !== invite.id)] }))
+    }
+    return invite
+  },
+
+  revokeInvite: async (inviteId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/invites/${inviteId}/revoke`,
+      {},
+      { headers: buildAuthHeaders(token) },
+    )
+    const invite = normalizeInvite(data?.invite)
+    if (invite) {
+      set((state) => ({ invites: state.invites.map((item) => (item.id === invite.id ? invite : item)) }))
+    }
+    return invite
   },
 
   // Admin helpers

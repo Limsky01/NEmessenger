@@ -218,7 +218,8 @@ CREATE TABLE IF NOT EXISTS invites (
   claim_token TEXT DEFAULT '',
   claimed_at INTEGER,
   used_by TEXT,
-  used_at INTEGER
+  used_at INTEGER,
+  revoked_at INTEGER
 );
 `)
 
@@ -252,6 +253,9 @@ try {
 try {
   db.prepare('ALTER TABLE invites ADD COLUMN used_at INTEGER').run()
 } catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN revoked_at INTEGER').run()
+} catch (err) {}
 
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
@@ -264,13 +268,16 @@ const listVoiceRoomsStmt = db.prepare('SELECT id, name, created_at, created_by F
 const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
 const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
 const selectVoiceRoomStmt = db.prepare('SELECT id, name FROM voice_rooms WHERE id=?')
-const insertInviteStmt = db.prepare('INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at) VALUES (?,?,?,?,?,?,NULL,NULL,NULL)')
+const insertInviteStmt = db.prepare(
+  'INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at, revoked_at) VALUES (?,?,?,?,?, ?, NULL, NULL, NULL, NULL)'
+)
 const selectInviteByCodeStmt = db.prepare('SELECT * FROM invites WHERE code=?')
 const selectInviteByIdStmt = db.prepare('SELECT * FROM invites WHERE id=?')
 const listInvitesByCreatorStmt = db.prepare('SELECT * FROM invites WHERE created_by=? ORDER BY created_at DESC')
 const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, claimed_at=? WHERE id=?')
 const clearInviteClaimStmt = db.prepare('UPDATE invites SET claim_token="", claimed_at=NULL WHERE id=?')
-const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='' WHERE id=?")
+const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='', revoked_at=NULL WHERE id=?")
+const revokeInviteStmt = db.prepare('UPDATE invites SET revoked_at=?, claim_token="" WHERE id=?')
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
 
@@ -376,14 +383,95 @@ const adminOnly = (req, res, next) => {
   return res.status(403).json({ error: 'forbidden' })
 }
 
+app.post('/api/invites/claim', (req, res) => {
+  const codeRaw = typeof req.body?.code === 'string' ? req.body.code : ''
+  const code = codeRaw.trim().toUpperCase()
+  if (!code) {
+    warn('[INVITES] claim missing code')
+    return res.status(400).json({ error: 'code_required' })
+  }
+  const invite = selectInviteByCodeStmt.get(code)
+  if (!invite) {
+    warn('[INVITES] claim invalid code', code)
+    return res.status(400).json({ error: 'invalid_code' })
+  }
+  const now = Date.now()
+  if (invite.revoked_at) {
+    warn('[INVITES] claim revoked', code)
+    return res.status(400).json({ error: 'invite_revoked' })
+  }
+  if (invite.used_by) {
+    warn('[INVITES] claim used', code)
+    return res.status(400).json({ error: 'invite_used' })
+  }
+  if (invite.expires_at && invite.expires_at < now) {
+    warn('[INVITES] claim expired', code)
+    return res.status(400).json({ error: 'invite_expired' })
+  }
+  const claimToken = generateClaimToken()
+  updateInviteClaimStmt.run(claimToken, now, invite.id)
+  const updated = selectInviteByIdStmt.get(invite.id)
+  const creator = selectUserById.get(invite.created_by)
+  const creatorInfo = creator ? { id: creator.id, username: creator.username } : { id: '', username: '' }
+  log('[INVITES] claimed', code, 'by_ip=' + req.ip)
+  res.json({
+    invite: {
+      code: updated.code,
+      createdAt: updated.created_at,
+      expiresAt: updated.expires_at,
+      status: getInviteStatus(updated),
+      createdBy: creatorInfo,
+    },
+    claimToken,
+  })
+})
+
 app.post('/api/register', (req, res) => {
-  const { username, password } = req.body || {}
+  const { username: rawUsername, password: rawPassword, inviteCode: rawInviteCode, inviteClaimToken } = req.body || {}
+  const username = typeof rawUsername === 'string' ? rawUsername.trim() : ''
+  const password = typeof rawPassword === 'string' ? rawPassword : ''
   if (!username || !password) {
     warn('[REGISTER] invalid payload', req.ip)
-    return res.status(400).json({ error: 'username and password required' })
+    return res.status(400).json({ error: 'username_and_password_required' })
+  }
+  if (password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    warn('[REGISTER] weak password', username)
+    return res.status(400).json({ error: 'weak_password' })
   }
   log('[REGISTER] attempt', username, 'ip=' + req.ip)
-  const isFirstUser = !db.prepare('SELECT 1 FROM users LIMIT 1').get()
+  const firstUserExists = db.prepare('SELECT 1 FROM users LIMIT 1').get()
+  const isFirstUser = !firstUserExists
+  let invite = null
+  if (!isFirstUser) {
+    const inviteCode = typeof rawInviteCode === 'string' ? rawInviteCode.trim().toUpperCase() : ''
+    const claimToken = typeof inviteClaimToken === 'string' ? inviteClaimToken.trim() : ''
+    if (!inviteCode || !claimToken) {
+      warn('[REGISTER] invite required missing data', username)
+      return res.status(400).json({ error: 'invite_required' })
+    }
+    invite = selectInviteByCodeStmt.get(inviteCode)
+    if (!invite) {
+      warn('[REGISTER] invalid invite', inviteCode)
+      return res.status(400).json({ error: 'invalid_invite' })
+    }
+    const now = Date.now()
+    if (invite.revoked_at) {
+      warn('[REGISTER] invite revoked', inviteCode)
+      return res.status(400).json({ error: 'invite_revoked' })
+    }
+    if (invite.used_by) {
+      warn('[REGISTER] invite already used', inviteCode)
+      return res.status(400).json({ error: 'invite_used' })
+    }
+    if (invite.expires_at && invite.expires_at < now) {
+      warn('[REGISTER] invite expired', inviteCode)
+      return res.status(400).json({ error: 'invite_expired' })
+    }
+    if (!invite.claim_token || invite.claim_token !== claimToken) {
+      warn('[REGISTER] invite claim mismatch', inviteCode)
+      return res.status(400).json({ error: 'invite_claim_invalid' })
+    }
+  }
   const id = uuidv4()
   const hash = bcrypt.hashSync(password, 10)
   const role = isFirstUser ? 'admin' : 'user'
@@ -395,9 +483,12 @@ app.post('/api/register', (req, res) => {
     return res.status(400).json({ error: 'username_taken' })
   }
   db.prepare('INSERT OR IGNORE INTO workspace_members (workspace_id,user_id) VALUES (?,?)').run(defaultWs.id, id)
+  if (invite) {
+    markInviteUsedStmt.run(id, Date.now(), invite.id)
+  }
   const token = jwt.sign({ id, username, role, avatar_seed: avatarSeed }, JWT_SECRET, { expiresIn: '30d' })
   const user = publicUser({ id, username, role, avatar_seed: avatarSeed })
-  log('[REGISTER] success', username, 'role=' + role)
+  log('[REGISTER] success', username, 'role=' + role, invite ? 'invite=' + invite.code : 'no_invite')
   res.json({ token, user })
   io.emit('user:update', user)
 })
@@ -418,6 +509,49 @@ app.post('/api/login', (req, res) => {
   const token = jwt.sign({ id: userRecord.id, username: userRecord.username, role: userRecord.role, avatar_seed: userRecord.avatar_seed || '' }, JWT_SECRET, { expiresIn: '30d' })
   log('[LOGIN] success', username)
   res.json({ token, user: publicUser(userRecord) })
+})
+
+app.get('/api/invites', auth, (req, res) => {
+  const invites = listInvitesByCreatorStmt.all(req.user.id).map(formatInvite)
+  log('[INVITES] list', 'user=' + req.user.id, 'count=' + invites.length)
+  res.json({ invites })
+})
+
+app.post('/api/invites', auth, (req, res) => {
+  const maxTtl = 1000 * 60 * 60 * 24 * 30
+  let ttlMs = parseInt(req.body?.ttlMs, 10)
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) ttlMs = INVITE_DEFAULT_TTL
+  if (ttlMs > maxTtl) ttlMs = maxTtl
+  const now = Date.now()
+  const id = uuidv4()
+  const code = generateInviteCode()
+  insertInviteStmt.run(id, code, req.user.id, now, now + ttlMs, '')
+  const invite = selectInviteByIdStmt.get(id)
+  log('[INVITES] create', code, 'user=' + req.user.id, 'ttl=' + ttlMs)
+  res.status(201).json({ invite: formatInvite(invite) })
+})
+
+app.post('/api/invites/:id/revoke', auth, (req, res) => {
+  const invite = selectInviteByIdStmt.get(req.params.id)
+  if (!invite) {
+    warn('[INVITES] revoke missing', req.params.id)
+    return res.status(404).json({ error: 'not_found' })
+  }
+  if (invite.created_by !== req.user.id && req.user.role !== 'admin') {
+    warn('[INVITES] revoke forbidden', 'user=' + req.user.id, 'target=' + invite.id)
+    return res.status(403).json({ error: 'forbidden' })
+  }
+  if (invite.used_by) {
+    warn('[INVITES] revoke used', invite.code)
+    return res.status(400).json({ error: 'invite_used' })
+  }
+  if (invite.revoked_at) {
+    return res.status(400).json({ error: 'invite_revoked' })
+  }
+  revokeInviteStmt.run(Date.now(), invite.id)
+  const updated = selectInviteByIdStmt.get(invite.id)
+  log('[INVITES] revoked', invite.code, 'by=' + req.user.id)
+  res.json({ invite: formatInvite(updated) })
 })
 
 app.get('/api/users', auth, (req, res) => {
@@ -830,9 +964,18 @@ const generateInviteCode = (length = INVITE_CODE_LENGTH) => {
   return code
 }
 
+const generateClaimToken = () =>
+  crypto
+    .randomBytes(24)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+
 const getInviteStatus = (invite) => {
   const now = Date.now()
   if (invite.used_by) return 'used'
+  if (invite.revoked_at) return 'revoked'
   if (invite.expires_at && invite.expires_at < now) return 'expired'
   if (invite.claim_token) return 'claimed'
   return 'active'
@@ -847,6 +990,7 @@ const formatInvite = (invite) => ({
   claimedAt: invite.claimed_at || 0,
   usedAt: invite.used_at || 0,
   usedBy: invite.used_by || '',
+  revokedAt: invite.revoked_at || 0,
   status: getInviteStatus(invite),
 })
 
