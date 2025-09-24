@@ -15,8 +15,24 @@ const app = express()
 const server = http.createServer(app)
 const origins = process.env.ORIGIN ? process.env.ORIGIN.split(',').map((s) => s.trim()) : ['*']
 const io = new Server(server, { cors: { origin: origins, methods: ['GET', 'POST', 'DELETE'] } })
+
+const timestamp = () => new Date().toISOString()
+const log = (...args) => console.log(timestamp(), ...args)
+const warn = (...args) => console.warn(timestamp(), ...args)
+const logError = (...args) => console.error(timestamp(), ...args)
+
 app.use(cors({ origin: origins, credentials: true }))
 app.use(express.json({ limit: '5mb' }))
+
+app.use((req, res, next) => {
+  const start = Date.now()
+  const origin = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'
+  log('[HTTP]', req.method, req.originalUrl, 'from=' + origin)
+  res.on('finish', () => {
+    log('[HTTP:done]', req.method, req.originalUrl, 'status=' + res.statusCode, (Date.now() - start) + 'ms')
+  })
+  next()
+})
 
 const PORT = process.env.PORT || 4000
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret'
@@ -160,11 +176,16 @@ const auth = (req, res, next) => {
     delete req.query.token
   }
   if (!token && req.headers['x-access-token']) token = req.headers['x-access-token']
-  if (!token) return res.status(401).json({ error: 'no_token' })
+  if (!token) {
+    warn('[AUTH] no token provided', req.originalUrl)
+    return res.status(401).json({ error: 'no_token' })
+  }
   try {
     req.user = jwt.verify(token, JWT_SECRET)
+    log('[AUTH] token verified', 'user=' + (req.user.username || req.user.id))
     next()
   } catch (e) {
+    warn('[AUTH] invalid token', e.message)
     return res.status(401).json({ error: 'invalid_token' })
   }
 }
@@ -177,7 +198,11 @@ const adminOnly = (req, res, next) => {
 
 app.post('/api/register', (req, res) => {
   const { username, password } = req.body || {}
-  if (!username || !password) return res.status(400).json({ error: 'username and password required' })
+  if (!username || !password) {
+    warn('[REGISTER] invalid payload', req.ip)
+    return res.status(400).json({ error: 'username and password required' })
+  }
+  log('[REGISTER] attempt', username, 'ip=' + req.ip)
   const isFirstUser = !db.prepare('SELECT 1 FROM users LIMIT 1').get()
   const id = uuidv4()
   const hash = bcrypt.hashSync(password, 10)
@@ -186,44 +211,62 @@ app.post('/api/register', (req, res) => {
   try {
     db.prepare('INSERT INTO users (id,username,password_hash,role,avatar_seed) VALUES (?,?,?,?,?)').run(id, username, hash, role, avatarSeed)
   } catch (e) {
+    warn('[REGISTER] username_taken', username)
     return res.status(400).json({ error: 'username_taken' })
   }
   db.prepare('INSERT OR IGNORE INTO workspace_members (workspace_id,user_id) VALUES (?,?)').run(defaultWs.id, id)
   const token = jwt.sign({ id, username, role, avatar_seed: avatarSeed }, JWT_SECRET, { expiresIn: '30d' })
   const user = publicUser({ id, username, role, avatar_seed: avatarSeed })
+  log('[REGISTER] success', username, 'role=' + role)
   res.json({ token, user })
   io.emit('user:update', user)
 })
 
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {}
+  log('[LOGIN] attempt', username, 'ip=' + req.ip)
   const userRecord = db.prepare('SELECT * FROM users WHERE username=?').get(username)
-  if (!userRecord) return res.status(401).json({ error: 'invalid_credentials' })
-  if (!bcrypt.compareSync(password, userRecord.password_hash)) return res.status(401).json({ error: 'invalid_credentials' })
+  if (!userRecord) {
+    warn('[LOGIN] invalid username', username)
+    return res.status(401).json({ error: 'invalid_credentials' })
+  }
+  if (!bcrypt.compareSync(password, userRecord.password_hash)) {
+    warn('[LOGIN] invalid password', username)
+    return res.status(401).json({ error: 'invalid_credentials' })
+  }
   db.prepare('INSERT OR IGNORE INTO workspace_members (workspace_id,user_id) VALUES (?,?)').run(defaultWs.id, userRecord.id)
   const token = jwt.sign({ id: userRecord.id, username: userRecord.username, role: userRecord.role, avatar_seed: userRecord.avatar_seed || '' }, JWT_SECRET, { expiresIn: '30d' })
+  log('[LOGIN] success', username)
   res.json({ token, user: publicUser(userRecord) })
 })
 
 app.get('/api/users', auth, (req, res) => {
   const users = db.prepare('SELECT id, username, role, avatar_seed FROM users ORDER BY username ASC').all()
+  log('[USERS] list', 'by=' + req.user.id, 'count=' + users.length)
   res.json({ users: users.map(publicUser) })
 })
 
 app.get('/api/profile', auth, (req, res) => {
   const user = selectUserById.get(req.user.id)
-  if (!user) return res.status(404).json({ error: 'not_found' })
+  if (!user) {
+    warn('[PROFILE] not found', req.user.id)
+    return res.status(404).json({ error: 'not_found' })
+  }
+  log('[PROFILE] fetch', 'user=' + req.user.id)
   res.json({ profile: publicUser(user) })
 })
 
 app.post('/api/profile/avatar', auth, (req, res) => {
   avatarUpload.single('avatar')(req, res, (err) => {
     if (err) {
-      console.error('avatar upload failed', err)
+      logError('avatar upload failed', err)
       const code = err.code === 'LIMIT_FILE_SIZE' ? 'avatar_too_large' : 'invalid_avatar'
       return res.status(400).json({ error: code })
     }
-    if (!req.file) return res.status(400).json({ error: 'invalid_avatar' })
+    if (!req.file) {
+      warn('[AVATAR] empty upload', req.user.id)
+      return res.status(400).json({ error: 'invalid_avatar' })
+    }
 
     const existing = selectUserById.get(req.user.id)
     if (!existing) return res.status(404).json({ error: 'not_found' })
@@ -232,12 +275,13 @@ app.post('/api/profile/avatar', auth, (req, res) => {
     const previousPath = existing.avatar_url ? path.join(UPLOAD_DIR, existing.avatar_url) : null
 
     updateAvatarInfoStmt.run(relPath, Date.now(), req.file.mimetype || '', req.user.id)
+    log('[AVATAR] updated', req.user.id, req.file.originalname || req.file.filename)
 
     if (previousPath && fs.existsSync(previousPath) && previousPath !== req.file.path) {
       try {
         fs.unlinkSync(previousPath)
       } catch (e) {
-        console.warn('avatar cleanup failed', e)
+        warn('avatar cleanup failed', e.message)
       }
     }
 
@@ -250,13 +294,20 @@ app.post('/api/profile/avatar', auth, (req, res) => {
 
 app.get('/api/users/:id/avatar', (req, res) => {
   const user = selectUserById.get(req.params.id)
-  if (!user?.avatar_url) return res.status(404).json({ error: 'not_found' })
+  if (!user?.avatar_url) {
+    warn('[AVATAR] not found', 'target=' + req.params.id)
+    return res.status(404).json({ error: 'not_found' })
+  }
   const avatarPath = path.resolve(path.join(UPLOAD_DIR, user.avatar_url))
   const uploadsRoot = path.resolve(UPLOAD_DIR)
   if (!avatarPath.startsWith(uploadsRoot)) return res.status(403).json({ error: 'forbidden' })
-  if (!fs.existsSync(avatarPath)) return res.status(404).json({ error: 'missing_file' })
+  if (!fs.existsSync(avatarPath)) {
+    warn('[AVATAR] missing file', 'target=' + req.params.id)
+    return res.status(404).json({ error: 'missing_file' })
+  }
   if (user.avatar_updated_at) res.setHeader('Last-Modified', new Date(user.avatar_updated_at).toUTCString())
   res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  log('[AVATAR] served', 'target=' + req.params.id, 'file=' + path.basename(avatarPath))
   res.sendFile(avatarPath)
 })
 app.post('/api/profile/password', auth, (req, res) => {
@@ -264,23 +315,32 @@ app.post('/api/profile/password', auth, (req, res) => {
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'invalid_payload' })
   if (newPassword.length < 6) return res.status(400).json({ error: 'password_too_short' })
   const user = selectUserById.get(req.user.id)
-  if (!user) return res.status(404).json({ error: 'not_found' })
+  if (!user) {
+    warn('[PROFILE] not found', req.user.id)
+    return res.status(404).json({ error: 'not_found' })
+  }
   if (!bcrypt.compareSync(currentPassword, user.password_hash)) return res.status(401).json({ error: 'invalid_current_password' })
   const hash = bcrypt.hashSync(newPassword, 10)
   updatePasswordStmt.run(hash, req.user.id)
+  log('[PROFILE] password changed', req.user.id)
   res.json({ ok: true })
 })
 
 app.get('/api/admin/files', auth, adminOnly, (req, res) => {
+  log('[ADMIN] files:list', 'admin=' + req.user.id)
   res.json({ files: db.prepare('SELECT * FROM files ORDER BY created_at DESC').all() })
 })
 app.delete('/api/admin/files/:id', auth, adminOnly, (req, res) => {
   const f = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
-  if (!f) return res.status(404).json({ error: 'not_found' })
+  if (!f) {
+    warn('[ADMIN] file:missing', 'admin=' + req.user.id, 'id=' + req.params.id)
+    return res.status(404).json({ error: 'not_found' })
+  }
   try {
     fs.unlinkSync(f.path)
   } catch (e) {}
   db.prepare('DELETE FROM files WHERE id=?').run(req.params.id)
+  log('[ADMIN] file:deleted', 'admin=' + req.user.id, 'id=' + req.params.id)
   res.json({ ok: true })
 })
 app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
@@ -288,6 +348,7 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
   db.prepare('DELETE FROM messages WHERE sender_id=?').run(id)
   db.prepare('DELETE FROM workspace_members WHERE user_id=?').run(id)
   db.prepare('DELETE FROM users WHERE id=?').run(id)
+  log('[ADMIN] user:deleted', 'admin=' + req.user.id, 'target=' + id)
   res.json({ ok: true })
 })
 
@@ -326,6 +387,7 @@ app.post('/api/upload/init', auth, (req, res) => {
   const id = uuidv4()
   const tmpDir = path.join(UPLOAD_DIR, 'tmp', id)
   fs.mkdirSync(tmpDir, { recursive: true })
+  log('[UPLOAD] init', 'user=' + req.user.id, 'upload=' + id, 'name=' + filename, 'size=' + size)
   res.json({ uploadId: id })
 })
 
@@ -336,6 +398,7 @@ app.post('/api/upload/chunk', auth, upload.single('chunk'), (req, res) => {
   if (!fs.existsSync(tmpDir)) return res.status(400).json({ error: 'no_session' })
   const chunkPath = path.join(tmpDir, `chunk_${index}`)
   fs.writeFileSync(chunkPath, req.file.buffer)
+  log('[UPLOAD] chunk', 'user=' + req.user.id, 'upload=' + uploadId, 'index=' + index, 'bytes=' + (req.file?.buffer?.length || 0))
   res.json({ ok: true })
 })
 
@@ -381,12 +444,14 @@ app.post('/api/upload/complete', auth, (req, res) => {
 
   db.prepare('INSERT INTO files (id,uploader_id,original_name,mime,size,path,created_at) VALUES (?,?,?,?,?,?,?)')
     .run(finalId, req.user.id, filename, mime || '', size, finalPath, Date.now())
+  log('[UPLOAD] complete', 'user=' + req.user.id, 'upload=' + uploadId, 'file=' + finalId, 'name=' + filename, 'size=' + size)
   res.json({ file: { id: finalId, name: filename, mime: mime || '', size } })
 })
 
 app.get('/api/files/:id/meta', auth, (req, res) => {
   const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
   if (!file) return res.status(404).json({ error: 'not_found' })
+  log('[FILES] meta', 'user=' + req.user.id, 'file=' + req.params.id)
   res.json({ file: fileMeta(file) })
 })
 
@@ -394,6 +459,7 @@ app.get('/api/files/:id', auth, (req, res) => {
   const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
   if (!file) return res.status(404).json({ error: 'not_found' })
   if (!file.path || !fs.existsSync(file.path)) return res.status(404).json({ error: 'missing_file' })
+  log('[FILES] download', 'user=' + req.user.id, 'file=' + req.params.id, 'name=' + file.original_name)
   res.setHeader('Content-Type', file.mime || 'application/octet-stream')
   res.setHeader('Content-Disposition', `attachment; filename="${file.original_name}"`)
   const stream = fs.createReadStream(file.path)
@@ -405,6 +471,7 @@ app.get('/api/files/:id/view', auth, (req, res) => {
   const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
   if (!file) return res.status(404).json({ error: 'not_found' })
   if (!file.path || !fs.existsSync(file.path)) return res.status(404).json({ error: 'missing_file' })
+  log('[FILES] inline', 'user=' + req.user.id, 'file=' + req.params.id, 'name=' + file.original_name)
   res.setHeader('Content-Type', file.mime || 'application/octet-stream')
   res.setHeader('Content-Disposition', `inline; filename="${file.original_name}"`)
   const stream = fs.createReadStream(file.path)
@@ -418,6 +485,7 @@ app.delete('/api/messages/:id', auth, (req, res) => {
   if (message.sender_id !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' })
   deleteMessageStmt.run(message.id)
   io.to(message.channel_id).emit('message:deleted', { id: message.id, channelId: message.channel_id })
+  log('[MESSAGE] delete', 'user=' + req.user.id, 'message=' + message.id, 'channel=' + message.channel_id)
   res.json({ ok: true })
 })
 
@@ -431,8 +499,10 @@ io.use((socket, next) => {
   if (!token) return next(new Error('no_token'))
   try {
     socket.user = jwt.verify(token, JWT_SECRET)
+    log('[SOCKET] handshake', 'user=' + (socket.user.username || socket.user.id))
     next()
   } catch (e) {
+    warn('[SOCKET] invalid token', e.message)
     next(new Error('invalid_token'))
   }
 })
@@ -441,6 +511,7 @@ io.on('connection', (socket) => {
   const userId = socket.user.id
   onlineUsers.set(userId, socket.id)
   io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
+  log('[SOCKET] connected', 'user=' + userId, 'socket=' + socket.id)
 
   const wsId = db.prepare('SELECT id FROM workspaces LIMIT 1').get().id
   const channels = listChannels.all(wsId)
@@ -448,12 +519,14 @@ io.on('connection', (socket) => {
   if (activeChannelId) socket.join(activeChannelId)
 
   socket.on('init:request', ({ limit = 50, offset = 0 } = {}) => {
+    log('[SOCKET] init:request', 'user=' + userId, 'limit=' + limit, 'offset=' + offset)
     const messages = activeChannelId ? listMessages.all(activeChannelId, limit, offset).reverse() : []
     socket.emit('init:response', { workspaces: [{ id: wsId, name: 'Home' }], channels, activeChannelId, messages })
   })
 
   socket.on('channel:switch', ({ channelId }) => {
     if (!channelId) return
+    log('[SOCKET] channel:switch', 'user=' + userId, 'channel=' + channelId)
     if (channelId.startsWith('dm:')) {
       if (!isMemberOfDirectChannel(channelId, userId)) return
       const normalized = normalizeDirectChannelId(channelId)
@@ -487,6 +560,7 @@ io.on('connection', (socket) => {
     insertMessage.run(id, targetChannel, userId, content, now)
     const payload = { id, channelId: targetChannel, senderId: userId, content, createdAt: now }
     io.to(targetChannel).emit('message:new', payload)
+    log('[MESSAGE] send', 'user=' + userId, 'channel=' + targetChannel, 'bytes=' + Buffer.byteLength(content, 'utf8'))
     if (directParticipants) {
       const room = io.sockets.adapter.rooms.get(targetChannel) || new Set()
       directParticipants.forEach((participantId) => {
@@ -500,6 +574,7 @@ io.on('connection', (socket) => {
 
   socket.on('messages:load', ({ channelId, limit = 50, offset = 0 }) => {
     if (!channelId) return
+    log('[SOCKET] messages:load', 'user=' + userId, 'channel=' + channelId, 'limit=' + limit, 'offset=' + offset)
     let targetChannel = channelId
     if (channelId.startsWith('dm:')) {
       if (!isMemberOfDirectChannel(channelId, userId)) return
@@ -514,10 +589,15 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     onlineUsers.delete(userId)
     io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
+    log('[SOCKET] disconnected', 'user=' + userId, 'socket=' + socket.id)
   })
 })
 
-server.listen(PORT, () => console.log('Server listening on', PORT))
+process.on('unhandledRejection', (reason) => {
+  logError('Unhandled rejection', reason)
+})
+
+server.listen(PORT, () => log('Server listening on', PORT))
 
 
 
