@@ -265,6 +265,7 @@ try {
 try {
   db.prepare('ALTER TABLE invites ADD COLUMN revoked_at INTEGER').run()
 } catch (err) {}
+
 try {
   db.prepare('ALTER TABLE channels ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0').run()
 } catch (err) {}
@@ -274,6 +275,7 @@ try {
 try {
   db.prepare('ALTER TABLE messages ADD COLUMN updated_at INTEGER DEFAULT 0').run()
 } catch (err) {}
+
 
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
