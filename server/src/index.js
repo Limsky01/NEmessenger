@@ -262,6 +262,7 @@ CREATE TABLE IF NOT EXISTS invites (
 );
 `)
 
+
 ensureColumn('users', 'avatar_seed', 'TEXT DEFAULT ""')
 ensureColumn('users', 'avatar_url', 'TEXT DEFAULT ""')
 ensureColumn('users', 'avatar_updated_at', 'INTEGER DEFAULT 0')
@@ -278,6 +279,48 @@ ensureColumn('channels', 'created_by', 'TEXT DEFAULT ""')
 ensureColumn('messages', 'updated_at', 'INTEGER DEFAULT 0')
 
 const hasMessageUpdatedAtColumn = tableHasColumn('messages', 'updated_at')
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN avatar_seed TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN avatar_updated_at INTEGER DEFAULT 0').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE files ADD COLUMN iv TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE files ADD COLUMN auth_tag TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN claim_token TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN claimed_at INTEGER').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN used_by TEXT').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN used_at INTEGER').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN revoked_at INTEGER').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE channels ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE channels ADD COLUMN created_by TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE messages ADD COLUMN updated_at INTEGER DEFAULT 0').run()
+} catch (err) {}
 
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
@@ -303,9 +346,13 @@ const revokeInviteStmt = db.prepare('UPDATE invites SET revoked_at=?, claim_toke
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const selectMessageFullById = db.prepare('SELECT * FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
+
 const updateMessageContentStmt = hasMessageUpdatedAtColumn
   ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
   : db.prepare('UPDATE messages SET content=? WHERE id=?')
+
+const updateMessageContentStmt = db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
+
 const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
 const insertChannelStmt = db.prepare(
   'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
@@ -1242,6 +1289,7 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   }
   if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
     return res.status(403).json({ error: 'forbidden' })
+
   const updatedAtRaw = Date.now()
   if (hasMessageUpdatedAtColumn) {
     updateMessageContentStmt.run(encryptText(rawContent), updatedAtRaw, message.id)
@@ -1249,6 +1297,10 @@ app.patch('/api/messages/:id', auth, (req, res) => {
     updateMessageContentStmt.run(encryptText(rawContent), message.id)
   }
   const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
+
+  const updatedAt = Date.now()
+  updateMessageContentStmt.run(encryptText(rawContent), updatedAt, message.id)
+
   const payload = {
     id: message.id,
     channelId: message.channel_id,
@@ -1275,9 +1327,15 @@ app.patch('/api/messages/:id', auth, (req, res) => {
 
 const onlineUsers = new Map()
 const listMessages = db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
+
 const insertMessage = hasMessageUpdatedAtColumn
   ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
   : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+
+const insertMessage = db.prepare(
+  'INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)',
+)
+
 const voiceParticipants = new Map()
 const typingState = new Map()
 
@@ -1633,12 +1691,6 @@ process.on('unhandledRejection', (reason) => {
 })
 
 server.listen(PORT, () => log('Server listening on', PORT))
-
-
-
-
-
-
 
 
 
