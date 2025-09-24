@@ -162,6 +162,20 @@ const normalizeInvite = (raw) => {
   }
 }
 
+
+const normalizeChannel = (raw) => {
+  if (!raw) return null
+  return {
+    id: raw.id,
+    name: raw.name ?? raw.channelName ?? 'channel',
+    createdAt: raw.createdAt ?? raw.created_at ?? Date.now(),
+    isPrivate: Boolean(raw.isPrivate ?? raw.is_private ?? false),
+    createdBy: raw.createdBy ?? raw.created_by ?? '',
+    memberCount: raw.memberCount ?? raw.member_count ?? 0,
+    membershipRole: raw.membershipRole ?? raw.membership_role ?? '',
+  }
+}
+
 const deriveKey = (cid) => {
   if (!cid) return null
   const source = encoder.encode(String(cid))
@@ -222,6 +236,7 @@ const formatMessage = (fallbackChannelId) => (raw) => {
     channelId,
     senderId,
     createdAt,
+    updatedAt: raw.updatedAt ?? raw.updated_at ?? 0,
     content: enc.decrypt(channelId, raw.content),
   }
 }
@@ -245,6 +260,8 @@ const useStore = create((set, get) => ({
   historyComplete: {},
   directPeers: {},
   files: {},
+  channelMembers: {},
+  typing: {},
   audioDevices: { inputs: [], outputs: [] },
   audioInputDeviceId: loadStoredDevice('audioInputDeviceId'),
   audioOutputDeviceId: loadStoredDevice('audioOutputDeviceId'),
@@ -411,15 +428,17 @@ const useStore = create((set, get) => ({
     })
 
     socket.on('init:response', ({ workspaces, channels, activeChannelId, messages }) => {
-      const normalize = formatMessage(activeChannelId)
+      const normalizeMessage = formatMessage(activeChannelId)
+      const normalizedChannels = Array.isArray(channels) ? channels.map(normalizeChannel).filter(Boolean) : []
       set({
-        workspaces,
-        channels,
+        workspaces: Array.isArray(workspaces) ? workspaces : [],
+        channels: normalizedChannels,
         activeChannelId,
-        messages: activeChannelId ? { [activeChannelId]: messages.map(normalize).filter(Boolean) } : {},
+        messages: activeChannelId ? { [activeChannelId]: messages.map(normalizeMessage).filter(Boolean) } : {},
         unread: {},
         historyComplete: activeChannelId ? { [activeChannelId]: messages.length < 50 } : {},
         historyLoading: {},
+        typing: {},
       })
     })
 
@@ -432,6 +451,11 @@ const useStore = create((set, get) => ({
           unread: { ...state.unread, [channelId]: 0 },
           historyLoading: { ...state.historyLoading, [channelId]: false },
           historyComplete: { ...state.historyComplete, [channelId]: messages.length < 50 },
+          typing: { ...state.typing },
+        }
+        if (payload.typing[channelId]) {
+          payload.typing[channelId] = payload.typing[channelId].filter((entry) => entry.userId !== state.user?.id)
+          if (!payload.typing[channelId].length) delete payload.typing[channelId]
         }
         if (channelId?.startsWith('dm:')) {
           const peerId = peerFromDirectChannel(channelId, state.user?.id)
@@ -467,15 +491,35 @@ const useStore = create((set, get) => ({
         const arr = state.messages[payload.channelId] || []
         const isActive = state.activeChannelId === payload.channelId
         const nextUnread = isActive ? 0 : (state.unread[payload.channelId] || 0) + 1
+        const typing = { ...state.typing }
+        if (normalized.senderId && typing[payload.channelId]) {
+          const filteredTyping = typing[payload.channelId].filter((entry) => entry.userId !== normalized.senderId)
+          if (filteredTyping.length) typing[payload.channelId] = filteredTyping
+          else delete typing[payload.channelId]
+        }
         const result = {
           messages: { ...state.messages, [payload.channelId]: [...arr, normalized] },
           unread: { ...state.unread, [payload.channelId]: nextUnread },
+          typing,
         }
         if (payload.channelId?.startsWith('dm:')) {
           const peerId = peerFromDirectChannel(payload.channelId, state.user?.id)
           if (peerId) result.directPeers = { ...state.directPeers, [payload.channelId]: peerId }
         }
         return result
+      })
+    })
+
+    socket.on('message:updated', (payload) => {
+      const normalized = formatMessage(payload.channelId)(payload)
+      if (!normalized) return
+      set((state) => {
+        const existing = state.messages[payload.channelId] || []
+        const index = existing.findIndex((m) => m.id === normalized.id)
+        if (index === -1) return state
+        const nextMessages = [...existing]
+        nextMessages[index] = { ...existing[index], ...normalized }
+        return { messages: { ...state.messages, [payload.channelId]: nextMessages } }
       })
     })
 
@@ -493,6 +537,92 @@ const useStore = create((set, get) => ({
           messages: { ...state.messages, [channelId]: filtered },
           unread,
         }
+      })
+    })
+
+    socket.on('channel:list', ({ channels }) => {
+      const normalized = Array.isArray(channels) ? channels.map(normalizeChannel).filter(Boolean) : []
+      set((state) => {
+        const activeIsDm = state.activeChannelId?.startsWith('dm:')
+        let nextActive = state.activeChannelId
+        if (!activeIsDm && nextActive && !normalized.some((channel) => channel.id === nextActive)) {
+          nextActive = normalized[0]?.id || null
+        }
+        const messages = { ...state.messages }
+        const unread = { ...state.unread }
+        const historyLoading = { ...state.historyLoading }
+        const historyComplete = { ...state.historyComplete }
+        const typing = { ...state.typing }
+        const channelIds = new Set(normalized.map((channel) => channel.id))
+        Object.keys(messages).forEach((channelId) => {
+          if (!channelId.startsWith('dm:') && !channelIds.has(channelId)) {
+            delete messages[channelId]
+            delete unread[channelId]
+            delete historyLoading[channelId]
+            delete historyComplete[channelId]
+            delete typing[channelId]
+          }
+        })
+        const nextState = {
+          channels: normalized,
+          messages,
+          unread,
+          historyLoading,
+          historyComplete,
+          typing,
+        }
+        if (nextActive !== state.activeChannelId) {
+          nextState.activeChannelId = nextActive
+        }
+        return nextState
+      })
+    })
+
+    socket.on('channel:revoked', ({ channelId }) => {
+      if (!channelId) return
+      set((state) => {
+        if (!state.channels.some((channel) => channel.id === channelId)) return state
+        const nextChannels = state.channels.filter((channel) => channel.id !== channelId)
+        const nextMessages = { ...state.messages }
+        delete nextMessages[channelId]
+        const nextUnread = { ...state.unread }
+        delete nextUnread[channelId]
+        const nextHistoryLoading = { ...state.historyLoading }
+        delete nextHistoryLoading[channelId]
+        const nextHistoryComplete = { ...state.historyComplete }
+        delete nextHistoryComplete[channelId]
+        const nextTyping = { ...state.typing }
+        delete nextTyping[channelId]
+        const result = {
+          channels: nextChannels,
+          messages: nextMessages,
+          unread: nextUnread,
+          historyLoading: nextHistoryLoading,
+          historyComplete: nextHistoryComplete,
+          typing: nextTyping,
+        }
+        if (state.activeChannelId === channelId) {
+          result.activeChannelId = nextChannels[0]?.id || null
+        }
+        return result
+      })
+    })
+
+    socket.on('typing:update', ({ channelId, userId: typingUserId, username, typing }) => {
+      if (!channelId || !typingUserId) return
+      set((state) => {
+        if (typingUserId === state.user?.id) return state
+        const existing = state.typing[channelId] || []
+        const filtered = existing.filter((entry) => entry.userId !== typingUserId)
+        if (typing) {
+          const nextList = [...filtered, { userId: typingUserId, username: username || typingUserId }]
+          return { typing: { ...state.typing, [channelId]: nextList } }
+        }
+        if (filtered.length === existing.length) return state
+        const next = { ...state.typing }
+        if (filtered.length) next[channelId] = filtered
+        else delete next[channelId]
+        return { typing: next }
       })
     })
 
@@ -639,6 +769,19 @@ const useStore = create((set, get) => ({
     socket.emit('message:send', { channelId, content: encrypted })
   },
 
+  editMessage: async (messageId, channelId, content) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const trimmed = typeof content === 'string' ? content.trim() : ''
+    if (!trimmed) throw new Error('invalid_content')
+    const encrypted = enc.encrypt(channelId, trimmed)
+    await axios.patch(
+      `${get().serverUrl}/api/messages/${messageId}`,
+      { content: encrypted },
+      { headers: buildAuthHeaders(token) },
+    )
+  },
+
   deleteMessage: async (messageId) => {
     const token = get().token
     if (!token) throw new Error('not_authenticated')
@@ -654,6 +797,100 @@ const useStore = create((set, get) => ({
     const offset = (messages[channelId] || []).length
     set((state) => ({ historyLoading: { ...state.historyLoading, [channelId]: true } }))
     socket.emit('messages:load', { channelId, limit: 50, offset })
+  },
+
+  createPrivateChannel: async (name, memberIds = []) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const trimmed = typeof name === 'string' ? name.trim() : ''
+    if (!trimmed) throw new Error('invalid_name')
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/channels`,
+      { name: trimmed, memberIds: Array.isArray(memberIds) ? memberIds : [], isPrivate: true },
+      { headers: buildAuthHeaders(token) },
+    )
+    const channel = normalizeChannel(data.channel)
+    if (channel) {
+      set((state) => {
+        const exists = state.channels.some((ch) => ch.id === channel.id)
+        const channels = exists
+          ? state.channels.map((ch) => (ch.id === channel.id ? { ...ch, ...channel } : ch))
+          : [...state.channels, channel]
+        return { channels, activeChannelId: channel.id }
+      })
+    }
+    const members = Array.isArray(data?.members)
+      ? data.members
+          .map((entry) => {
+            const user = normalizeUser(entry.user)
+            if (!user) return null
+            return { user, role: entry.role || 'member' }
+          })
+          .filter(Boolean)
+      : []
+    if (channel && members.length) {
+      set((state) => ({ channelMembers: { ...state.channelMembers, [channel.id]: members } }))
+    }
+    return channel
+  },
+
+  fetchChannelMembers: async (channelId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.get(`${get().serverUrl}/api/channels/${channelId}/members`, {
+      headers: buildAuthHeaders(token),
+    })
+    const members = Array.isArray(data?.members)
+      ? data.members
+          .map((entry) => {
+            const user = normalizeUser(entry.user)
+            if (!user) return null
+            return { user, role: entry.role || 'member' }
+          })
+          .filter(Boolean)
+      : []
+    set((state) => ({ channelMembers: { ...state.channelMembers, [channelId]: members } }))
+    return members
+  },
+
+  addChannelMember: async (channelId, userId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/channels/${channelId}/members`,
+      { userId },
+      { headers: buildAuthHeaders(token) },
+    )
+    const members = Array.isArray(data?.members)
+      ? data.members
+          .map((entry) => {
+            const user = normalizeUser(entry.user)
+            if (!user) return null
+            return { user, role: entry.role || 'member' }
+          })
+          .filter(Boolean)
+      : []
+    set((state) => ({ channelMembers: { ...state.channelMembers, [channelId]: members } }))
+    return members
+  },
+
+  removeChannelMember: async (channelId, userId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.delete(`${get().serverUrl}/api/channels/${channelId}/members/${userId}`, {
+      headers: buildAuthHeaders(token),
+    })
+    const members = Array.isArray(data?.members)
+      ? data.members
+          .map((entry) => {
+            const user = normalizeUser(entry.user)
+            if (!user) return null
+            return { user, role: entry.role || 'member' }
+          })
+          .filter(Boolean)
+      : []
+    set((state) => ({ channelMembers: { ...state.channelMembers, [channelId]: members } }))
+    return members
   },
 
   updateAvatar: async (file) => {
