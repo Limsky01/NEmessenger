@@ -163,6 +163,36 @@ if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true })
 const db = new Database('messenger_v4.db')
 db.pragma('journal_mode = WAL')
 
+const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+const getTableColumns = (table) => {
+  if (!identifierPattern.test(table)) return []
+  try {
+    return db.prepare(`PRAGMA table_info(${table})`).all()
+  } catch (err) {
+    warn('[DB] table info failed', table, err.message)
+    return []
+  }
+}
+
+const tableHasColumn = (table, column) => {
+  if (!identifierPattern.test(column)) return false
+  return getTableColumns(table).some((col) => col?.name === column)
+}
+
+const ensureColumn = (table, column, definition) => {
+  if (!identifierPattern.test(table) || !identifierPattern.test(column)) return false
+  if (tableHasColumn(table, column)) return true
+  try {
+    db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run()
+    log('[DB] added column', `${table}.${column}`)
+    return true
+  } catch (err) {
+    warn('[DB] add column failed', `${table}.${column}`, err.message)
+    return tableHasColumn(table, column)
+  }
+}
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -232,6 +262,23 @@ CREATE TABLE IF NOT EXISTS invites (
 );
 `)
 
+
+ensureColumn('users', 'avatar_seed', 'TEXT DEFAULT ""')
+ensureColumn('users', 'avatar_url', 'TEXT DEFAULT ""')
+ensureColumn('users', 'avatar_updated_at', 'INTEGER DEFAULT 0')
+ensureColumn('users', 'avatar_mime', 'TEXT DEFAULT ""')
+ensureColumn('files', 'iv', 'TEXT DEFAULT ""')
+ensureColumn('files', 'auth_tag', 'TEXT DEFAULT ""')
+ensureColumn('invites', 'claim_token', 'TEXT DEFAULT ""')
+ensureColumn('invites', 'claimed_at', 'INTEGER')
+ensureColumn('invites', 'used_by', 'TEXT')
+ensureColumn('invites', 'used_at', 'INTEGER')
+ensureColumn('invites', 'revoked_at', 'INTEGER')
+ensureColumn('channels', 'is_private', 'INTEGER NOT NULL DEFAULT 0')
+ensureColumn('channels', 'created_by', 'TEXT DEFAULT ""')
+ensureColumn('messages', 'updated_at', 'INTEGER DEFAULT 0')
+
+const hasMessageUpdatedAtColumn = tableHasColumn('messages', 'updated_at')
 try {
   db.prepare('ALTER TABLE users ADD COLUMN avatar_seed TEXT DEFAULT ""').run()
 } catch (err) {}
@@ -299,7 +346,13 @@ const revokeInviteStmt = db.prepare('UPDATE invites SET revoked_at=?, claim_toke
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const selectMessageFullById = db.prepare('SELECT * FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
+
+const updateMessageContentStmt = hasMessageUpdatedAtColumn
+  ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
+  : db.prepare('UPDATE messages SET content=? WHERE id=?')
+
 const updateMessageContentStmt = db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
+
 const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
 const insertChannelStmt = db.prepare(
   'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
@@ -319,7 +372,8 @@ const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
 const decryptMessageRow = (row) => {
   if (!row) return row
   if (typeof row.content === 'undefined') return row
-  return { ...row, content: decryptText(row.content) }
+  const updatedAt = row.updated_at ?? row.updatedAt ?? 0
+  return { ...row, content: decryptText(row.content), updated_at: updatedAt, updatedAt }
 }
 
 const decryptMessages = (rows) => rows.map(decryptMessageRow)
@@ -1235,8 +1289,18 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   }
   if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
     return res.status(403).json({ error: 'forbidden' })
+
+  const updatedAtRaw = Date.now()
+  if (hasMessageUpdatedAtColumn) {
+    updateMessageContentStmt.run(encryptText(rawContent), updatedAtRaw, message.id)
+  } else {
+    updateMessageContentStmt.run(encryptText(rawContent), message.id)
+  }
+  const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
+
   const updatedAt = Date.now()
   updateMessageContentStmt.run(encryptText(rawContent), updatedAt, message.id)
+
   const payload = {
     id: message.id,
     channelId: message.channel_id,
@@ -1263,9 +1327,15 @@ app.patch('/api/messages/:id', auth, (req, res) => {
 
 const onlineUsers = new Map()
 const listMessages = db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
+
+const insertMessage = hasMessageUpdatedAtColumn
+  ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
+  : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+
 const insertMessage = db.prepare(
   'INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)',
 )
+
 const voiceParticipants = new Map()
 const typingState = new Map()
 
