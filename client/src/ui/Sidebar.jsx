@@ -15,6 +15,8 @@ export default function Sidebar() {
   const me = useStore((s) => s.user)
   const onlineUserIds = useStore((s) => s.onlineUserIds)
   const openProfile = useStore((s) => s.openProfile)
+  const openAdmin = useStore((s) => s.openAdmin)
+  const view = useStore((s) => s.view)
   const openDirectChat = useStore((s) => s.openDirectChat)
   const directPeers = useStore((s) => s.directPeers)
   const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
@@ -25,18 +27,29 @@ export default function Sidebar() {
   return (
     <div className="w-[320px] border-r border-white/10 h-full flex flex-col bg-white/5 backdrop-blur-md">
       <div className="p-4 panel sticky top-0 space-y-3 z-10">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <div>
             <div className="text-sm font-medium">@{me?.username || 'user'}</div>
             <div className="text-[11px] text-white/40">ID: {me?.id}</div>
           </div>
-          <button
-            type="button"
-            onClick={openProfile}
-            className="px-3 py-1.5 text-xs rounded-xl bg-white/10 hover:bg-white/20 transition button-press"
-          >
-            Профиль
-          </button>
+          <div className="flex items-center gap-2">
+            {me?.role === 'admin' && (
+              <button
+                type="button"
+                onClick={openAdmin}
+                className={`px-3 py-1.5 text-xs rounded-xl transition button-press ${view === 'admin' ? 'bg-white/25 text-white' : 'bg-white/10 hover:bg-white/20'}`}
+              >
+                Админ
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={openProfile}
+              className={`px-3 py-1.5 text-xs rounded-xl transition button-press ${view === 'profile' ? 'bg-white/25 text-white' : 'bg-white/10 hover:bg-white/20'}`}
+            >
+              Профиль
+            </button>
+          </div>
         </div>
         <div className="flex items-center justify-between text-xs text-white/60">
           <span>Каналы</span>

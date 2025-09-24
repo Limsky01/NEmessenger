@@ -227,6 +227,8 @@ db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username
 const selectUserById = db.prepare('SELECT * FROM users WHERE id=?')
 const updateAvatarInfoStmt = db.prepare('UPDATE users SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?')
 const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id=?')
+const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
+const countAdminsStmt = db.prepare('SELECT COUNT(*) as count FROM users WHERE role="admin"')
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
 
@@ -370,7 +372,9 @@ app.post('/api/login', (req, res) => {
 })
 
 app.get('/api/users', auth, (req, res) => {
-  const users = db.prepare('SELECT id, username, role, avatar_seed FROM users ORDER BY username ASC').all()
+  const users = db
+    .prepare('SELECT id, username, role, avatar_seed, avatar_url, avatar_updated_at FROM users ORDER BY username ASC')
+    .all()
   log('[USERS] list', 'by=' + req.user.id, 'count=' + users.length)
   res.json({ users: users.map(publicUser) })
 })
@@ -474,11 +478,96 @@ app.delete('/api/admin/files/:id', auth, adminOnly, (req, res) => {
 })
 app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
   const id = req.params.id
+  const existing = selectUserById.get(id)
+  if (!existing) return res.status(404).json({ error: 'not_found' })
+  if (existing.role === 'admin') {
+    const totalAdmins = countAdminsStmt.get()?.count || 0
+    if (totalAdmins <= 1) return res.status(400).json({ error: 'last_admin' })
+  }
+  if (existing.avatar_url) {
+    const avatarPath = path.resolve(path.join(UPLOAD_DIR, existing.avatar_url))
+    const uploadsRoot = path.resolve(UPLOAD_DIR)
+    if (avatarPath.startsWith(uploadsRoot) && fs.existsSync(avatarPath)) {
+      try {
+        fs.unlinkSync(avatarPath)
+      } catch (err) {
+        warn('[ADMIN] avatar cleanup failed', err.message)
+      }
+    }
+  }
   db.prepare('DELETE FROM messages WHERE sender_id=?').run(id)
   db.prepare('DELETE FROM workspace_members WHERE user_id=?').run(id)
   db.prepare('DELETE FROM users WHERE id=?').run(id)
+  const sid = onlineUsers.get(id)
+  if (sid) {
+    onlineUsers.delete(id)
+    const socket = io.sockets.sockets.get(sid)
+    if (socket) {
+      try {
+        socket.disconnect(true)
+      } catch (err) {
+        warn('[ADMIN] disconnect failed', err.message)
+      }
+    }
+    io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
+  }
   log('[ADMIN] user:deleted', 'admin=' + req.user.id, 'target=' + id)
   res.json({ ok: true })
+})
+
+app.patch('/api/admin/users/:id/role', auth, adminOnly, (req, res) => {
+  const id = req.params.id
+  const { role } = req.body || {}
+  if (!role || (role !== 'admin' && role !== 'user')) return res.status(400).json({ error: 'invalid_role' })
+  const existing = selectUserById.get(id)
+  if (!existing) return res.status(404).json({ error: 'not_found' })
+  if (existing.role === role) return res.json({ user: publicUser(existing) })
+  if (existing.role === 'admin' && role !== 'admin') {
+    const totalAdmins = countAdminsStmt.get()?.count || 0
+    if (totalAdmins <= 1) return res.status(400).json({ error: 'last_admin' })
+  }
+  updateUserRoleStmt.run(role, id)
+  const updated = selectUserById.get(id)
+  const payload = publicUser(updated)
+  io.emit('user:update', payload)
+  log('[ADMIN] role:update', 'admin=' + req.user.id, 'target=' + id, 'role=' + role)
+  res.json({ user: payload })
+})
+
+app.post('/api/admin/users/:id/password', auth, adminOnly, (req, res) => {
+  const id = req.params.id
+  const { newPassword } = req.body || {}
+  if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6)
+    return res.status(400).json({ error: 'password_too_short' })
+  const existing = selectUserById.get(id)
+  if (!existing) return res.status(404).json({ error: 'not_found' })
+  const hash = bcrypt.hashSync(newPassword, 10)
+  updatePasswordStmt.run(hash, id)
+  log('[ADMIN] password:reset', 'admin=' + req.user.id, 'target=' + id)
+  res.json({ ok: true })
+})
+
+app.delete('/api/admin/users/:id/avatar', auth, adminOnly, (req, res) => {
+  const id = req.params.id
+  const existing = selectUserById.get(id)
+  if (!existing) return res.status(404).json({ error: 'not_found' })
+  if (existing.avatar_url) {
+    const avatarPath = path.resolve(path.join(UPLOAD_DIR, existing.avatar_url))
+    const uploadsRoot = path.resolve(UPLOAD_DIR)
+    if (avatarPath.startsWith(uploadsRoot) && fs.existsSync(avatarPath)) {
+      try {
+        fs.unlinkSync(avatarPath)
+      } catch (err) {
+        warn('[ADMIN] avatar delete failed', err.message)
+      }
+    }
+  }
+  updateAvatarInfoStmt.run('', 0, '', id)
+  const updated = selectUserById.get(id)
+  const payload = publicUser(updated)
+  io.emit('user:update', payload)
+  log('[ADMIN] avatar:deleted', 'admin=' + req.user.id, 'target=' + id)
+  res.json({ user: payload })
 })
 
 const avatarStorage = multer.diskStorage({

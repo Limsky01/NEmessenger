@@ -397,7 +397,7 @@ export default function Chat() {
                   <span>@{nameById(m.senderId)}</span>
                   <span className="opacity-60">{new Date(m.createdAt || m.created_at).toLocaleTimeString()}</span>
                 </div>
-                {mine && (
+                {(mine || me?.role === 'admin') && (
                   <button
                     type="button"
                     className="text-white/40 hover:text-red-400 transition flex items-center gap-1"

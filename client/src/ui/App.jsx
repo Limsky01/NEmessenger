@@ -4,6 +4,7 @@ import Sidebar from './Sidebar.jsx'
 import Chat from './Chat.jsx'
 import Login from './Login.jsx'
 import Profile from './Profile.jsx'
+import AdminPanel from './AdminPanel.jsx'
 import useStore from '../state/store.js'
 import { motion, AnimatePresence } from 'framer-motion'
 
@@ -43,7 +44,7 @@ export default function App() {
         {token ? (
           <div className="flex h-[calc(100%-48px)]">
             <Sidebar />
-            {view === 'profile' ? <Profile /> : <Chat />}
+            {view === 'profile' ? <Profile /> : view === 'admin' ? <AdminPanel /> : <Chat />}
           </div>
         ) : (
           <Login />

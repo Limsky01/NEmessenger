@@ -157,6 +157,10 @@ const useStore = create((set, get) => ({
   setView: (view) => set({ view }),
   openProfile: () => set({ view: 'profile' }),
   openChat: () => set({ view: 'chat' }),
+  openAdmin: () => {
+    if (get().user?.role !== 'admin') return
+    set({ view: 'admin' })
+  },
   setChannelKey: (cid, keyStr) => enc.setKeyForChannel(cid, keyStr),
   getChannelKey: (cid) => enc.getKeyForChannel(cid),
   buildAvatarUrl: (user) => {
@@ -390,10 +394,85 @@ const useStore = create((set, get) => ({
     if (!token) throw new Error('not_authenticated')
     await axios.delete(`${get().serverUrl}/api/admin/files/${id}`, { headers: buildAuthHeaders(token) })
   },
-  deleteUser: async (id) => {
+  adminUpdateUserRole: async (userId, role) => {
     const token = get().token
     if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.patch(
+      `${get().serverUrl}/api/admin/users/${userId}/role`,
+      { role },
+      { headers: buildAuthHeaders(token) },
+    )
+    const updated = normalizeUser(data.user ?? data)
+    if (!updated) return null
+    set((state) => ({
+      users: state.users.some((u) => u.id === updated.id)
+        ? state.users.map((u) => (u.id === updated.id ? { ...u, ...updated } : u))
+        : [...state.users, updated],
+      user: state.user?.id === updated.id ? { ...state.user, ...updated } : state.user,
+    }))
+    return updated
+  },
+  adminResetUserPassword: async (userId, newPassword) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    await axios.post(
+      `${get().serverUrl}/api/admin/users/${userId}/password`,
+      { newPassword },
+      { headers: buildAuthHeaders(token) },
+    )
+  },
+  adminDeleteUserAvatar: async (userId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.delete(`${get().serverUrl}/api/admin/users/${userId}/avatar`, {
+      headers: buildAuthHeaders(token),
+    })
+    const updated = normalizeUser(data.user ?? data)
+    if (!updated) return null
+    set((state) => ({
+      users: state.users.some((u) => u.id === updated.id)
+        ? state.users.map((u) => (u.id === updated.id ? { ...u, ...updated } : u))
+        : [...state.users, updated],
+      user: state.user?.id === updated.id ? { ...state.user, ...updated } : state.user,
+    }))
+    return updated
+  },
+  adminDeleteUser: async (id) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const me = get().user
+    if (me?.id === id) throw new Error('cannot_delete_self')
     await axios.delete(`${get().serverUrl}/api/admin/users/${id}`, { headers: buildAuthHeaders(token) })
+    set((state) => {
+      const directChannelId = state.user?.id ? buildDirectChannelId(state.user.id, id) : null
+      const nextUsers = state.users.filter((u) => u.id !== id)
+      const nextDirectPeers = { ...state.directPeers }
+      const nextUnread = { ...state.unread }
+      const nextHistoryLoading = { ...state.historyLoading }
+      const nextHistoryComplete = { ...state.historyComplete }
+      const nextMessages = { ...state.messages }
+      const nextOnline = state.onlineUserIds.filter((userId) => userId !== id)
+      if (directChannelId) {
+        delete nextDirectPeers[directChannelId]
+        delete nextUnread[directChannelId]
+        delete nextHistoryLoading[directChannelId]
+        delete nextHistoryComplete[directChannelId]
+        delete nextMessages[directChannelId]
+      }
+      const patch = {
+        users: nextUsers,
+        directPeers: nextDirectPeers,
+        unread: nextUnread,
+        historyLoading: nextHistoryLoading,
+        historyComplete: nextHistoryComplete,
+        messages: nextMessages,
+        onlineUserIds: nextOnline,
+      }
+      if (directChannelId && state.activeChannelId === directChannelId) {
+        patch.activeChannelId = null
+      }
+      return patch
+    })
   },
 
   registerFileMeta: (file) => {
