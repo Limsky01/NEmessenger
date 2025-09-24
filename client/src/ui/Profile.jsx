@@ -8,6 +8,10 @@ export default function Profile() {
   const updateAvatar = useStore((s) => s.updateAvatar)
   const changePassword = useStore((s) => s.changePassword)
   const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
+  const invites = useStore((s) => s.invites) ?? []
+  const fetchInvites = useStore((s) => s.fetchInvites)
+  const createInvite = useStore((s) => s.createInvite)
+  const revokeInvite = useStore((s) => s.revokeInvite)
   const audioDevices = useStore((s) => s.audioDevices)
   const audioInputDeviceId = useStore((s) => s.audioInputDeviceId)
   const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
@@ -23,6 +27,13 @@ export default function Profile() {
   const [newPassword, setNewPassword] = useState('')
   const [passwordStatus, setPasswordStatus] = useState(null)
   const [deviceStatus, setDeviceStatus] = useState(null)
+  const [inviteTtl, setInviteTtl] = useState('604800000')
+  const [inviteActionStatus, setInviteActionStatus] = useState(null)
+  const [inviteLoading, setInviteLoading] = useState(false)
+  const [revokeInviteId, setRevokeInviteId] = useState(null)
+  const [copiedInviteId, setCopiedInviteId] = useState(null)
+  const inviteStatusTimerRef = useRef(null)
+  const inviteCopyTimerRef = useRef(null)
 
   useEffect(() => () => {
     if (avatarPreview) URL.revokeObjectURL(avatarPreview)
@@ -31,6 +42,19 @@ export default function Profile() {
   useEffect(() => {
     refreshAudioDevices()
   }, [refreshAudioDevices])
+
+  useEffect(() => {
+    if (!user) return
+    fetchInvites().catch((err) => console.error(err))
+  }, [user, fetchInvites])
+
+  useEffect(
+    () => () => {
+      if (inviteStatusTimerRef.current) clearTimeout(inviteStatusTimerRef.current)
+      if (inviteCopyTimerRef.current) clearTimeout(inviteCopyTimerRef.current)
+    },
+    [],
+  )
 
   const handleAvatarSelect = (event) => {
     const file = event.target.files?.[0]
@@ -82,6 +106,94 @@ export default function Profile() {
     setAvatarFile(null)
     setAvatarStatus(null)
     if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  const inviteStatusLabels = {
+    active: 'Активен',
+    claimed: 'Ожидает регистрации',
+    used: 'Использован',
+    expired: 'Просрочен',
+    revoked: 'Отозван',
+  }
+
+  const formatInviteDate = (value) => {
+    if (!value) return ''
+    try {
+      return new Date(value).toLocaleString('ru-RU')
+    } catch (err) {
+      console.error('invite date format failed', err)
+      return ''
+    }
+  }
+
+  const showInviteStatus = (payload) => {
+    if (inviteStatusTimerRef.current) clearTimeout(inviteStatusTimerRef.current)
+    setInviteActionStatus(payload)
+    if (payload) {
+      inviteStatusTimerRef.current = setTimeout(() => setInviteActionStatus(null), 4000)
+    }
+  }
+
+  const handleCreateInvite = async () => {
+    showInviteStatus(null)
+    setInviteLoading(true)
+    try {
+      const ttlMs = parseInt(inviteTtl, 10)
+      const invite = await createInvite(Number.isFinite(ttlMs) ? ttlMs : undefined)
+      if (invite) {
+        let message = `Создан новый код: ${invite.code}`
+        try {
+          if (navigator?.clipboard?.writeText) {
+            await navigator.clipboard.writeText(invite.code)
+            setCopiedInviteId(invite.id)
+            if (inviteCopyTimerRef.current) clearTimeout(inviteCopyTimerRef.current)
+            inviteCopyTimerRef.current = setTimeout(() => setCopiedInviteId(null), 2000)
+            message = `Код ${invite.code} скопирован в буфер обмена`
+          }
+        } catch (copyErr) {
+          console.error(copyErr)
+        }
+        showInviteStatus({ type: 'success', message })
+      }
+    } catch (err) {
+      console.error(err)
+      showInviteStatus({ type: 'error', message: 'Не удалось создать код приглашения' })
+    } finally {
+      setInviteLoading(false)
+    }
+  }
+
+  const handleCopyInvite = async (invite) => {
+    if (!invite?.code) return
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(invite.code)
+        setCopiedInviteId(invite.id)
+        if (inviteCopyTimerRef.current) clearTimeout(inviteCopyTimerRef.current)
+        inviteCopyTimerRef.current = setTimeout(() => setCopiedInviteId(null), 2000)
+        showInviteStatus({ type: 'success', message: `Код ${invite.code} скопирован` })
+      } else {
+        showInviteStatus({ type: 'info', message: `Код: ${invite.code}` })
+      }
+    } catch (err) {
+      console.error(err)
+      showInviteStatus({ type: 'error', message: 'Не удалось скопировать код' })
+    }
+  }
+
+  const handleRevokeInvite = async (invite) => {
+    if (!invite) return
+    setRevokeInviteId(invite.id)
+    showInviteStatus(null)
+    try {
+      await revokeInvite(invite.id)
+      showInviteStatus({ type: 'success', message: `Код ${invite.code} отозван` })
+    } catch (err) {
+      console.error(err)
+      showInviteStatus({ type: 'error', message: 'Не удалось отозвать код' })
+    } finally {
+      setRevokeInviteId(null)
+    }
   }
 
   const handleRefreshDevices = async () => {
@@ -187,6 +299,99 @@ export default function Profile() {
           <div><span className="text-white/40">Имя пользователя:</span> @{user.username}</div>
           <div><span className="text-white/40">ID:</span> {user.id}</div>
           <div><span className="text-white/40">Роль:</span> {roleLabel}</div>
+        </div>
+      </section>
+
+      <section className="panel rounded-3xl px-6 py-5 space-y-4">
+        <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Приглашения</div>
+        <div className="space-y-4 text-sm">
+          <div className="flex flex-col sm:flex-row sm:items-end gap-3">
+            <div className="flex-1">
+              <label className="text-xs uppercase tracking-[0.2em] text-white/50 block mb-2">Срок действия</label>
+              <select
+                value={inviteTtl}
+                onChange={(e) => setInviteTtl(e.target.value)}
+                className="w-full bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
+              >
+                <option value="86400000">24 часа</option>
+                <option value="604800000">7 дней</option>
+                <option value="1209600000">14 дней</option>
+              </select>
+            </div>
+            <button
+              type="button"
+              onClick={handleCreateInvite}
+              disabled={inviteLoading}
+              className="px-4 py-3 rounded-2xl bg-white/15 hover:bg-white/25 transition disabled:opacity-60"
+            >
+              Создать код
+            </button>
+          </div>
+          {inviteActionStatus && (
+            <div
+              className={`text-center ${
+                inviteActionStatus.type === 'success'
+                  ? 'text-emerald-400'
+                  : inviteActionStatus.type === 'error'
+                  ? 'text-red-400'
+                  : 'text-white/70'
+              }`}
+            >
+              {inviteActionStatus.message}
+            </div>
+          )}
+          <div className="space-y-3">
+            {invites.length === 0 ? (
+              <div className="text-white/50 text-sm">
+                Кодов пока нет. Создайте первый, чтобы пригласить друзей.
+              </div>
+            ) : (
+              invites.map((invite) => {
+                const statusLabel = inviteStatusLabels[invite.status] ?? invite.status
+                const expiresAt = formatInviteDate(invite.expiresAt)
+                const claimedAt = invite.status === 'claimed' ? formatInviteDate(invite.claimedAt) : ''
+                const usedAt = invite.status === 'used' ? formatInviteDate(invite.usedAt) : ''
+                const canRevoke = invite.status === 'active' || invite.status === 'claimed'
+                return (
+                  <div
+                    key={invite.id}
+                    className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-white/5 border border-white/10 rounded-2xl px-4 py-4"
+                  >
+                    <div className="space-y-1 text-sm">
+                      <div className="text-lg tracking-[0.3em] text-white/90">{invite.code}</div>
+                      <div className="text-xs uppercase tracking-[0.2em] text-white/40">
+                        Статус:
+                        {' '}
+                        <span className="text-white/70 normal-case">{statusLabel}</span>
+                      </div>
+                      {expiresAt && <div className="text-white/50 text-xs">Действует до: {expiresAt}</div>}
+                      {claimedAt && <div className="text-white/50 text-xs">Код зарезервирован: {claimedAt}</div>}
+                      {usedAt && <div className="text-white/50 text-xs">Использован: {usedAt}</div>}
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+                      <button
+                        type="button"
+                        onClick={() => handleCopyInvite(invite)}
+                        className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 transition text-sm disabled:opacity-60"
+                      >
+                        {copiedInviteId === invite.id ? 'Скопировано' : 'Скопировать'}
+                      </button>
+                      {canRevoke && (
+                        <button
+                          type="button"
+                          onClick={() => handleRevokeInvite(invite)}
+                          disabled={revokeInviteId === invite.id}
+                          className="px-3 py-2 rounded-xl bg-red-500/20 hover:bg-red-500/30 transition text-sm disabled:opacity-60"
+                        >
+                          Отозвать
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })
+            )}
+          </div>
         </div>
       </section>
 
