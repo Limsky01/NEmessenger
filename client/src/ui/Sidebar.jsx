@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react'
+import React, { useMemo, useState } from 'react'
 import useStore, { buildDirectChannelId } from '../state/store.js'
 import AvatarImage from './AvatarImage.jsx'
 
@@ -28,14 +28,56 @@ export default function Sidebar() {
   const createVoiceRoom = useStore((s) => s.createVoiceRoom)
   const deleteVoiceRoom = useStore((s) => s.deleteVoiceRoom)
   const voiceStatus = useStore((s) => s.voiceStatus)
+  const createPrivateChannel = useStore((s) => s.createPrivateChannel)
 
   const onlineSet = useMemo(() => new Set(onlineUserIds), [onlineUserIds])
   const otherUsers = useMemo(() => users.filter((u) => u.id !== me?.id), [users, me])
+  const publicChannels = useMemo(() => channels.filter((channel) => !channel.isPrivate), [channels])
+  const privateChannels = useMemo(() => channels.filter((channel) => channel.isPrivate), [channels])
   const voiceParticipantsCount = (roomId) => (voiceParticipants[roomId] || []).length
+
   const handleCreateVoiceRoom = () => {
     const name = window.prompt('Название голосовой комнаты')
     if (!name) return
     createVoiceRoom(name).catch((err) => console.error('create voice room failed', err))
+  }
+
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [channelName, setChannelName] = useState('')
+  const [selectedIds, setSelectedIds] = useState([])
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState(null)
+
+  const toggleSelection = (userId) => {
+    setSelectedIds((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
+  }
+
+  const closeCreateDialog = () => {
+    if (creating) return
+    setCreateDialogOpen(false)
+    setChannelName('')
+    setSelectedIds([])
+    setCreateError(null)
+  }
+
+  const handleCreatePrivateChannel = async () => {
+    if (creating) return
+    if (!channelName.trim()) {
+      setCreateError('Введите название канала')
+      return
+    }
+    setCreating(true)
+    setCreateError(null)
+    try {
+      const channel = await createPrivateChannel(channelName, selectedIds)
+      if (channel?.id) switchChannel(channel.id)
+      closeCreateDialog()
+    } catch (err) {
+      console.error('create private channel failed', err)
+      setCreateError('Не удалось создать канал')
+    } finally {
+      setCreating(false)
+    }
   }
 
   return (
@@ -73,12 +115,14 @@ export default function Sidebar() {
 
       <div className="px-3 pt-3 pb-6 overflow-y-auto scroll-thin space-y-6 flex-1">
         <div className="space-y-2">
-          {channels.map((channel) => {
+          <div className="px-2 text-xs uppercase tracking-[0.2em] text-white/40">Общие каналы</div>
+          {publicChannels.map((channel) => {
             const active = channel.id === activeChannelId
             const unreadCount = unread[channel.id] || 0
             return (
               <button
                 key={channel.id}
+                type="button"
                 onClick={() => switchChannel(channel.id)}
                 className={`w-full flex items-center justify-between px-3 py-3 rounded-2xl transition-colors ${active ? 'panel' : 'glass hover:bg-white/10'}`}
               >
@@ -93,7 +137,47 @@ export default function Sidebar() {
               </button>
             )
           })}
-          {channels.length === 0 && <div className="text-sm text-white/40 px-2">Каналов пока нет</div>}
+          {publicChannels.length === 0 && <div className="text-sm text-white/40 px-2">Общих каналов пока нет</div>}
+        </div>
+
+        <div className="space-y-2">
+          <div className="px-2 text-xs uppercase tracking-[0.2em] text-white/40 flex items-center justify-between">
+            <span>Приватные комнаты</span>
+            <button
+              type="button"
+              onClick={() => setCreateDialogOpen(true)}
+              className="text-white/40 hover:text-white/80 transition text-lg leading-none"
+            >
+              +
+            </button>
+          </div>
+          {privateChannels.map((channel) => {
+            const active = channel.id === activeChannelId
+            const unreadCount = unread[channel.id] || 0
+            const role = channel.membershipRole === 'owner' ? 'Создатель' : channel.membershipRole === 'admin' ? 'Админ' : 'Участник'
+            return (
+              <button
+                key={channel.id}
+                type="button"
+                onClick={() => switchChannel(channel.id)}
+                className={`w-full flex items-center justify-between px-3 py-3 rounded-2xl transition-colors ${active ? 'panel' : 'glass hover:bg-white/10'}`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className="avatar">🔒</div>
+                  <div>
+                    <div className="text-sm font-medium">{channel.name}</div>
+                    <div className="text-xs text-white/60 flex items-center gap-2">
+                      <span>{role}</span>
+                      <span>•</span>
+                      <span>{channel.memberCount} участн.</span>
+                    </div>
+                  </div>
+                </div>
+                {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
+              </button>
+            )
+          })}
+          {privateChannels.length === 0 && <div className="text-sm text-white/40 px-2">Приватных комнат пока нет</div>}
         </div>
 
         <div>
@@ -159,7 +243,15 @@ export default function Sidebar() {
                     </div>
                     <div className="text-xs text-white/50">В голосе: {count}</div>
                     {active && voiceStatus && (
-                      <div className="text-[11px] text-white/40">{voiceStatus === 'connecting' ? 'Подключение...' : voiceStatus === 'error' ? 'Ошибка соединения' : voiceStatus === 'room_closed' ? 'Комната закрыта' : 'Подключено'}</div>
+                      <div className="text-[11px] text-white/40">
+                        {voiceStatus === 'connecting'
+                          ? 'Подключение...'
+                          : voiceStatus === 'error'
+                          ? 'Ошибка соединения'
+                          : voiceStatus === 'room_closed'
+                          ? 'Комната закрыта'
+                          : 'Подключено'}
+                      </div>
                     )}
                   </div>
                   <button
@@ -192,6 +284,78 @@ export default function Sidebar() {
           {voiceRooms.length === 0 && <div className="text-sm text-white/40 px-2">Голосовые комнаты отсутствуют</div>}
         </div>
       </div>
+
+      {createDialogOpen && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6" onClick={closeCreateDialog}>
+          <div className="panel w-full max-w-lg rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
+              <div>
+                <div className="text-lg font-semibold text-white/90">Новая приватная комната</div>
+                <div className="text-xs text-white/60">Выберите название и участников</div>
+              </div>
+              <button type="button" onClick={closeCreateDialog} className="text-white/40 hover:text-white/80 transition">
+                ✕
+              </button>
+            </div>
+            {createError && <div className="px-5 py-3 text-sm text-red-300 bg-red-500/10">{createError}</div>}
+            <div className="px-5 py-4 space-y-4 max-h-[60vh] overflow-y-auto">
+              <div className="space-y-2">
+                <label className="text-sm text-white/70" htmlFor="new-channel-name">
+                  Название
+                </label>
+                <input
+                  id="new-channel-name"
+                  type="text"
+                  value={channelName}
+                  onChange={(e) => setChannelName(e.target.value)}
+                  className="w-full bg-white/10 rounded-2xl px-4 py-2 text-sm text-white placeholder:text-white/40 focus:outline-none focus:ring-2 focus:ring-white/40"
+                  placeholder="Например, Проект А"
+                  disabled={creating}
+                />
+              </div>
+              <div className="space-y-2">
+                <div className="text-xs uppercase tracking-[0.2em] text-white/40">Участники</div>
+                <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                  {otherUsers.map((user) => {
+                    const checked = selectedIds.includes(user.id)
+                    return (
+                      <label
+                        key={user.id}
+                        className="flex items-center justify-between gap-3 bg-white/5 hover:bg-white/10 transition px-3 py-2 rounded-2xl"
+                      >
+                        <div className="flex items-center gap-3">
+                          <AvatarImage user={user} size={28} src={buildAvatarUrl?.(user)} />
+                          <div className="text-sm text-white/80">@{user.username}</div>
+                        </div>
+                        <input type="checkbox" checked={checked} onChange={() => toggleSelection(user.id)} disabled={creating} />
+                      </label>
+                    )
+                  })}
+                  {otherUsers.length === 0 && <div className="text-sm text-white/40">Больше нет пользователей</div>}
+                </div>
+              </div>
+            </div>
+            <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeCreateDialog}
+                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
+                disabled={creating}
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={handleCreatePrivateChannel}
+                className="px-4 py-2 rounded-2xl bg-white/80 text-black hover:bg-white disabled:bg-white/30 disabled:text-white/40 text-sm"
+                disabled={creating}
+              >
+                {creating ? 'Создание...' : 'Создать'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
