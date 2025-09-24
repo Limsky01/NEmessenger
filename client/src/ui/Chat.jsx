@@ -42,6 +42,15 @@ function TrashIcon({ className = 'w-4 h-4' }) {
   )
 }
 
+function EditIcon({ className = 'w-4 h-4' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4 12.5-12.5z" />
+    </svg>
+  )
+}
+
 function IconButton({ onClick, title, children, disabled, variant = 'ghost' }) {
   const base = 'w-10 h-10 flex items-center justify-center rounded-full transition-colors button-press pointer-auto no-drag'
   const style =
@@ -321,6 +330,7 @@ export default function Chat() {
   const sendMessage = useStore((s) => s.sendMessage)
   const loadMore = useStore((s) => s.loadMore)
   const deleteMessage = useStore((s) => s.deleteMessage)
+  const editMessage = useStore((s) => s.editMessage)
   const users = useStore((s) => s.users)
   const me = useStore((s) => s.user)
   const uploadFile = useStore((s) => s.uploadFile)
@@ -329,18 +339,33 @@ export default function Chat() {
   const buildFileUrl = useStore((s) => s.buildFileUrl)
   const ensureFileMeta = useStore((s) => s.ensureFileMeta)
   const files = useStore((s) => s.files)
+  const channelMembersMap = useStore((s) => s.channelMembers)
+  const fetchChannelMembers = useStore((s) => s.fetchChannelMembers)
+  const addChannelMember = useStore((s) => s.addChannelMember)
+  const removeChannelMember = useStore((s) => s.removeChannelMember)
+  const typingMap = useStore((s) => s.typing)
+  const socket = useStore((s) => s.socket)
 
   const [text, setText] = useState('')
   const [uploadState, setUploadState] = useState(null)
-  const [pendingDelete, setPendingDelete] = useState(null)
+  const [deleteDialog, setDeleteDialog] = useState(null)
+  const [editDialog, setEditDialog] = useState(null)
   const [imagePreview, setImagePreview] = useState(null)
   const [uploadDialog, setUploadDialog] = useState(null)
+  const [membersDialogOpen, setMembersDialogOpen] = useState(false)
+  const [membersLoading, setMembersLoading] = useState(false)
+  const [membersError, setMembersError] = useState(null)
+  const [selectedNewMembers, setSelectedNewMembers] = useState([])
+  const [selfTyping, setSelfTyping] = useState(false)
   const listRef = useRef(null)
   const fileInputRef = useRef(null)
   const textareaRef = useRef(null)
   const prevChannelRef = useRef(null)
   const prevCountRef = useRef(0)
   const uploadDialogRef = useRef(null)
+  const typingTimeoutRef = useRef(null)
+  const selfTypingRef = useRef(false)
+  const prevTypingChannelRef = useRef(null)
 
   const userMap = useMemo(() => {
     const map = new Map()
@@ -357,6 +382,79 @@ export default function Chat() {
     return directPeers[activeChannelId] || extractPeerIdFromChannel(activeChannelId, me?.id)
   }, [isDirectChannel, directPeers, activeChannelId, me?.id])
   const directPeer = directPeerId ? userMap.get(directPeerId) : null
+  const channelMembers = currentChannel?.id ? channelMembersMap[currentChannel.id] || [] : []
+  const typingUsersRaw = useMemo(() => (activeChannelId ? typingMap[activeChannelId] || [] : []), [typingMap, activeChannelId])
+  const typingUsers = useMemo(
+    () => typingUsersRaw.filter((entry) => entry.userId !== me?.id),
+    [typingUsersRaw, me?.id],
+  )
+  const typingLabel = useMemo(() => {
+    if (!typingUsers.length) return ''
+    const names = typingUsers.map((entry) => {
+      const user = entry.userId ? userMap.get(entry.userId) : null
+      const username = entry.username || user?.username || entry.userId
+      return username?.startsWith('@') ? username : `@${username}`
+    })
+    if (names.length === 1) return `${names[0]} печатает...`
+    if (names.length === 2) return `${names[0]} и ${names[1]} печатают...`
+    if (names.length === 3) return `${names[0]}, ${names[1]} и ${names[2]} печатают...`
+    return `${names[0]}, ${names[1]} и еще ${names.length - 2} печатают...`
+  }, [typingUsers, userMap])
+  const deletePreviewText = useMemo(() => {
+    if (!deleteDialog?.message) return ''
+    const { textSegments, attachments } = extractTextAndAttachments(deleteDialog.message.content)
+    const text = textSegments.join(' ').trim()
+    if (text) return text
+    if (attachments.length) {
+      return `Вложений: ${attachments.length}`
+    }
+    return 'Без текста'
+  }, [deleteDialog])
+  const canManageMembers = Boolean(
+    currentChannel?.isPrivate && (me?.role === 'admin' || ['owner', 'admin'].includes(currentChannel?.membershipRole || '')),
+  )
+  const canModerateChannel = Boolean(
+    currentChannel &&
+      (me?.role === 'admin' ||
+        (currentChannel.isPrivate && ['owner', 'admin'].includes(currentChannel.membershipRole || ''))),
+  )
+  const availableMemberCandidates = useMemo(() => {
+    if (!currentChannel?.id) return []
+    const existing = new Set(channelMembers.map((entry) => entry.user.id))
+    if (me?.id) existing.add(me.id)
+    return users.filter((user) => !existing.has(user.id))
+  }, [channelMembers, users, currentChannel?.id, me?.id])
+
+  useEffect(() => {
+    setMembersDialogOpen(false)
+    setMembersError(null)
+    setSelectedNewMembers([])
+    setMembersLoading(false)
+  }, [activeChannelId])
+
+  useEffect(() => {
+    setSelectedNewMembers((current) =>
+      current.filter((userId) => availableMemberCandidates.some((candidate) => candidate.id === userId)),
+    )
+  }, [availableMemberCandidates])
+
+  useEffect(() => {
+    if (!membersDialogOpen || !currentChannel?.id || !currentChannel.isPrivate) return undefined
+    let cancelled = false
+    setMembersLoading(true)
+    setMembersError(null)
+    fetchChannelMembers(currentChannel.id)
+      .catch((err) => {
+        console.error('fetch members failed', err)
+        if (!cancelled) setMembersError('Не удалось загрузить участников')
+      })
+      .finally(() => {
+        if (!cancelled) setMembersLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [membersDialogOpen, currentChannel?.id, currentChannel?.isPrivate, fetchChannelMembers])
 
   useEffect(() => {
     const list = listRef.current
@@ -379,6 +477,22 @@ export default function Chat() {
     el.style.height = 'auto'
     el.style.height = `${Math.min(el.scrollHeight, 140)}px`
   }, [text])
+
+  useEffect(() => {
+    const previousChannel = prevTypingChannelRef.current
+    if (previousChannel && previousChannel !== activeChannelId && socket && selfTypingRef.current) {
+      socket.emit('typing', { channelId: previousChannel, state: false })
+    }
+    prevTypingChannelRef.current = activeChannelId
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current)
+      typingTimeoutRef.current = null
+    }
+    if (selfTypingRef.current) {
+      selfTypingRef.current = false
+      setSelfTyping(false)
+    }
+  }, [activeChannelId, socket])
 
   const onScroll = (e) => {
     if (e.currentTarget.scrollTop === 0) loadMore()
@@ -407,6 +521,20 @@ export default function Chat() {
   useEffect(() => {
     uploadDialogRef.current = uploadDialog
   }, [uploadDialog])
+
+  useEffect(
+    () => () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current)
+        typingTimeoutRef.current = null
+      }
+      if (selfTypingRef.current && socket && activeChannelId) {
+        socket.emit('typing', { channelId: activeChannelId, state: false })
+        selfTypingRef.current = false
+      }
+    },
+    [socket, activeChannelId],
+  )
 
   useEffect(() => () => {
     const dialog = uploadDialogRef.current
@@ -470,14 +598,14 @@ export default function Chat() {
         if (uploaded) attachments.push(uploaded)
       }
       if (attachments.length) {
-        setText((prev) => {
-          const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
-          const blocks = []
-          if (comment) blocks.push(comment)
-          blocks.push(tokens.join('\n'))
-          const addition = blocks.filter(Boolean).join('\n')
-          return prev ? `${prev}\n${addition}` : addition
-        })
+        const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
+        const blocks = []
+        if (comment) blocks.push(comment)
+        blocks.push(tokens.join('\n'))
+        const addition = blocks.filter(Boolean).join('\n')
+        const currentValue = textareaRef.current ? textareaRef.current.value : text
+        const nextValue = currentValue ? `${currentValue}\n${addition}` : addition
+        handleTextChange(nextValue)
       }
     } catch (err) {
       console.error(err)
@@ -552,10 +680,58 @@ export default function Chat() {
     fileInputRef.current?.click()
   }
 
+  const emitTypingState = (state) => {
+    if (!socket || !activeChannelId) return
+    socket.emit('typing', { channelId: activeChannelId, state })
+  }
+
+  const scheduleTypingStop = () => {
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
+    typingTimeoutRef.current = setTimeout(() => {
+      if (selfTypingRef.current) {
+        emitTypingState(false)
+        selfTypingRef.current = false
+        setSelfTyping(false)
+      }
+    }, 2500)
+  }
+
+  const handleTextChange = (value) => {
+    setText(value)
+    if (!socket || !activeChannelId) return
+    if (!selfTypingRef.current) {
+      emitTypingState(true)
+      selfTypingRef.current = true
+      setSelfTyping(true)
+    }
+    scheduleTypingStop()
+  }
+
+  const handleInputBlur = () => {
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current)
+      typingTimeoutRef.current = null
+    }
+    if (selfTypingRef.current) {
+      emitTypingState(false)
+      selfTypingRef.current = false
+      setSelfTyping(false)
+    }
+  }
+
   const handleSend = () => {
     if (!text.trim()) return
     sendMessage(text)
     setText('')
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current)
+      typingTimeoutRef.current = null
+    }
+    if (selfTypingRef.current) {
+      emitTypingState(false)
+      selfTypingRef.current = false
+      setSelfTyping(false)
+    }
   }
 
   const handleKeyDown = (e) => {
@@ -595,16 +771,116 @@ export default function Chat() {
     if (ev.target) ev.target.value = ''
   }
 
-  const handleDeleteMessage = async (messageId) => {
-    setPendingDelete(messageId)
+  const canRemoveMemberEntry = (entry) => {
+    if (!canManageMembers) return false
+    if (me?.role === 'admin') return true
+    if (entry.role === 'owner') return false
+    if (currentChannel?.membershipRole === 'owner') return true
+    if (currentChannel?.membershipRole === 'admin') {
+      return entry.role === 'member'
+    }
+    return false
+  }
+
+  const handleSelectedMemberToggle = (userId) => {
+    setSelectedNewMembers((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
+  }
+
+  const handleAddMembers = async () => {
+    if (!currentChannel?.id || !selectedNewMembers.length) return
+    setMembersLoading(true)
+    setMembersError(null)
     try {
-      await deleteMessage(messageId)
+      for (const userId of selectedNewMembers) {
+        // eslint-disable-next-line no-await-in-loop
+        await addChannelMember(currentChannel.id, userId)
+      }
+      setSelectedNewMembers([])
+    } catch (err) {
+      console.error('add member failed', err)
+      setMembersError('Не удалось добавить участника')
+    } finally {
+      setMembersLoading(false)
+    }
+  }
+
+  const handleRemoveMember = async (userId) => {
+    if (!currentChannel?.id) return
+    setMembersLoading(true)
+    setMembersError(null)
+    try {
+      await removeChannelMember(currentChannel.id, userId)
+      if (userId === me?.id) {
+        setMembersDialogOpen(false)
+      }
+    } catch (err) {
+      console.error('remove member failed', err)
+      setMembersError('Не удалось удалить участника')
+    } finally {
+      setMembersLoading(false)
+    }
+  }
+
+  const handleRequestDelete = (message) => {
+    setDeleteDialog({ message, loading: false, error: null })
+  }
+
+  const confirmDeleteMessage = async () => {
+    if (!deleteDialog?.message) return
+    setDeleteDialog((state) => (state ? { ...state, loading: true, error: null } : state))
+    try {
+      await deleteMessage(deleteDialog.message.id)
+      setDeleteDialog(null)
     } catch (err) {
       console.error(err)
-      alert('Не удалось удалить сообщение')
-    } finally {
-      setPendingDelete(null)
+      setDeleteDialog((state) => (state ? { ...state, loading: false, error: 'Не удалось удалить сообщение' } : state))
     }
+  }
+
+  const handleRequestEdit = (message) => {
+    setEditDialog({ message, value: message.content, loading: false, error: null })
+  }
+
+  const confirmEditMessage = async () => {
+    if (!editDialog?.message) return
+    const value = editDialog.value || ''
+    if (!value.trim()) {
+      setEditDialog((state) => (state ? { ...state, error: 'Введите текст сообщения' } : state))
+      return
+    }
+    setEditDialog((state) => (state ? { ...state, loading: true, error: null } : state))
+    try {
+      await editMessage(editDialog.message.id, editDialog.message.channelId, value)
+      setEditDialog(null)
+    } catch (err) {
+      console.error(err)
+      setEditDialog((state) => (state ? { ...state, loading: false, error: 'Не удалось сохранить изменения' } : state))
+    }
+  }
+
+  const closeDeleteDialog = () => {
+    if (deleteDialog?.loading) return
+    setDeleteDialog(null)
+  }
+
+  const closeEditDialog = () => {
+    if (editDialog?.loading) return
+    setEditDialog(null)
+  }
+
+  const openMembersDialog = () => {
+    if (!currentChannel?.id) return
+    setMembersDialogOpen(true)
+    setMembersError(null)
+    setSelectedNewMembers([])
+  }
+
+  const closeMembersDialog = () => {
+    if (membersLoading) return
+    setMembersDialogOpen(false)
+    setMembersError(null)
+    setSelectedNewMembers([])
+    setMembersLoading(false)
   }
 
   const headerTitle = isDirectChannel
@@ -621,12 +897,23 @@ export default function Chat() {
           <div className="text-sm font-medium">{headerTitle}</div>
           <div className="text-xs text-white/60">{headerSubtitle}</div>
         </div>
-        {uploadState && (
-          <div className="text-xs text-white/60">
-            Загрузка {uploadState.current}/{uploadState.total}
-            {uploadState.progress != null ? ` · ${uploadState.progress}%` : ''}
-          </div>
-        )}
+        <div className="flex items-center gap-3">
+          {canManageMembers && currentChannel && (
+            <button
+              type="button"
+              onClick={openMembersDialog}
+              className="px-3 py-1.5 text-xs rounded-xl bg-white/10 hover:bg-white/20 transition"
+            >
+              Участники
+            </button>
+          )}
+          {uploadState && (
+            <div className="text-xs text-white/60">
+              Загрузка {uploadState.current}/{uploadState.total}
+              {uploadState.progress != null ? ` · ${uploadState.progress}%` : ''}
+            </div>
+          )}
+        </div>
       </div>
 
       <div ref={listRef} onScroll={onScroll} className="flex-1 overflow-y-auto p-6 space-y-3 scroll-thin">
@@ -637,23 +924,41 @@ export default function Chat() {
           const imageTokens = attachments.map((token) => ({ ...token, ...useStore.getState().files[token.id] })).filter(isTokenLikelyImage)
           const fileTokens = attachments.filter((token) => !isTokenLikelyImage(token))
           const avatarSrc = avatarSrcById(m.senderId)
+          const canDelete = mine || me?.role === 'admin' || canModerateChannel
+          const canEdit = mine || canModerateChannel
+          const edited = m.updatedAt && m.updatedAt > (m.createdAt || 0)
           return (
             <div key={m.id} className={`max-w-[72%] px-4 py-3 rounded-3xl shadow-glass ${mine ? 'ml-auto panel' : 'glass'}`}>
               <div className="flex items-center justify-between text-[11px] text-white/70 mb-2">
                 <div className="flex items-center gap-2">
                   <AvatarImage user={author} size={28} src={avatarSrc} />
                   <span>@{nameById(m.senderId)}</span>
-                  <span className="opacity-60">{new Date(m.createdAt || m.created_at).toLocaleTimeString()}</span>
+                  <span className="opacity-60">
+                    {new Date(m.createdAt || m.created_at).toLocaleTimeString()}
+                    {edited ? ' · изменено' : ''}
+                  </span>
                 </div>
-                {(mine || me?.role === 'admin') && (
-                  <button
-                    type="button"
-                    className="text-white/40 hover:text-red-400 transition flex items-center gap-1"
-                    onClick={() => handleDeleteMessage(m.id)}
-                    disabled={pendingDelete === m.id}
-                  >
-                    <TrashIcon />
-                  </button>
+                {(canEdit || canDelete) && (
+                  <div className="flex items-center gap-2 text-white/40">
+                    {canEdit && (
+                      <button
+                        type="button"
+                        className="hover:text-white transition"
+                        onClick={() => handleRequestEdit(m)}
+                      >
+                        <EditIcon />
+                      </button>
+                    )}
+                    {canDelete && (
+                      <button
+                        type="button"
+                        className="hover:text-red-400 transition"
+                        onClick={() => handleRequestDelete(m)}
+                      >
+                        <TrashIcon />
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
               <div className="whitespace-pre-wrap leading-relaxed break-words space-y-3">
@@ -675,6 +980,12 @@ export default function Chat() {
         )}
       </div>
 
+      {(selfTyping || typingLabel) && (
+        <div className="px-6 pb-2 text-xs text-white/60 italic">
+          {[selfTyping ? 'Вы печатаете...' : null, typingLabel].filter(Boolean).join(' ')}
+        </div>
+      )}
+
       <div className="px-6 py-4 border-t border-white/10">
         <div className="panel rounded-3xl px-4 py-2 flex items-center gap-3">
           <IconButton onClick={handleFilePick} title="Прикрепить файлы">
@@ -683,8 +994,9 @@ export default function Chat() {
           <textarea
             ref={textareaRef}
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => handleTextChange(e.target.value)}
             onKeyDown={handleKeyDown}
+            onBlur={handleInputBlur}
             placeholder="Напишите сообщение..."
             className="flex-1 bg-transparent text-sm text-white/90 placeholder:text-white/40 outline-none border-none resize-none max-h-36"
             style={{ marginTop: '-10px' }}
@@ -701,6 +1013,232 @@ export default function Chat() {
         </div>
       </div>
       <input ref={fileInputRef} type="file" className="hidden" multiple onChange={handleFileChange} />
+      {deleteDialog && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
+          onClick={closeDeleteDialog}
+        >
+          <div className="panel w-full max-w-md rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-white/10">
+              <div className="text-lg font-semibold text-white/90">Удалить сообщение?</div>
+              <div className="text-xs text-white/60 mt-1">Действие нельзя отменить.</div>
+            </div>
+            {deleteDialog.error && <div className="px-5 py-3 text-sm text-red-300 bg-red-500/10">{deleteDialog.error}</div>}
+            <div className="px-5 py-4 space-y-3">
+              {deleteDialog.message && (
+                <div className="glass rounded-2xl px-4 py-3 space-y-2">
+                  <div className="text-xs text-white/50 uppercase tracking-[0.2em]">Сообщение</div>
+                  <div className="text-sm text-white/80 whitespace-pre-wrap break-words">{deletePreviewText}</div>
+                  <div className="text-xs text-white/40">
+                    @{nameById(deleteDialog.message.senderId)} ·{' '}
+                    {new Date(deleteDialog.message.createdAt || deleteDialog.message.created_at || Date.now()).toLocaleString()}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeDeleteDialog}
+                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
+                disabled={deleteDialog.loading}
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteMessage}
+                className="px-4 py-2 rounded-2xl bg-red-500/80 hover:bg-red-500 transition text-sm text-white disabled:opacity-60"
+                disabled={deleteDialog.loading}
+              >
+                {deleteDialog.loading ? 'Удаление...' : 'Удалить'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {editDialog && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
+          onClick={closeEditDialog}
+        >
+          <div className="panel w-full max-w-lg rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
+              <div>
+                <div className="text-lg font-semibold text-white/90">Редактирование сообщения</div>
+                {editDialog.message && (
+                  <div className="text-xs text-white/60 mt-1">@{nameById(editDialog.message.senderId)}</div>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={closeEditDialog}
+                className="text-white/40 hover:text-white/80 transition"
+                disabled={editDialog.loading}
+              >
+                ✕
+              </button>
+            </div>
+            {editDialog.error && <div className="px-5 py-3 text-sm text-red-300 bg-red-500/10">{editDialog.error}</div>}
+            <div className="px-5 py-4 space-y-4">
+              <textarea
+                value={editDialog.value}
+                onChange={(e) =>
+                  setEditDialog((state) => (state ? { ...state, value: e.target.value } : state))
+                }
+                rows={5}
+                className="w-full bg-white/10 rounded-2xl px-4 py-3 text-sm text-white/90 placeholder:text-white/40 outline-none resize-none focus:ring-2 focus:ring-white/40"
+                placeholder="Введите сообщение"
+                disabled={editDialog.loading}
+              />
+              <div className="text-xs text-white/40">
+                Изменённое сообщение увидят все участники чата.
+              </div>
+            </div>
+            <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeEditDialog}
+                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
+                disabled={editDialog.loading}
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={confirmEditMessage}
+                className="px-4 py-2 rounded-2xl bg-white/80 text-black hover:bg-white transition text-sm disabled:bg-white/40 disabled:text-white/60"
+                disabled={editDialog.loading}
+              >
+                {editDialog.loading ? 'Сохранение...' : 'Сохранить'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {membersDialogOpen && currentChannel && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
+          onClick={closeMembersDialog}
+        >
+          <div className="panel w-full max-w-3xl rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-6 py-4 border-b border-white/10">
+              <div>
+                <div className="text-lg font-semibold text-white/90">Участники #{currentChannel.name}</div>
+                <div className="text-xs text-white/60 mt-1">Управление доступом к приватной комнате</div>
+              </div>
+              <button
+                type="button"
+                onClick={closeMembersDialog}
+                className="text-white/40 hover:text-white/80 transition"
+                disabled={membersLoading}
+              >
+                ✕
+              </button>
+            </div>
+            {membersError && <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{membersError}</div>}
+            <div className="px-6 py-4 space-y-6 max-h-[70vh] overflow-y-auto scroll-thin">
+              <div>
+                <div className="text-xs uppercase tracking-[0.2em] text-white/40 mb-2">Текущие участники</div>
+                {membersLoading && channelMembers.length === 0 ? (
+                  <div className="text-sm text-white/50 py-4">Загрузка участников...</div>
+                ) : channelMembers.length ? (
+                  <div className="space-y-2">
+                    {channelMembers.map((entry) => (
+                      <div
+                        key={entry.user.id}
+                        className="flex items-center justify-between gap-3 glass px-3 py-2 rounded-2xl"
+                      >
+                        <div className="flex items-center gap-3">
+                          <AvatarImage user={entry.user} size={32} src={buildAvatarUrl?.(entry.user)} />
+                          <div>
+                            <div className="text-sm text-white/90">@{entry.user.username}</div>
+                            <div className="text-[11px] text-white/40">
+                              {entry.role === 'owner'
+                                ? 'Создатель'
+                                : entry.role === 'admin'
+                                ? 'Админ'
+                                : 'Участник'}
+                            </div>
+                          </div>
+                        </div>
+                        {canRemoveMemberEntry(entry) && (
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveMember(entry.user.id)}
+                            className="text-xs text-red-300 hover:text-red-200 transition"
+                            disabled={membersLoading}
+                          >
+                            Удалить
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-sm text-white/50 py-4">Участников пока нет</div>
+                )}
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-[0.2em] text-white/40 mb-2">Добавить участников</div>
+                {availableMemberCandidates.length ? (
+                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                    {availableMemberCandidates.map((user) => {
+                      const checked = selectedNewMembers.includes(user.id)
+                      return (
+                        <label
+                          key={user.id}
+                          className="flex items-center justify-between gap-3 glass px-3 py-2 rounded-2xl cursor-pointer hover:bg-white/10 transition"
+                        >
+                          <div className="flex items-center gap-3">
+                            <AvatarImage user={user} size={28} src={buildAvatarUrl?.(user)} />
+                            <div className="text-sm text-white/80">@{user.username}</div>
+                          </div>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => handleSelectedMemberToggle(user.id)}
+                            disabled={membersLoading}
+                          />
+                        </label>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <div className="text-sm text-white/50 py-2">Нет доступных пользователей</div>
+                )}
+              </div>
+            </div>
+            <div className="px-6 py-4 border-t border-white/10 flex items-center justify-between gap-3">
+              <div className="text-xs text-white/40">
+                {membersLoading
+                  ? 'Обновление списка...'
+                  : selectedNewMembers.length
+                  ? `${selectedNewMembers.length} выбран(о)`
+                  : ''}
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={closeMembersDialog}
+                  className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
+                  disabled={membersLoading}
+                >
+                  Закрыть
+                </button>
+                <button
+                  type="button"
+                  onClick={handleAddMembers}
+                  className="px-4 py-2 rounded-2xl bg-white/80 text-black hover:bg-white transition text-sm disabled:bg-white/40 disabled:text-white/60"
+                  disabled={membersLoading || selectedNewMembers.length === 0}
+                >
+                  {membersLoading ? 'Сохранение...' : 'Добавить'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       {uploadDialog && (
         <div
           className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
