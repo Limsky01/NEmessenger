@@ -22,6 +22,7 @@ const registerIpcHandlers = () => {
   ipcMain.removeAllListeners('window:minimize')
   ipcMain.removeAllListeners('window:toggle-maximize')
   ipcMain.removeAllListeners('window:close')
+  ipcMain.removeAllListeners('window:drag-start')
 
   ipcMain.handle('window:get-state', () => getWindowState())
 
@@ -44,6 +45,22 @@ const registerIpcHandlers = () => {
   ipcMain.on('window:close', () => {
     win?.close()
   })
+
+  ipcMain.on('window:drag-start', (_event, coords = {}) => {
+    if (!win || !win.isMaximized()) return
+    const rawX = Number(coords.screenX)
+    const rawY = Number(coords.screenY)
+    const [width, height] = win.getSize()
+    const targetX = Number.isFinite(rawX) ? Math.round(rawX - width / 2) : null
+    const targetY = Number.isFinite(rawY) ? Math.round(rawY - Math.min(40, Math.max(24, height * 0.08))) : null
+    const reposition = () => {
+      if (!win) return
+      if (Number.isFinite(targetX) && Number.isFinite(targetY)) win.setPosition(targetX, targetY, false)
+      sendWindowState()
+    }
+    win.once('unmaximize', reposition)
+    win.unmaximize()
+  })
 }
 
 function createWindow() {
@@ -57,6 +74,9 @@ function createWindow() {
     transparent: isMac,
     backgroundColor: '#00000000',
     titleBarStyle: isMac ? 'hiddenInset' : 'hidden',
+    minimizable: true,
+    maximizable: true,
+    movable: true,
     webPreferences: {
       contextIsolation: true,
       sandbox: false,

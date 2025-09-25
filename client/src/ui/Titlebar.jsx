@@ -93,8 +93,23 @@ export default function Titlebar() {
 
   const isExpanded = windowState.maximized || windowState.fullscreen
 
+  const handleMouseDown = (event) => {
+    if (event.button !== 0) return
+    if (!api?.beginDrag) return
+    const screenX = window.screenX + event.clientX
+    const screenY = window.screenY + event.clientY
+    api.beginDrag({ screenX, screenY })
+  }
+
   return (
-    <div className="drag h-12 px-4 flex items-center justify-between border-b border-white/10 panel">
+    <div
+      className="drag h-12 px-4 flex items-center justify-between border-b border-white/10 panel"
+      onMouseDown={handleMouseDown}
+      onDoubleClick={(event) => {
+        event.preventDefault()
+        handleToggleFullscreen()
+      }}
+    >
       <div className="text-sm tracking-widest opacity-90 select-none">NE Messenger</div>
       <div className="flex gap-2 pointer-auto" style={noclickStyle}>
         <TitleButton onClick={handleMinimize} title="Свернуть">

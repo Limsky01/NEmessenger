@@ -163,6 +163,36 @@ if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true })
 const db = new Database('messenger_v4.db')
 db.pragma('journal_mode = WAL')
 
+const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+const getTableColumns = (table) => {
+  if (!identifierPattern.test(table)) return []
+  try {
+    return db.prepare(`PRAGMA table_info(${table})`).all()
+  } catch (err) {
+    warn('[DB] table info failed', table, err.message)
+    return []
+  }
+}
+
+const tableHasColumn = (table, column) => {
+  if (!identifierPattern.test(column)) return false
+  return getTableColumns(table).some((col) => col?.name === column)
+}
+
+const ensureColumn = (table, column, definition) => {
+  if (!identifierPattern.test(table) || !identifierPattern.test(column)) return false
+  if (tableHasColumn(table, column)) return true
+  try {
+    db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run()
+    log('[DB] added column', `${table}.${column}`)
+    return true
+  } catch (err) {
+    warn('[DB] add column failed', `${table}.${column}`, err.message)
+    return tableHasColumn(table, column)
+  }
+}
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -185,14 +215,23 @@ CREATE TABLE IF NOT EXISTS channels (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
   name TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  is_private INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
   channel_id TEXT NOT NULL,
   sender_id TEXT NOT NULL,
   content TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS channel_members (
+  channel_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  PRIMARY KEY (channel_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS files (
   id TEXT PRIMARY KEY,
@@ -207,8 +246,23 @@ CREATE TABLE IF NOT EXISTS voice_rooms (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  created_by TEXT DEFAULT ''
+  created_by TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS voice_room_members (
+  room_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  added_at INTEGER NOT NULL,
+  added_by TEXT NOT NULL,
+  PRIMARY KEY (room_id, user_id),
+  FOREIGN KEY (room_id) REFERENCES voice_rooms(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (added_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_room_members_room ON voice_room_members(room_id);
+CREATE INDEX IF NOT EXISTS idx_voice_room_members_user ON voice_room_members(user_id);
 CREATE TABLE IF NOT EXISTS invites (
   id TEXT PRIMARY KEY,
   code TEXT UNIQUE NOT NULL,
@@ -218,40 +272,27 @@ CREATE TABLE IF NOT EXISTS invites (
   claim_token TEXT DEFAULT '',
   claimed_at INTEGER,
   used_by TEXT,
-  used_at INTEGER
+  used_at INTEGER,
+  revoked_at INTEGER
 );
 `)
 
-try {
-  db.prepare('ALTER TABLE users ADD COLUMN avatar_seed TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE users ADD COLUMN avatar_updated_at INTEGER DEFAULT 0').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE users ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE files ADD COLUMN iv TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE files ADD COLUMN auth_tag TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE invites ADD COLUMN claim_token TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE invites ADD COLUMN claimed_at INTEGER').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE invites ADD COLUMN used_by TEXT').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE invites ADD COLUMN used_at INTEGER').run()
-} catch (err) {}
+ensureColumn('users', 'avatar_seed', 'TEXT DEFAULT ""')
+ensureColumn('users', 'avatar_url', 'TEXT DEFAULT ""')
+ensureColumn('users', 'avatar_updated_at', 'INTEGER DEFAULT 0')
+ensureColumn('users', 'avatar_mime', 'TEXT DEFAULT ""')
+ensureColumn('files', 'iv', 'TEXT DEFAULT ""')
+ensureColumn('files', 'auth_tag', 'TEXT DEFAULT ""')
+ensureColumn('invites', 'claim_token', 'TEXT DEFAULT ""')
+ensureColumn('invites', 'claimed_at', 'INTEGER')
+ensureColumn('invites', 'used_by', 'TEXT')
+ensureColumn('invites', 'used_at', 'INTEGER')
+ensureColumn('invites', 'revoked_at', 'INTEGER')
+ensureColumn('channels', 'is_private', 'INTEGER NOT NULL DEFAULT 0')
+ensureColumn('channels', 'created_by', 'TEXT DEFAULT ""')
+ensureColumn('messages', 'updated_at', 'INTEGER DEFAULT 0')
+
+const hasMessageUpdatedAtColumn = tableHasColumn('messages', 'updated_at')
 
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
@@ -261,23 +302,65 @@ const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id
 const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
 const countAdminsStmt = db.prepare("SELECT COUNT(*) as count FROM users WHERE role='admin'")
 const listVoiceRoomsStmt = db.prepare('SELECT id, name, created_at, created_by FROM voice_rooms ORDER BY created_at ASC')
+const listVoiceRoomsForUserStmt = db.prepare(
+  `SELECT vr.id, vr.name, vr.created_at, vr.created_by, vrm.role AS membership_role
+   FROM voice_rooms vr
+   LEFT JOIN voice_room_members vrm ON vrm.room_id = vr.id AND vrm.user_id = ?
+   WHERE vr.created_by = ? OR vrm.user_id = ?
+   ORDER BY vr.created_at ASC`
+)
 const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
 const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
-const selectVoiceRoomStmt = db.prepare('SELECT id, name FROM voice_rooms WHERE id=?')
-const insertInviteStmt = db.prepare('INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at) VALUES (?,?,?,?,?,?,NULL,NULL,NULL)')
+const selectVoiceRoomStmt = db.prepare('SELECT id, name, created_by FROM voice_rooms WHERE id=?')
+const insertVoiceRoomMemberStmt = db.prepare(
+  'INSERT OR REPLACE INTO voice_room_members (room_id, user_id, role, added_at, added_by) VALUES (?,?,?,?,?)'
+)
+const deleteVoiceRoomMemberStmt = db.prepare('DELETE FROM voice_room_members WHERE room_id=? AND user_id=?')
+const listVoiceRoomMembersStmt = db.prepare(
+  `SELECT vrm.user_id, vrm.role, vrm.added_at, u.username
+   FROM voice_room_members vrm
+   LEFT JOIN users u ON u.id = vrm.user_id
+   WHERE vrm.room_id = ?
+   ORDER BY u.username COLLATE NOCASE ASC`
+)
+const selectVoiceRoomMemberStmt = db.prepare('SELECT role FROM voice_room_members WHERE room_id=? AND user_id=?')
+const insertInviteStmt = db.prepare(
+  'INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at, revoked_at) VALUES (?,?,?,?,?, ?, NULL, NULL, NULL, NULL)'
+)
 const selectInviteByCodeStmt = db.prepare('SELECT * FROM invites WHERE code=?')
 const selectInviteByIdStmt = db.prepare('SELECT * FROM invites WHERE id=?')
 const listInvitesByCreatorStmt = db.prepare('SELECT * FROM invites WHERE created_by=? ORDER BY created_at DESC')
 const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, claimed_at=? WHERE id=?')
 const clearInviteClaimStmt = db.prepare('UPDATE invites SET claim_token="", claimed_at=NULL WHERE id=?')
-const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='' WHERE id=?")
+const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='', revoked_at=NULL WHERE id=?")
+const revokeInviteStmt = db.prepare('UPDATE invites SET revoked_at=?, claim_token="" WHERE id=?')
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
+const selectMessageFullById = db.prepare('SELECT * FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
+const updateMessageContentStmt = hasMessageUpdatedAtColumn
+  ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
+  : db.prepare('UPDATE messages SET content=? WHERE id=?')
+const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
+const insertChannelStmt = db.prepare(
+  'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
+)
+const listAllChannelsStmt = db.prepare('SELECT * FROM channels WHERE workspace_id=? ORDER BY created_at ASC')
+const listUserChannelMembershipsStmt = db.prepare('SELECT channel_id, role FROM channel_members WHERE user_id=?')
+const listChannelMembersStmt = db.prepare('SELECT user_id, role FROM channel_members WHERE channel_id=? ORDER BY user_id ASC')
+const listChannelMembersDetailedStmt = db.prepare(
+  "SELECT m.user_id, m.role, u.username FROM channel_members m JOIN users u ON u.id = m.user_id WHERE m.channel_id=? ORDER BY u.username ASC",
+)
+const insertChannelMemberStmt = db.prepare('INSERT OR REPLACE INTO channel_members (channel_id, user_id, role) VALUES (?,?,?)')
+const deleteChannelMemberStmt = db.prepare('DELETE FROM channel_members WHERE channel_id=? AND user_id=?')
+const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
+const countChannelMembersStmt = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id=?')
+const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
 
 const decryptMessageRow = (row) => {
   if (!row) return row
   if (typeof row.content === 'undefined') return row
-  return { ...row, content: decryptText(row.content) }
+  const updatedAt = row.updated_at ?? row.updatedAt ?? 0
+  return { ...row, content: decryptText(row.content), updated_at: updatedAt, updatedAt }
 }
 
 const decryptMessages = (rows) => rows.map(decryptMessageRow)
@@ -287,14 +370,21 @@ if (!defaultWs) {
   const wsId = uuidv4()
   db.prepare('INSERT INTO workspaces (id,name,created_at) VALUES (?,?,?)').run(wsId, 'Home', Date.now())
   const chId = uuidv4()
-  db.prepare('INSERT INTO channels (id,workspace_id,name,created_at) VALUES (?,?,?,?)').run(chId, wsId, 'general', Date.now())
+  db.prepare('INSERT INTO channels (id,workspace_id,name,created_at,is_private,created_by) VALUES (?,?,?,?,?,?)').run(
+    chId,
+    wsId,
+    'general',
+    Date.now(),
+    0,
+    '',
+  )
   defaultWs = { id: wsId }
 }
 
 let cachedVoiceRooms = listVoiceRoomsStmt.all()
 if (!cachedVoiceRooms.length) {
   const vrId = uuidv4()
-  insertVoiceRoomStmt.run(vrId, 'Общий голосовой', Date.now(), '')
+  insertVoiceRoomStmt.run(vrId, 'Общий голосовой', Date.now(), 'system')
   cachedVoiceRooms = listVoiceRoomsStmt.all()
 }
 
@@ -324,6 +414,137 @@ const fileMeta = (file) => {
     mime: file.mime || '',
     size: file.size ?? 0,
   }
+}
+
+const listWorkspaceMembersStmt = db.prepare('SELECT user_id FROM workspace_members WHERE workspace_id=?')
+
+const normalizeChannelRow = (row) => {
+  if (!row) return null
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    name: row.name,
+    createdAt: row.created_at,
+    isPrivate: Boolean(row.is_private),
+    createdBy: row.created_by || '',
+  }
+}
+
+const getChannelMemberCount = (channelId) => {
+  try {
+    const result = countChannelMembersStmt.get(channelId)
+    return result?.count ?? 0
+  } catch (err) {
+    warn('[CHANNELS] count members failed', err.message)
+    return 0
+  }
+}
+
+const getAccessibleChannelsForUser = (user) => {
+  if (!user) return []
+  const memberships = new Map()
+  try {
+    const rows = listUserChannelMembershipsStmt.all(user.id)
+    rows.forEach((row) => memberships.set(row.channel_id, row.role || 'member'))
+  } catch (err) {
+    warn('[CHANNELS] list memberships failed', err.message)
+  }
+  const allChannels = listAllChannelsStmt.all(defaultWs.id)
+  return allChannels
+    .map(normalizeChannelRow)
+    .filter(Boolean)
+    .filter((channel) => {
+      if (!channel.isPrivate) return true
+      if (user.role === 'admin') return true
+      if (channel.createdBy && channel.createdBy === user.id) return true
+      return memberships.has(channel.id)
+    })
+    .map((channel) => {
+      const memberCount = channel.isPrivate ? getChannelMemberCount(channel.id) : 0
+      const ownerRole = channel.createdBy && channel.createdBy === user.id ? 'owner' : ''
+      const membershipRole = ownerRole || memberships.get(channel.id) || (user.role === 'admin' && channel.isPrivate ? 'admin' : '')
+      return {
+        id: channel.id,
+        name: channel.name,
+        createdAt: channel.createdAt,
+        isPrivate: channel.isPrivate,
+        createdBy: channel.createdBy,
+        memberCount,
+        membershipRole,
+      }
+    })
+}
+
+const getChannelAudienceUserIds = (channel) => {
+  if (!channel) return []
+  const normalized = normalizeChannelRow(channel)
+  if (!normalized) return []
+  if (!normalized.isPrivate) {
+    const members = listWorkspaceMembersStmt.all(normalized.workspaceId).map((row) => row.user_id)
+    const admins = listAdminsStmt.all().map((row) => row.id)
+    return Array.from(new Set([...members, ...admins].filter(Boolean)))
+  }
+  const members = listChannelMembersStmt.all(normalized.id).map((row) => row.user_id)
+  const admins = listAdminsStmt.all().map((row) => row.id)
+  const payload = new Set([...members, normalized.createdBy, ...admins].filter(Boolean))
+  return Array.from(payload)
+}
+
+const emitChannelListForUser = (userId) => {
+  if (!userId) return
+  const user = selectUserById.get(userId)
+  if (!user) return
+  const channels = getAccessibleChannelsForUser(user)
+  const socketId = onlineUsers.get(userId)
+  if (socketId) {
+    io.to(socketId).emit('channel:list', { channels })
+  }
+  return channels
+}
+
+const emitChannelListForUsers = (userIds) => {
+  const seen = new Set()
+  userIds.forEach((userId) => {
+    if (!userId || seen.has(userId)) return
+    seen.add(userId)
+    emitChannelListForUser(userId)
+  })
+}
+
+const removeUserFromChannelRoom = (channelId, userId) => {
+  const socketId = onlineUsers.get(userId)
+  if (!socketId) return
+  const socket = io.sockets.sockets.get(socketId)
+  if (!socket) return
+  if (socket.rooms.has(channelId)) {
+    socket.leave(channelId)
+    if (socket.user?.id === userId) {
+      socket.emit('channel:revoked', { channelId })
+    }
+  }
+}
+
+const resolveChannelAccess = (user, channelId) => {
+  if (!user || !channelId) return { allowed: false }
+  const channel = selectChannelByIdStmt.get(channelId)
+  if (!channel) return { allowed: false }
+  if (!channel.is_private) return { allowed: true, channel }
+  if (user.role === 'admin') return { allowed: true, channel, role: 'admin' }
+  if (channel.created_by && channel.created_by === user.id) return { allowed: true, channel, role: 'owner' }
+  const membership = findChannelMemberStmt.get(channelId, user.id)
+  if (membership) return { allowed: true, channel, role: membership.role || 'member' }
+  return { allowed: false }
+}
+
+const getChannelMembersDetailed = (channelId) => {
+  const rows = listChannelMembersStmt.all(channelId)
+  return rows
+    .map((row) => {
+      const user = selectUserById.get(row.user_id)
+      if (!user) return null
+      return { user: publicUser(user), role: row.role || 'member' }
+    })
+    .filter(Boolean)
 }
 
 const buildDirectChannelId = (a, b) => `dm:${[a, b].sort().join(':')}`
@@ -376,14 +597,95 @@ const adminOnly = (req, res, next) => {
   return res.status(403).json({ error: 'forbidden' })
 }
 
+app.post('/api/invites/claim', (req, res) => {
+  const codeRaw = typeof req.body?.code === 'string' ? req.body.code : ''
+  const code = codeRaw.trim().toUpperCase()
+  if (!code) {
+    warn('[INVITES] claim missing code')
+    return res.status(400).json({ error: 'code_required' })
+  }
+  const invite = selectInviteByCodeStmt.get(code)
+  if (!invite) {
+    warn('[INVITES] claim invalid code', code)
+    return res.status(400).json({ error: 'invalid_code' })
+  }
+  const now = Date.now()
+  if (invite.revoked_at) {
+    warn('[INVITES] claim revoked', code)
+    return res.status(400).json({ error: 'invite_revoked' })
+  }
+  if (invite.used_by) {
+    warn('[INVITES] claim used', code)
+    return res.status(400).json({ error: 'invite_used' })
+  }
+  if (invite.expires_at && invite.expires_at < now) {
+    warn('[INVITES] claim expired', code)
+    return res.status(400).json({ error: 'invite_expired' })
+  }
+  const claimToken = generateClaimToken()
+  updateInviteClaimStmt.run(claimToken, now, invite.id)
+  const updated = selectInviteByIdStmt.get(invite.id)
+  const creator = selectUserById.get(invite.created_by)
+  const creatorInfo = creator ? { id: creator.id, username: creator.username } : { id: '', username: '' }
+  log('[INVITES] claimed', code, 'by_ip=' + req.ip)
+  res.json({
+    invite: {
+      code: updated.code,
+      createdAt: updated.created_at,
+      expiresAt: updated.expires_at,
+      status: getInviteStatus(updated),
+      createdBy: creatorInfo,
+    },
+    claimToken,
+  })
+})
+
 app.post('/api/register', (req, res) => {
-  const { username, password } = req.body || {}
+  const { username: rawUsername, password: rawPassword, inviteCode: rawInviteCode, inviteClaimToken } = req.body || {}
+  const username = typeof rawUsername === 'string' ? rawUsername.trim() : ''
+  const password = typeof rawPassword === 'string' ? rawPassword : ''
   if (!username || !password) {
     warn('[REGISTER] invalid payload', req.ip)
-    return res.status(400).json({ error: 'username and password required' })
+    return res.status(400).json({ error: 'username_and_password_required' })
+  }
+  if (password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    warn('[REGISTER] weak password', username)
+    return res.status(400).json({ error: 'weak_password' })
   }
   log('[REGISTER] attempt', username, 'ip=' + req.ip)
-  const isFirstUser = !db.prepare('SELECT 1 FROM users LIMIT 1').get()
+  const firstUserExists = db.prepare('SELECT 1 FROM users LIMIT 1').get()
+  const isFirstUser = !firstUserExists
+  let invite = null
+  if (!isFirstUser) {
+    const inviteCode = typeof rawInviteCode === 'string' ? rawInviteCode.trim().toUpperCase() : ''
+    const claimToken = typeof inviteClaimToken === 'string' ? inviteClaimToken.trim() : ''
+    if (!inviteCode || !claimToken) {
+      warn('[REGISTER] invite required missing data', username)
+      return res.status(400).json({ error: 'invite_required' })
+    }
+    invite = selectInviteByCodeStmt.get(inviteCode)
+    if (!invite) {
+      warn('[REGISTER] invalid invite', inviteCode)
+      return res.status(400).json({ error: 'invalid_invite' })
+    }
+    const now = Date.now()
+    if (invite.revoked_at) {
+      warn('[REGISTER] invite revoked', inviteCode)
+      return res.status(400).json({ error: 'invite_revoked' })
+    }
+    if (invite.used_by) {
+      warn('[REGISTER] invite already used', inviteCode)
+      return res.status(400).json({ error: 'invite_used' })
+    }
+    if (invite.expires_at && invite.expires_at < now) {
+      warn('[REGISTER] invite expired', inviteCode)
+      return res.status(400).json({ error: 'invite_expired' })
+    }
+    if (!invite.claim_token || invite.claim_token !== claimToken) {
+      warn('[REGISTER] invite claim mismatch', inviteCode)
+      return res.status(400).json({ error: 'invite_claim_invalid' })
+    }
+  }
   const id = uuidv4()
   const hash = bcrypt.hashSync(password, 10)
   const role = isFirstUser ? 'admin' : 'user'
@@ -395,9 +697,12 @@ app.post('/api/register', (req, res) => {
     return res.status(400).json({ error: 'username_taken' })
   }
   db.prepare('INSERT OR IGNORE INTO workspace_members (workspace_id,user_id) VALUES (?,?)').run(defaultWs.id, id)
+  if (invite) {
+    markInviteUsedStmt.run(id, Date.now(), invite.id)
+  }
   const token = jwt.sign({ id, username, role, avatar_seed: avatarSeed }, JWT_SECRET, { expiresIn: '30d' })
   const user = publicUser({ id, username, role, avatar_seed: avatarSeed })
-  log('[REGISTER] success', username, 'role=' + role)
+  log('[REGISTER] success', username, 'role=' + role, invite ? 'invite=' + invite.code : 'no_invite')
   res.json({ token, user })
   io.emit('user:update', user)
 })
@@ -418,6 +723,156 @@ app.post('/api/login', (req, res) => {
   const token = jwt.sign({ id: userRecord.id, username: userRecord.username, role: userRecord.role, avatar_seed: userRecord.avatar_seed || '' }, JWT_SECRET, { expiresIn: '30d' })
   log('[LOGIN] success', username)
   res.json({ token, user: publicUser(userRecord) })
+})
+
+app.get('/api/invites', auth, (req, res) => {
+  const invites = listInvitesByCreatorStmt.all(req.user.id).map(formatInvite)
+  log('[INVITES] list', 'user=' + req.user.id, 'count=' + invites.length)
+  res.json({ invites })
+})
+
+app.post('/api/invites', auth, (req, res) => {
+  const maxTtl = 1000 * 60 * 60 * 24 * 30
+  let ttlMs = parseInt(req.body?.ttlMs, 10)
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) ttlMs = INVITE_DEFAULT_TTL
+  if (ttlMs > maxTtl) ttlMs = maxTtl
+  const now = Date.now()
+  const id = uuidv4()
+  const code = generateInviteCode()
+  insertInviteStmt.run(id, code, req.user.id, now, now + ttlMs, '')
+  const invite = selectInviteByIdStmt.get(id)
+  log('[INVITES] create', code, 'user=' + req.user.id, 'ttl=' + ttlMs)
+  res.status(201).json({ invite: formatInvite(invite) })
+})
+
+app.post('/api/invites/:id/revoke', auth, (req, res) => {
+  const invite = selectInviteByIdStmt.get(req.params.id)
+  if (!invite) {
+    warn('[INVITES] revoke missing', req.params.id)
+    return res.status(404).json({ error: 'not_found' })
+  }
+  if (invite.created_by !== req.user.id && req.user.role !== 'admin') {
+    warn('[INVITES] revoke forbidden', 'user=' + req.user.id, 'target=' + invite.id)
+    return res.status(403).json({ error: 'forbidden' })
+  }
+  if (invite.used_by) {
+    warn('[INVITES] revoke used', invite.code)
+    return res.status(400).json({ error: 'invite_used' })
+  }
+  if (invite.revoked_at) {
+    return res.status(400).json({ error: 'invite_revoked' })
+  }
+  revokeInviteStmt.run(Date.now(), invite.id)
+  const updated = selectInviteByIdStmt.get(invite.id)
+  log('[INVITES] revoked', invite.code, 'by=' + req.user.id)
+  res.json({ invite: formatInvite(updated) })
+})
+
+app.get('/api/channels', auth, (req, res) => {
+  const user = selectUserById.get(req.user.id)
+  if (!user) return res.status(404).json({ error: 'not_found' })
+  const channels = getAccessibleChannelsForUser(user)
+  res.json({ channels })
+})
+
+app.post('/api/channels', auth, (req, res) => {
+  const user = selectUserById.get(req.user.id)
+  if (!user) return res.status(404).json({ error: 'not_found' })
+  const { name, memberIds, isPrivate = true } = req.body || {}
+  const trimmed = typeof name === 'string' ? name.trim() : ''
+  if (!trimmed || trimmed.length < 2 || trimmed.length > 64)
+    return res.status(400).json({ error: 'invalid_name' })
+  const privateFlag = isPrivate !== false
+  const now = Date.now()
+  const channelId = uuidv4()
+  insertChannelStmt.run(channelId, defaultWs.id, trimmed, now, privateFlag ? 1 : 0, privateFlag ? req.user.id : req.user.id)
+  if (privateFlag) {
+    insertChannelMemberStmt.run(channelId, req.user.id, 'owner')
+    const provided = Array.isArray(memberIds) ? memberIds : []
+    const unique = new Set(provided.filter((id) => typeof id === 'string' && id && id !== req.user.id))
+    unique.forEach((memberId) => {
+      const target = selectUserById.get(memberId)
+      if (!target) return
+      insertChannelMemberStmt.run(channelId, memberId, 'member')
+    })
+  }
+  const channelRow = selectChannelByIdStmt.get(channelId)
+  const audience = getChannelAudienceUserIds(channelRow)
+  emitChannelListForUsers(audience)
+  const creatorChannels = getAccessibleChannelsForUser(selectUserById.get(req.user.id)).filter((ch) => ch.id === channelId)
+  const channelPayload = creatorChannels[0] || {
+    id: channelRow.id,
+    name: channelRow.name,
+    createdAt: channelRow.created_at,
+    isPrivate: Boolean(channelRow.is_private),
+    createdBy: channelRow.created_by || req.user.id,
+    memberCount: channelRow.is_private ? getChannelMemberCount(channelRow.id) : 0,
+    membershipRole: privateFlag ? 'owner' : '',
+  }
+  const members = privateFlag ? getChannelMembersDetailed(channelId) : []
+  log('[CHANNELS] create', channelId, 'user=' + req.user.id, 'private=' + privateFlag)
+  res.status(201).json({ channel: channelPayload, members })
+})
+
+app.get('/api/channels/:id/members', auth, (req, res) => {
+  const user = selectUserById.get(req.user.id)
+  if (!user) return res.status(404).json({ error: 'not_found' })
+  const access = resolveChannelAccess(user, req.params.id)
+  if (!access.allowed) return res.status(404).json({ error: 'not_found' })
+  const channel = access.channel || selectChannelByIdStmt.get(req.params.id)
+  if (!channel) return res.status(404).json({ error: 'not_found' })
+  if (!channel.is_private) return res.json({ members: [] })
+  const members = getChannelMembersDetailed(req.params.id)
+  res.json({ members })
+})
+
+app.post('/api/channels/:id/members', auth, (req, res) => {
+  const user = selectUserById.get(req.user.id)
+  if (!user) return res.status(404).json({ error: 'not_found' })
+  const access = resolveChannelAccess(user, req.params.id)
+  if (!access.allowed) return res.status(404).json({ error: 'not_found' })
+  const channel = access.channel || selectChannelByIdStmt.get(req.params.id)
+  if (!channel) return res.status(404).json({ error: 'not_found' })
+  if (!channel.is_private) return res.status(400).json({ error: 'not_private' })
+  const canManage = access.role === 'owner' || user.role === 'admin'
+  if (!canManage) return res.status(403).json({ error: 'forbidden' })
+  const targetId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : ''
+  if (!targetId) return res.status(400).json({ error: 'invalid_user' })
+  if (targetId === channel.created_by) return res.status(400).json({ error: 'cannot_modify_owner' })
+  const targetUser = selectUserById.get(targetId)
+  if (!targetUser) return res.status(404).json({ error: 'user_not_found' })
+  insertChannelMemberStmt.run(req.params.id, targetId, 'member')
+  const refreshed = selectChannelByIdStmt.get(req.params.id)
+  const audience = getChannelAudienceUserIds(refreshed)
+  emitChannelListForUsers([...audience, targetId])
+  const members = getChannelMembersDetailed(req.params.id)
+  log('[CHANNELS] member:add', req.params.id, 'actor=' + req.user.id, 'target=' + targetId)
+  res.json({ members })
+})
+
+app.delete('/api/channels/:id/members/:userId', auth, (req, res) => {
+  const user = selectUserById.get(req.user.id)
+  if (!user) return res.status(404).json({ error: 'not_found' })
+  const access = resolveChannelAccess(user, req.params.id)
+  if (!access.allowed) return res.status(404).json({ error: 'not_found' })
+  const channel = access.channel || selectChannelByIdStmt.get(req.params.id)
+  if (!channel) return res.status(404).json({ error: 'not_found' })
+  if (!channel.is_private) return res.status(400).json({ error: 'not_private' })
+  const targetId = req.params.userId
+  if (!targetId) return res.status(400).json({ error: 'invalid_user' })
+  if (targetId === channel.created_by) return res.status(400).json({ error: 'cannot_modify_owner' })
+  const membership = findChannelMemberStmt.get(req.params.id, targetId)
+  if (!membership) return res.status(404).json({ error: 'not_found' })
+  const canManage = access.role === 'owner' || user.role === 'admin' || targetId === req.user.id
+  if (!canManage) return res.status(403).json({ error: 'forbidden' })
+  deleteChannelMemberStmt.run(req.params.id, targetId)
+  removeUserFromChannelRoom(req.params.id, targetId)
+  const refreshed = selectChannelByIdStmt.get(req.params.id)
+  const audience = getChannelAudienceUserIds(refreshed)
+  emitChannelListForUsers([...audience, targetId])
+  const members = getChannelMembersDetailed(req.params.id)
+  log('[CHANNELS] member:remove', req.params.id, 'actor=' + req.user.id, 'target=' + targetId)
+  res.json({ members })
 })
 
 app.get('/api/users', auth, (req, res) => {
@@ -565,23 +1020,36 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
 })
 
 app.get('/api/voice-rooms', auth, (req, res) => {
-  const rooms = listVoiceRoomsStmt.all().map(formatVoiceRoom)
+  const viewer = selectUserById.get(req.user.id) || req.user
+  const rooms = getVoiceRoomsForUser(viewer).map((room) => formatVoiceRoom(room, viewer))
   res.json({ rooms })
 })
 
-app.post('/api/voice-rooms', auth, adminOnly, (req, res) => {
+app.post('/api/voice-rooms', auth, (req, res) => {
+  const viewer = selectUserById.get(req.user.id)
+  if (!viewer) return res.status(404).json({ error: 'not_found' })
   const name = typeof req.body?.name === 'string' ? req.body.name.trim() : ''
   if (!name) return res.status(400).json({ error: 'invalid_name' })
-  const id = uuidv4()
+  const rawMembers = Array.isArray(req.body?.members) ? req.body.members : []
+  const memberSet = new Set(rawMembers.filter((id) => typeof id === 'string' && id !== viewer.id))
+  const adminSet = new Set(Array.isArray(req.body?.admins) ? req.body.admins : [])
   const now = Date.now()
-  insertVoiceRoomStmt.run(id, name, now, req.user.id)
+  const id = uuidv4()
+  insertVoiceRoomStmt.run(id, name, now, viewer.id)
+  insertVoiceRoomMemberStmt.run(id, viewer.id, 'owner', now, viewer.id)
+  memberSet.forEach((userId) => {
+    insertVoiceRoomMemberStmt.run(id, userId, adminSet.has(userId) ? 'admin' : 'member', now, viewer.id)
+  })
   emitVoiceRoomsUpdate()
-  res.status(201).json({ room: formatVoiceRoom({ id, name, created_at: now, created_by: req.user.id }) })
+  res.status(201).json({ room: formatVoiceRoom({ id, name, created_at: now, created_by: viewer.id }, viewer) })
 })
 
-app.delete('/api/voice-rooms/:id', auth, adminOnly, (req, res) => {
+app.delete('/api/voice-rooms/:id', auth, (req, res) => {
+  const viewer = selectUserById.get(req.user.id)
+  if (!viewer) return res.status(404).json({ error: 'not_found' })
   const room = selectVoiceRoomStmt.get(req.params.id)
   if (!room) return res.status(404).json({ error: 'not_found' })
+  if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
   const participants = voiceParticipants.get(room.id)
   if (participants) {
     for (const participant of participants.values()) {
@@ -595,6 +1063,50 @@ app.delete('/api/voice-rooms/:id', auth, adminOnly, (req, res) => {
   deleteVoiceRoomStmt.run(room.id)
   emitVoiceRoomsUpdate()
   res.json({ ok: true })
+})
+
+app.post('/api/voice-rooms/:id/members', auth, (req, res) => {
+  const viewer = selectUserById.get(req.user.id)
+  if (!viewer) return res.status(404).json({ error: 'not_found' })
+  const room = selectVoiceRoomStmt.get(req.params.id)
+  if (!room) return res.status(404).json({ error: 'not_found' })
+  if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
+  const updates = Array.isArray(req.body?.upserts) ? req.body.upserts : []
+  const removals = Array.isArray(req.body?.remove) ? req.body.remove : []
+  const now = Date.now()
+
+  const removedUsers = []
+  removals
+    .filter((userId) => typeof userId === 'string' && userId !== room.created_by)
+    .forEach((userId) => {
+      deleteVoiceRoomMemberStmt.run(room.id, userId)
+      removedUsers.push(userId)
+    })
+
+  updates.forEach((entry) => {
+    if (!entry || typeof entry.userId !== 'string') return
+    const role = entry.role === 'admin' ? 'admin' : 'member'
+    if (entry.userId === room.created_by) return
+    if (!selectUserById.get(entry.userId)) return
+    insertVoiceRoomMemberStmt.run(room.id, entry.userId, role, now, viewer.id)
+  })
+
+  if (removedUsers.length) {
+    const participants = voiceParticipants.get(room.id)
+    if (participants) {
+      for (const participant of participants.values()) {
+        if (!removedUsers.includes(participant.userId)) continue
+        const targetSocket = io.sockets.sockets.get(participant.socketId)
+        if (targetSocket) {
+          targetSocket.emit('voice:room-closed', { roomId: room.id })
+          leaveVoiceRoom(targetSocket, { silent: true })
+        }
+      }
+    }
+  }
+
+  emitVoiceRoomsUpdate()
+  res.json({ room: formatVoiceRoom({ ...room }, viewer) })
 })
 
 app.patch('/api/admin/users/:id/role', auth, adminOnly, (req, res) => {
@@ -785,18 +1297,80 @@ app.get('/api/files/:id/view', auth, (req, res) => {
 app.delete('/api/messages/:id', auth, (req, res) => {
   const message = findMessageById.get(req.params.id)
   if (!message) return res.status(404).json({ error: 'not_found' })
-  if (message.sender_id !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' })
+  let isChannelOwner = false
+  if (!message.channel_id.startsWith('dm:')) {
+    const channel = selectChannelByIdStmt.get(message.channel_id)
+    if (channel?.created_by && channel.created_by === req.user.id) isChannelOwner = true
+  }
+  if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
+    return res.status(403).json({ error: 'forbidden' })
   deleteMessageStmt.run(message.id)
   io.to(message.channel_id).emit('message:deleted', { id: message.id, channelId: message.channel_id })
+  if (message.channel_id.startsWith('dm:')) {
+    const participants = parseDirectChannelId(message.channel_id)
+    if (participants) {
+      const room = io.sockets.adapter.rooms.get(message.channel_id) || new Set()
+      ;[participants.first, participants.second].forEach((participantId) => {
+        const sid = onlineUsers.get(participantId)
+        if (!sid || room.has(sid)) return
+        io.to(sid).emit('message:deleted', { id: message.id, channelId: message.channel_id })
+      })
+    }
+  }
   log('[MESSAGE] delete', 'user=' + req.user.id, 'message=' + message.id, 'channel=' + message.channel_id)
   res.json({ ok: true })
 })
 
+app.patch('/api/messages/:id', auth, (req, res) => {
+  const rawContent = typeof req.body?.content === 'string' ? req.body.content.trim() : ''
+  if (!rawContent) return res.status(400).json({ error: 'content_required' })
+  const message = selectMessageFullById.get(req.params.id)
+  if (!message) return res.status(404).json({ error: 'not_found' })
+  let isChannelOwner = false
+  if (!message.channel_id.startsWith('dm:')) {
+    const channel = selectChannelByIdStmt.get(message.channel_id)
+    if (channel?.created_by && channel.created_by === req.user.id) isChannelOwner = true
+  }
+  if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
+    return res.status(403).json({ error: 'forbidden' })
+  const updatedAtRaw = Date.now()
+  if (hasMessageUpdatedAtColumn) {
+    updateMessageContentStmt.run(encryptText(rawContent), updatedAtRaw, message.id)
+  } else {
+    updateMessageContentStmt.run(encryptText(rawContent), message.id)
+  }
+  const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
+  const payload = {
+    id: message.id,
+    channelId: message.channel_id,
+    senderId: message.sender_id,
+    content: rawContent,
+    createdAt: message.created_at,
+    updatedAt,
+  }
+  io.to(message.channel_id).emit('message:updated', payload)
+  if (message.channel_id.startsWith('dm:')) {
+    const participants = parseDirectChannelId(message.channel_id)
+    if (participants) {
+      const room = io.sockets.adapter.rooms.get(message.channel_id) || new Set()
+      ;[participants.first, participants.second].forEach((participantId) => {
+        const sid = onlineUsers.get(participantId)
+        if (!sid || room.has(sid)) return
+        io.to(sid).emit('message:updated', payload)
+      })
+    }
+  }
+  log('[MESSAGE] update', 'user=' + req.user.id, 'message=' + message.id, 'channel=' + message.channel_id)
+  res.json({ message: payload })
+})
+
 const onlineUsers = new Map()
-const listChannels = db.prepare('SELECT * FROM channels WHERE workspace_id=? ORDER BY created_at ASC')
 const listMessages = db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
-const insertMessage = db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+const insertMessage = hasMessageUpdatedAtColumn
+  ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
+  : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
 const voiceParticipants = new Map()
+const typingState = new Map()
 
 const getVoiceRoomState = (roomId) => {
   const participants = voiceParticipants.get(roomId) || new Map()
@@ -807,17 +1381,62 @@ const getVoiceRoomState = (roomId) => {
   }))
 }
 
-const formatVoiceRoom = (room) => ({
-  id: room.id,
-  name: room.name,
-  createdAt: room.created_at,
-  createdBy: room.created_by || '',
-  participantCount: voiceParticipants.get(room.id)?.size || 0,
-})
+const normalizeVoiceRoomMembers = (roomId) =>
+  listVoiceRoomMembersStmt.all(roomId).map((member) => ({
+    userId: member.user_id,
+    username: member.username || '',
+    role: member.role,
+    addedAt: member.added_at,
+  }))
+
+const formatVoiceRoom = (room, viewer) => {
+  const baseRole = room.membership_role || (viewer?.id && room.created_by === viewer.id ? 'owner' : '')
+  const membershipRole = viewer?.role === 'admin' && !baseRole ? 'admin' : baseRole
+  const payload = {
+    id: room.id,
+    name: room.name,
+    createdAt: room.created_at,
+    createdBy: room.created_by || '',
+    participantCount: voiceParticipants.get(room.id)?.size || 0,
+    membershipRole: membershipRole || '',
+  }
+  if (membershipRole === 'owner' || membershipRole === 'admin') {
+    payload.members = normalizeVoiceRoomMembers(room.id)
+  }
+  return payload
+}
+
+const getVoiceRoomsForUser = (user) => {
+  if (!user) return []
+  if (user.role === 'admin') {
+    return listVoiceRoomsStmt.all().map((room) => ({ ...room, membership_role: 'admin' }))
+  }
+  return listVoiceRoomsForUserStmt.all(user.id, user.id, user.id)
+}
+
+const hasVoiceRoomAccess = (user, room) => {
+  if (!user || !room) return false
+  if (user.role === 'admin') return true
+  if (room.created_by === user.id) return true
+  const membership = selectVoiceRoomMemberStmt.get(room.id, user.id)
+  return Boolean(membership)
+}
+
+const canManageVoiceRoom = (user, room) => {
+  if (!user || !room) return false
+  if (user.role === 'admin') return true
+  if (room.created_by === user.id) return true
+  const membership = selectVoiceRoomMemberStmt.get(room.id, user.id)
+  return membership?.role === 'admin'
+}
 
 const emitVoiceRoomsUpdate = () => {
   cachedVoiceRooms = listVoiceRoomsStmt.all()
-  io.emit('voice:rooms:update', { rooms: cachedVoiceRooms.map(formatVoiceRoom) })
+  for (const socket of io.sockets.sockets.values()) {
+    if (!socket.user) continue
+    const rooms = getVoiceRoomsForUser(socket.user)
+    socket.emit('voice:rooms:update', { rooms: rooms.map((room) => formatVoiceRoom(room, socket.user)) })
+  }
 }
 
 const generateInviteCode = (length = INVITE_CODE_LENGTH) => {
@@ -830,9 +1449,18 @@ const generateInviteCode = (length = INVITE_CODE_LENGTH) => {
   return code
 }
 
+const generateClaimToken = () =>
+  crypto
+    .randomBytes(24)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+
 const getInviteStatus = (invite) => {
   const now = Date.now()
   if (invite.used_by) return 'used'
+  if (invite.revoked_at) return 'revoked'
   if (invite.expires_at && invite.expires_at < now) return 'expired'
   if (invite.claim_token) return 'claimed'
   return 'active'
@@ -847,6 +1475,7 @@ const formatInvite = (invite) => ({
   claimedAt: invite.claimed_at || 0,
   usedAt: invite.used_at || 0,
   usedBy: invite.used_by || '',
+  revokedAt: invite.revoked_at || 0,
   status: getInviteStatus(invite),
 })
 
@@ -891,15 +1520,38 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   const userId = socket.user.id
+  const loadUser = () => selectUserById.get(userId)
+  let userRecord = loadUser()
+  if (!userRecord) {
+    socket.emit('auth:error', { error: 'user_not_found' })
+    socket.disconnect(true)
+    return
+  }
+  socket.user.username = userRecord.username
+  socket.user.role = userRecord.role
   onlineUsers.set(userId, socket.id)
   io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
   log('[SOCKET] connected', 'user=' + userId, 'socket=' + socket.id)
+
+  const wsId = defaultWs.id
+
+  const leaveMessageRooms = () => {
+    for (const room of socket.rooms) {
+      if (room === socket.id) continue
+      if (room.startsWith('voice:')) continue
+      socket.leave(room)
+    }
+  }
 
   const joinVoiceRoom = (roomId) => {
     if (!roomId) return
     const room = selectVoiceRoomStmt.get(roomId)
     if (!room) {
       socket.emit('voice:error', { error: 'not_found' })
+      return
+    }
+    if (!hasVoiceRoomAccess(socket.user, room)) {
+      socket.emit('voice:error', { error: 'forbidden' })
       return
     }
     if (socket.voiceRoomId === roomId) return
@@ -924,32 +1576,87 @@ io.on('connection', (socket) => {
     broadcastVoiceState(roomId)
   }
 
-  const wsId = db.prepare('SELECT id FROM workspaces LIMIT 1').get().id
-  const channels = listChannels.all(wsId)
-  const activeChannelId = channels[0]?.id
-  if (activeChannelId) socket.join(activeChannelId)
+  let currentChannelId = null
+
+  const ensureChannelJoined = (channelId) => {
+    if (!channelId) {
+      leaveMessageRooms()
+      currentChannelId = null
+      return
+    }
+    leaveMessageRooms()
+    socket.join(channelId)
+    currentChannelId = channelId
+  }
+
+  const typingKeyFor = (channelId) => `${channelId}:${userId}`
+
+  const sendTypingUpdate = (channelId, typing) => {
+    const latestUser = loadUser() || userRecord
+    const payload = {
+      channelId,
+      userId,
+      username: latestUser?.username || socket.user.username || 'user',
+      typing: Boolean(typing),
+    }
+    socket.to(channelId).emit('typing:update', payload)
+    if (channelId.startsWith('dm:')) {
+      const participants = parseDirectChannelId(channelId)
+      if (participants) {
+        const room = io.sockets.adapter.rooms.get(channelId) || new Set()
+        ;[participants.first, participants.second].forEach((participantId) => {
+          if (participantId === userId) return
+          const sid = onlineUsers.get(participantId)
+          if (!sid || room.has(sid)) return
+          io.to(sid).emit('typing:update', payload)
+        })
+      }
+    }
+  }
+
+  const clearTypingForChannel = (channelId) => {
+    if (!channelId) return
+    const key = typingKeyFor(channelId)
+    if (typingState.has(key)) {
+      typingState.delete(key)
+      sendTypingUpdate(channelId, false)
+    }
+  }
+
+  const accessibleChannels = getAccessibleChannelsForUser(userRecord)
+  currentChannelId = accessibleChannels[0]?.id || null
+  if (currentChannelId) socket.join(currentChannelId)
 
   socket.on('init:request', ({ limit = 50, offset = 0 } = {}) => {
+    userRecord = loadUser() || userRecord
     log('[SOCKET] init:request', 'user=' + userId, 'limit=' + limit, 'offset=' + offset)
-    const messages = activeChannelId ? decryptMessages(listMessages.all(activeChannelId, limit, offset)).reverse() : []
-    socket.emit('init:response', { workspaces: [{ id: wsId, name: 'Home' }], channels, activeChannelId, messages })
+    const channels = getAccessibleChannelsForUser(userRecord)
+    if (!channels.some((channel) => channel.id === currentChannelId)) {
+      currentChannelId = channels[0]?.id || null
+      if (currentChannelId) ensureChannelJoined(currentChannelId)
+      else leaveMessageRooms()
+    }
+    const messages = currentChannelId ? decryptMessages(listMessages.all(currentChannelId, limit, offset)).reverse() : []
+    socket.emit('init:response', { workspaces: [{ id: wsId, name: 'Home' }], channels, activeChannelId: currentChannelId, messages })
   })
 
   socket.on('channel:switch', ({ channelId }) => {
     if (!channelId) return
     log('[SOCKET] channel:switch', 'user=' + userId, 'channel=' + channelId)
+    clearTypingForChannel(currentChannelId)
     if (channelId.startsWith('dm:')) {
       if (!isMemberOfDirectChannel(channelId, userId)) return
       const normalized = normalizeDirectChannelId(channelId)
       if (!normalized) return
-      for (const room of socket.rooms) if (room !== socket.id) socket.leave(room)
-      socket.join(normalized)
+      ensureChannelJoined(normalized)
       const msgs = decryptMessages(listMessages.all(normalized, 50, 0)).reverse()
       socket.emit('channel:opened', { channelId: normalized, messages: msgs })
       return
     }
-    for (const room of socket.rooms) if (room !== socket.id) socket.leave(room)
-    socket.join(channelId)
+    userRecord = loadUser() || userRecord
+    const access = resolveChannelAccess(userRecord, channelId)
+    if (!access.allowed) return
+    ensureChannelJoined(channelId)
     const msgs = decryptMessages(listMessages.all(channelId, 50, 0)).reverse()
     socket.emit('channel:opened', { channelId, messages: msgs })
   })
@@ -965,23 +1672,29 @@ io.on('connection', (socket) => {
       targetChannel = normalized
       const parsed = parseDirectChannelId(channelId)
       directParticipants = parsed ? [parsed.first, parsed.second] : null
+    } else {
+      userRecord = loadUser() || userRecord
+      const access = resolveChannelAccess(userRecord, channelId)
+      if (!access.allowed) return
+      targetChannel = channelId
     }
     const id = uuidv4()
     const now = Date.now()
     const encryptedContent = encryptText(content)
     insertMessage.run(id, targetChannel, userId, encryptedContent, now)
-    const payload = { id, channelId: targetChannel, senderId: userId, content, createdAt: now }
+    const payload = { id, channelId: targetChannel, senderId: userId, content, createdAt: now, updatedAt: 0 }
     io.to(targetChannel).emit('message:new', payload)
     log('[MESSAGE] send', 'user=' + userId, 'channel=' + targetChannel, 'bytes=' + Buffer.byteLength(content, 'utf8'))
     if (directParticipants) {
       const room = io.sockets.adapter.rooms.get(targetChannel) || new Set()
       directParticipants.forEach((participantId) => {
+        if (participantId === userId) return
         const sid = onlineUsers.get(participantId)
-        if (!sid) return
-        if (room.has(sid)) return
+        if (!sid || room.has(sid)) return
         io.to(sid).emit('message:new', payload)
       })
     }
+    clearTypingForChannel(targetChannel)
   })
 
   socket.on('messages:load', ({ channelId, limit = 50, offset = 0 }) => {
@@ -993,14 +1706,52 @@ io.on('connection', (socket) => {
       const normalized = normalizeDirectChannelId(channelId)
       if (!normalized) return
       targetChannel = normalized
+    } else {
+      userRecord = loadUser() || userRecord
+      const access = resolveChannelAccess(userRecord, channelId)
+      if (!access.allowed) return
+      targetChannel = channelId
     }
     const msgs = decryptMessages(listMessages.all(targetChannel, limit, offset)).reverse()
     socket.emit('messages:page', { channelId: targetChannel, messages: msgs, offset, limit })
   })
 
+  socket.on('typing', ({ channelId, state }) => {
+    if (!channelId) return
+    let targetChannel = channelId
+    if (channelId.startsWith('dm:')) {
+      if (!isMemberOfDirectChannel(channelId, userId)) return
+      const normalized = normalizeDirectChannelId(channelId)
+      if (!normalized) return
+      targetChannel = normalized
+    } else {
+      userRecord = loadUser() || userRecord
+      const access = resolveChannelAccess(userRecord, channelId)
+      if (!access.allowed) return
+      targetChannel = channelId
+    }
+    const key = typingKeyFor(targetChannel)
+    if (state) {
+      typingState.set(key, Date.now())
+      sendTypingUpdate(targetChannel, true)
+    } else if (typingState.has(key)) {
+      typingState.delete(key)
+      sendTypingUpdate(targetChannel, false)
+    }
+  })
+
   socket.on('disconnect', () => {
     leaveVoiceRoom(socket)
     onlineUsers.delete(userId)
+    const keysToClear = []
+    typingState.forEach((_, key) => {
+      if (key.endsWith(`:${userId}`)) keysToClear.push(key)
+    })
+    keysToClear.forEach((key) => {
+      typingState.delete(key)
+      const channelId = key.slice(0, key.lastIndexOf(':'))
+      if (channelId) sendTypingUpdate(channelId, false)
+    })
     io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
     log('[SOCKET] disconnected', 'user=' + userId, 'socket=' + socket.id)
   })
@@ -1013,6 +1764,8 @@ io.on('connection', (socket) => {
     if (!targetSocket) return
     targetSocket.emit('voice:signal', { from: socket.id, data })
   })
+
+  emitChannelListForUser(userId)
 })
 
 process.on('unhandledRejection', (reason) => {
