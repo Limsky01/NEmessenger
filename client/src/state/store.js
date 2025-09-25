@@ -8,6 +8,84 @@ const encoder = new TextEncoder()
 const storageKeyForChannel = (cid) => `chkey:${cid}`
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
 const voicePeerConnections = new Map()
+const speakingMonitors = new Map()
+
+const ensureAudioContext = () => {
+  if (typeof window === 'undefined') return null
+  const AudioCtx = window.AudioContext || window.webkitAudioContext
+  if (!AudioCtx) return null
+  if (!ensureAudioContext.ctx) {
+    try {
+      ensureAudioContext.ctx = new AudioCtx()
+    } catch (err) {
+      console.warn('audio context init failed', err)
+      return null
+    }
+  }
+  if (ensureAudioContext.ctx?.state === 'suspended') {
+    ensureAudioContext.ctx.resume().catch(() => {})
+  }
+  return ensureAudioContext.ctx
+}
+
+const stopSpeakingMonitor = (id, set) => {
+  if (!id) return
+  const session = speakingMonitors.get(id)
+  if (session) {
+    clearInterval(session.interval)
+    try {
+      session.source.disconnect()
+    } catch (err) {
+      console.warn('speaking monitor disconnect failed', err)
+    }
+    speakingMonitors.delete(id)
+  }
+  if (!set) return
+  set((state) => {
+    if (!state.voiceSpeaking || typeof state.voiceSpeaking !== 'object') return state
+    if (typeof state.voiceSpeaking[id] === 'undefined') return state
+    const next = { ...state.voiceSpeaking }
+    delete next[id]
+    return { voiceSpeaking: next }
+  })
+}
+
+const startSpeakingMonitor = (id, stream, set) => {
+  if (!id || !stream) return
+  const context = ensureAudioContext()
+  if (!context) return
+  stopSpeakingMonitor(id)
+  let source
+  try {
+    source = context.createMediaStreamSource(stream)
+  } catch (err) {
+    console.warn('media source init failed', err)
+    return
+  }
+  const analyser = context.createAnalyser()
+  analyser.smoothingTimeConstant = 0.8
+  analyser.fftSize = 512
+  source.connect(analyser)
+  const buffer = new Uint8Array(analyser.frequencyBinCount)
+  let lastState = false
+  const interval = setInterval(() => {
+    try {
+      analyser.getByteFrequencyData(buffer)
+      const avg = buffer.reduce((acc, value) => acc + value, 0) / buffer.length
+      const speaking = avg > 45
+      if (speaking !== lastState) {
+        lastState = speaking
+        set((state) => ({
+          voiceSpeaking: { ...state.voiceSpeaking, [id]: speaking },
+        }))
+      }
+    } catch (err) {
+      console.warn('speaking monitor update failed', err)
+    }
+  }, 160)
+  speakingMonitors.set(id, { analyser, source, interval })
+}
+ensureAudioContext.ctx = null
 
 const loadStoredDevice = (key) => {
   try {
@@ -31,11 +109,26 @@ const teardownVoicePeer = (socketId, set) => {
     }
     voicePeerConnections.delete(socketId)
   }
+  stopSpeakingMonitor(socketId, set)
   set((state) => {
-    if (!state.voiceRemoteStreams[socketId]) return state
-    const next = { ...state.voiceRemoteStreams }
-    delete next[socketId]
-    return { voiceRemoteStreams: next }
+    const nextStreams = { ...state.voiceRemoteStreams }
+    const nextStates = { ...state.voicePeerStates }
+    const nextSpeaking = { ...state.voiceSpeaking }
+    let changed = false
+    if (nextStreams[socketId]) {
+      delete nextStreams[socketId]
+      changed = true
+    }
+    if (nextStates[socketId]) {
+      delete nextStates[socketId]
+      changed = true
+    }
+    if (typeof nextSpeaking[socketId] !== 'undefined') {
+      delete nextSpeaking[socketId]
+      changed = true
+    }
+    if (!changed) return state
+    return { voiceRemoteStreams: nextStreams, voicePeerStates: nextStates, voiceSpeaking: nextSpeaking }
   })
 }
 
@@ -75,10 +168,14 @@ const setupVoicePeer = async ({ socket, roomId, participant, initiator, get, set
         },
       },
     }))
+    startSpeakingMonitor(participant.socketId, remoteStream, set)
   }
 
   pc.onconnectionstatechange = () => {
     const state = pc.connectionState
+    set((current) => ({
+      voicePeerStates: { ...current.voicePeerStates, [participant.socketId]: state },
+    }))
     if (state === 'failed' || state === 'disconnected' || state === 'closed') {
       teardownVoicePeer(participant.socketId, set)
     }
@@ -267,9 +364,12 @@ const useStore = create((set, get) => ({
   voiceRooms: [],
   voiceParticipants: {},
   voiceRemoteStreams: {},
+  voicePeerStates: {},
+  voiceSpeaking: {},
   activeVoiceRoomId: null,
   voiceStatus: null,
   voiceStream: null,
+  voiceSelfSocketId: null,
   invites: [],
 
   setAuth: (token, user) => set((state) => {
@@ -350,7 +450,7 @@ const useStore = create((set, get) => ({
       const deviceId = get().audioInputDeviceId
       const constraints = deviceId ? { audio: { deviceId: { exact: deviceId } } } : { audio: true }
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
-      set({ voiceStream: stream, voiceStatus: 'connecting', activeVoiceRoomId: roomId })
+      set({ voiceStream: stream, voiceStatus: 'connecting', activeVoiceRoomId: roomId, voiceSelfSocketId: null })
       socket.emit('voice:join', { roomId })
     } catch (err) {
       console.error('joinVoiceRoom failed', err)
@@ -365,26 +465,51 @@ const useStore = create((set, get) => ({
     voicePeerConnections.clear()
     const stream = get().voiceStream
     if (stream) stream.getTracks().forEach((track) => track.stop())
+    speakingMonitors.forEach((_, key) => stopSpeakingMonitor(key))
     set((state) => ({
       activeVoiceRoomId: null,
       voiceStream: null,
       voiceStatus: null,
       voiceRemoteStreams: {},
+      voicePeerStates: {},
+      voiceSpeaking: {},
+      voiceSelfSocketId: null,
       voiceParticipants: roomId ? { ...state.voiceParticipants, [roomId]: [] } : state.voiceParticipants,
     }))
   },
-  createVoiceRoom: async (name) => {
+  createVoiceRoom: async (name, options = {}) => {
     const token = get().token
     if (!token) throw new Error('not_authenticated')
     const trimmed = typeof name === 'string' ? name.trim() : ''
     if (!trimmed) throw new Error('invalid_name')
+    const members = Array.isArray(options.members) ? options.members : []
+    const admins = Array.isArray(options.admins) ? options.admins : []
+    const payload = { name: trimmed }
+    if (members.length) payload.members = members
+    if (admins.length) payload.admins = admins
     const { data } = await axios.post(
       `${get().serverUrl}/api/voice-rooms`,
-      { name: trimmed },
+      payload,
       { headers: buildAuthHeaders(token) },
     )
     if (data?.room) {
       set((state) => ({ voiceRooms: [...state.voiceRooms.filter((room) => room.id !== data.room.id), data.room] }))
+    }
+  },
+  updateVoiceRoomMembers: async (roomId, { upserts = [], remove = [] } = {}) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/voice-rooms/${roomId}/members`,
+      { upserts, remove },
+      { headers: buildAuthHeaders(token) },
+    )
+    if (data?.room) {
+      set((state) => ({
+        voiceRooms: state.voiceRooms.some((room) => room.id === roomId)
+          ? state.voiceRooms.map((room) => (room.id === roomId ? { ...room, ...data.room } : room))
+          : [...state.voiceRooms, data.room],
+      }))
     }
   },
   deleteVoiceRoom: async (roomId) => {
@@ -715,9 +840,23 @@ const useStore = create((set, get) => ({
         }
       }
     })
-    socket.on('voice:joined', ({ roomId }) => {
+    socket.on('voice:joined', ({ roomId, participant }) => {
       if (!roomId) return
-      set((state) => ({ voiceStatus: 'connected', activeVoiceRoomId: roomId }))
+      set((state) => {
+        const list = state.voiceParticipants[roomId] || []
+        const exists = participant ? list.some((p) => p.socketId === participant.socketId) : false
+        const nextList = participant && !exists ? [...list, participant] : list
+        return {
+          voiceStatus: 'connected',
+          activeVoiceRoomId: roomId,
+          voiceSelfSocketId: participant?.socketId || state.voiceSelfSocketId,
+          voiceParticipants: { ...state.voiceParticipants, [roomId]: nextList },
+        }
+      })
+      const localStream = get().voiceStream
+      if (participant?.socketId && localStream) {
+        startSpeakingMonitor(participant.socketId, localStream, set)
+      }
     })
     socket.on('voice:room-closed', ({ roomId }) => {
       if (get().activeVoiceRoomId === roomId) {
@@ -731,7 +870,16 @@ const useStore = create((set, get) => ({
       if (stream) stream.getTracks().forEach((track) => track.stop())
       voicePeerConnections.forEach((_, id) => teardownVoicePeer(id, set))
       voicePeerConnections.clear()
-      set({ voiceStream: null, activeVoiceRoomId: null, voiceRemoteStreams: {}, voiceStatus: 'disconnected' })
+      speakingMonitors.forEach((_, key) => stopSpeakingMonitor(key))
+      set({
+        voiceStream: null,
+        activeVoiceRoomId: null,
+        voiceRemoteStreams: {},
+        voicePeerStates: {},
+        voiceSpeaking: {},
+        voiceSelfSocketId: null,
+        voiceStatus: 'disconnected',
+      })
     })
   },
 

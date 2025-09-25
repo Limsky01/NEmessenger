@@ -246,8 +246,23 @@ CREATE TABLE IF NOT EXISTS voice_rooms (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  created_by TEXT DEFAULT ''
+  created_by TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS voice_room_members (
+  room_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  added_at INTEGER NOT NULL,
+  added_by TEXT NOT NULL,
+  PRIMARY KEY (room_id, user_id),
+  FOREIGN KEY (room_id) REFERENCES voice_rooms(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (added_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_room_members_room ON voice_room_members(room_id);
+CREATE INDEX IF NOT EXISTS idx_voice_room_members_user ON voice_room_members(user_id);
 CREATE TABLE IF NOT EXISTS invites (
   id TEXT PRIMARY KEY,
   code TEXT UNIQUE NOT NULL,
@@ -261,7 +276,6 @@ CREATE TABLE IF NOT EXISTS invites (
   revoked_at INTEGER
 );
 `)
-
 
 ensureColumn('users', 'avatar_seed', 'TEXT DEFAULT ""')
 ensureColumn('users', 'avatar_url', 'TEXT DEFAULT ""')
@@ -279,6 +293,7 @@ ensureColumn('channels', 'created_by', 'TEXT DEFAULT ""')
 ensureColumn('messages', 'updated_at', 'INTEGER DEFAULT 0')
 
 const hasMessageUpdatedAtColumn = tableHasColumn('messages', 'updated_at')
+
 try {
   db.prepare('ALTER TABLE users ADD COLUMN avatar_seed TEXT DEFAULT ""').run()
 } catch (err) {}
@@ -322,6 +337,7 @@ try {
   db.prepare('ALTER TABLE messages ADD COLUMN updated_at INTEGER DEFAULT 0').run()
 } catch (err) {}
 
+
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
 const selectUserById = db.prepare('SELECT * FROM users WHERE id=?')
@@ -330,8 +346,29 @@ const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id
 const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
 const countAdminsStmt = db.prepare("SELECT COUNT(*) as count FROM users WHERE role='admin'")
 const listVoiceRoomsStmt = db.prepare('SELECT id, name, created_at, created_by FROM voice_rooms ORDER BY created_at ASC')
+const listVoiceRoomsForUserStmt = db.prepare(
+  `SELECT vr.id, vr.name, vr.created_at, vr.created_by, vrm.role AS membership_role
+   FROM voice_rooms vr
+   LEFT JOIN voice_room_members vrm ON vrm.room_id = vr.id AND vrm.user_id = ?
+   WHERE vr.created_by = ? OR vrm.user_id = ?
+   ORDER BY vr.created_at ASC`
+)
 const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
 const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
+
+const selectVoiceRoomStmt = db.prepare('SELECT id, name, created_by FROM voice_rooms WHERE id=?')
+const insertVoiceRoomMemberStmt = db.prepare(
+  'INSERT OR REPLACE INTO voice_room_members (room_id, user_id, role, added_at, added_by) VALUES (?,?,?,?,?)'
+)
+const deleteVoiceRoomMemberStmt = db.prepare('DELETE FROM voice_room_members WHERE room_id=? AND user_id=?')
+const listVoiceRoomMembersStmt = db.prepare(
+  `SELECT vrm.user_id, vrm.role, vrm.added_at, u.username
+   FROM voice_room_members vrm
+   LEFT JOIN users u ON u.id = vrm.user_id
+   WHERE vrm.room_id = ?
+   ORDER BY u.username COLLATE NOCASE ASC`
+)
+const selectVoiceRoomMemberStmt = db.prepare('SELECT role FROM voice_room_members WHERE room_id=? AND user_id=?')
 const selectVoiceRoomStmt = db.prepare('SELECT id, name FROM voice_rooms WHERE id=?')
 const insertInviteStmt = db.prepare(
   'INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at, revoked_at) VALUES (?,?,?,?,?, ?, NULL, NULL, NULL, NULL)'
@@ -340,11 +377,30 @@ const selectInviteByCodeStmt = db.prepare('SELECT * FROM invites WHERE code=?')
 const selectInviteByIdStmt = db.prepare('SELECT * FROM invites WHERE id=?')
 const listInvitesByCreatorStmt = db.prepare('SELECT * FROM invites WHERE created_by=? ORDER BY created_at DESC')
 const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, claimed_at=? WHERE id=?')
+const clearInviteClaimStmt = db.prepare('UPDATE invites SET claim_token="", claimed_at=NULL WHERE id=?')
 const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='', revoked_at=NULL WHERE id=?")
 const revokeInviteStmt = db.prepare('UPDATE invites SET revoked_at=?, claim_token="" WHERE id=?')
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const selectMessageFullById = db.prepare('SELECT * FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
+const updateMessageContentStmt = hasMessageUpdatedAtColumn
+  ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
+  : db.prepare('UPDATE messages SET content=? WHERE id=?')
+const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
+const insertChannelStmt = db.prepare(
+  'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
+)
+const listAllChannelsStmt = db.prepare('SELECT * FROM channels WHERE workspace_id=? ORDER BY created_at ASC')
+const listUserChannelMembershipsStmt = db.prepare('SELECT channel_id, role FROM channel_members WHERE user_id=?')
+const listChannelMembersStmt = db.prepare('SELECT user_id, role FROM channel_members WHERE channel_id=? ORDER BY user_id ASC')
+const listChannelMembersDetailedStmt = db.prepare(
+  "SELECT m.user_id, m.role, u.username FROM channel_members m JOIN users u ON u.id = m.user_id WHERE m.channel_id=? ORDER BY u.username ASC",
+)
+const insertChannelMemberStmt = db.prepare('INSERT OR REPLACE INTO channel_members (channel_id, user_id, role) VALUES (?,?,?)')
+const deleteChannelMemberStmt = db.prepare('DELETE FROM channel_members WHERE channel_id=? AND user_id=?')
+const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
+const countChannelMembersStmt = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id=?')
+const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
 
 const updateMessageContentStmt = hasMessageUpdatedAtColumn
   ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
@@ -394,7 +450,7 @@ if (!defaultWs) {
 let cachedVoiceRooms = listVoiceRoomsStmt.all()
 if (!cachedVoiceRooms.length) {
   const vrId = uuidv4()
-  insertVoiceRoomStmt.run(vrId, 'Общий голосовой', Date.now(), '')
+  insertVoiceRoomStmt.run(vrId, 'Общий голосовой', Date.now(), 'system')
   cachedVoiceRooms = listVoiceRoomsStmt.all()
 }
 
@@ -1030,23 +1086,36 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
 })
 
 app.get('/api/voice-rooms', auth, (req, res) => {
-  const rooms = listVoiceRoomsStmt.all().map(formatVoiceRoom)
+  const viewer = selectUserById.get(req.user.id) || req.user
+  const rooms = getVoiceRoomsForUser(viewer).map((room) => formatVoiceRoom(room, viewer))
   res.json({ rooms })
 })
 
-app.post('/api/voice-rooms', auth, adminOnly, (req, res) => {
+app.post('/api/voice-rooms', auth, (req, res) => {
+  const viewer = selectUserById.get(req.user.id)
+  if (!viewer) return res.status(404).json({ error: 'not_found' })
   const name = typeof req.body?.name === 'string' ? req.body.name.trim() : ''
   if (!name) return res.status(400).json({ error: 'invalid_name' })
-  const id = uuidv4()
+  const rawMembers = Array.isArray(req.body?.members) ? req.body.members : []
+  const memberSet = new Set(rawMembers.filter((id) => typeof id === 'string' && id !== viewer.id))
+  const adminSet = new Set(Array.isArray(req.body?.admins) ? req.body.admins : [])
   const now = Date.now()
-  insertVoiceRoomStmt.run(id, name, now, req.user.id)
+  const id = uuidv4()
+  insertVoiceRoomStmt.run(id, name, now, viewer.id)
+  insertVoiceRoomMemberStmt.run(id, viewer.id, 'owner', now, viewer.id)
+  memberSet.forEach((userId) => {
+    insertVoiceRoomMemberStmt.run(id, userId, adminSet.has(userId) ? 'admin' : 'member', now, viewer.id)
+  })
   emitVoiceRoomsUpdate()
-  res.status(201).json({ room: formatVoiceRoom({ id, name, created_at: now, created_by: req.user.id }) })
+  res.status(201).json({ room: formatVoiceRoom({ id, name, created_at: now, created_by: viewer.id }, viewer) })
 })
 
-app.delete('/api/voice-rooms/:id', auth, adminOnly, (req, res) => {
+app.delete('/api/voice-rooms/:id', auth, (req, res) => {
+  const viewer = selectUserById.get(req.user.id)
+  if (!viewer) return res.status(404).json({ error: 'not_found' })
   const room = selectVoiceRoomStmt.get(req.params.id)
   if (!room) return res.status(404).json({ error: 'not_found' })
+  if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
   const participants = voiceParticipants.get(room.id)
   if (participants) {
     for (const participant of participants.values()) {
@@ -1060,6 +1129,50 @@ app.delete('/api/voice-rooms/:id', auth, adminOnly, (req, res) => {
   deleteVoiceRoomStmt.run(room.id)
   emitVoiceRoomsUpdate()
   res.json({ ok: true })
+})
+
+app.post('/api/voice-rooms/:id/members', auth, (req, res) => {
+  const viewer = selectUserById.get(req.user.id)
+  if (!viewer) return res.status(404).json({ error: 'not_found' })
+  const room = selectVoiceRoomStmt.get(req.params.id)
+  if (!room) return res.status(404).json({ error: 'not_found' })
+  if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
+  const updates = Array.isArray(req.body?.upserts) ? req.body.upserts : []
+  const removals = Array.isArray(req.body?.remove) ? req.body.remove : []
+  const now = Date.now()
+
+  const removedUsers = []
+  removals
+    .filter((userId) => typeof userId === 'string' && userId !== room.created_by)
+    .forEach((userId) => {
+      deleteVoiceRoomMemberStmt.run(room.id, userId)
+      removedUsers.push(userId)
+    })
+
+  updates.forEach((entry) => {
+    if (!entry || typeof entry.userId !== 'string') return
+    const role = entry.role === 'admin' ? 'admin' : 'member'
+    if (entry.userId === room.created_by) return
+    if (!selectUserById.get(entry.userId)) return
+    insertVoiceRoomMemberStmt.run(room.id, entry.userId, role, now, viewer.id)
+  })
+
+  if (removedUsers.length) {
+    const participants = voiceParticipants.get(room.id)
+    if (participants) {
+      for (const participant of participants.values()) {
+        if (!removedUsers.includes(participant.userId)) continue
+        const targetSocket = io.sockets.sockets.get(participant.socketId)
+        if (targetSocket) {
+          targetSocket.emit('voice:room-closed', { roomId: room.id })
+          leaveVoiceRoom(targetSocket, { silent: true })
+        }
+      }
+    }
+  }
+
+  emitVoiceRoomsUpdate()
+  res.json({ room: formatVoiceRoom({ ...room }, viewer) })
 })
 
 app.patch('/api/admin/users/:id/role', auth, adminOnly, (req, res) => {
@@ -1295,7 +1408,6 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   }
   const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
 
-
   updateMessageContentStmt.run(encryptText(rawContent), updatedAt, message.id)
 
   const payload = {
@@ -1330,6 +1442,12 @@ const insertMessage = hasMessageUpdatedAtColumn
   : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
 
 
+const insertMessage = hasMessageUpdatedAtColumn
+  ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
+  : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+
+
+
 
 const voiceParticipants = new Map()
 const typingState = new Map()
@@ -1343,17 +1461,62 @@ const getVoiceRoomState = (roomId) => {
   }))
 }
 
-const formatVoiceRoom = (room) => ({
-  id: room.id,
-  name: room.name,
-  createdAt: room.created_at,
-  createdBy: room.created_by || '',
-  participantCount: voiceParticipants.get(room.id)?.size || 0,
-})
+const normalizeVoiceRoomMembers = (roomId) =>
+  listVoiceRoomMembersStmt.all(roomId).map((member) => ({
+    userId: member.user_id,
+    username: member.username || '',
+    role: member.role,
+    addedAt: member.added_at,
+  }))
+
+const formatVoiceRoom = (room, viewer) => {
+  const baseRole = room.membership_role || (viewer?.id && room.created_by === viewer.id ? 'owner' : '')
+  const membershipRole = viewer?.role === 'admin' && !baseRole ? 'admin' : baseRole
+  const payload = {
+    id: room.id,
+    name: room.name,
+    createdAt: room.created_at,
+    createdBy: room.created_by || '',
+    participantCount: voiceParticipants.get(room.id)?.size || 0,
+    membershipRole: membershipRole || '',
+  }
+  if (membershipRole === 'owner' || membershipRole === 'admin') {
+    payload.members = normalizeVoiceRoomMembers(room.id)
+  }
+  return payload
+}
+
+const getVoiceRoomsForUser = (user) => {
+  if (!user) return []
+  if (user.role === 'admin') {
+    return listVoiceRoomsStmt.all().map((room) => ({ ...room, membership_role: 'admin' }))
+  }
+  return listVoiceRoomsForUserStmt.all(user.id, user.id, user.id)
+}
+
+const hasVoiceRoomAccess = (user, room) => {
+  if (!user || !room) return false
+  if (user.role === 'admin') return true
+  if (room.created_by === user.id) return true
+  const membership = selectVoiceRoomMemberStmt.get(room.id, user.id)
+  return Boolean(membership)
+}
+
+const canManageVoiceRoom = (user, room) => {
+  if (!user || !room) return false
+  if (user.role === 'admin') return true
+  if (room.created_by === user.id) return true
+  const membership = selectVoiceRoomMemberStmt.get(room.id, user.id)
+  return membership?.role === 'admin'
+}
 
 const emitVoiceRoomsUpdate = () => {
   cachedVoiceRooms = listVoiceRoomsStmt.all()
-  io.emit('voice:rooms:update', { rooms: cachedVoiceRooms.map(formatVoiceRoom) })
+  for (const socket of io.sockets.sockets.values()) {
+    if (!socket.user) continue
+    const rooms = getVoiceRoomsForUser(socket.user)
+    socket.emit('voice:rooms:update', { rooms: rooms.map((room) => formatVoiceRoom(room, socket.user)) })
+  }
 }
 
 const generateInviteCode = (length = INVITE_CODE_LENGTH) => {
@@ -1465,6 +1628,10 @@ io.on('connection', (socket) => {
     const room = selectVoiceRoomStmt.get(roomId)
     if (!room) {
       socket.emit('voice:error', { error: 'not_found' })
+      return
+    }
+    if (!hasVoiceRoomAccess(socket.user, room)) {
+      socket.emit('voice:error', { error: 'forbidden' })
       return
     }
     if (socket.voiceRoomId === roomId) return
