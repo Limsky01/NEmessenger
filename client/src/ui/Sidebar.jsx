@@ -34,6 +34,7 @@ export default function Sidebar() {
   const voiceSelfSocketId = useStore((s) => s.voiceSelfSocketId)
   const updateVoiceRoomMembers = useStore((s) => s.updateVoiceRoomMembers)
 
+
   const onlineSet = useMemo(() => new Set(onlineUserIds), [onlineUserIds])
   const otherUsers = useMemo(() => users.filter((u) => u.id !== me?.id), [users, me])
   const publicChannels = useMemo(() => channels.filter((channel) => !channel.isPrivate), [channels])
@@ -160,6 +161,45 @@ export default function Sidebar() {
       setVoiceError(editingRoom ? 'Не удалось обновить участников' : 'Не удалось создать комнату')
     } finally {
       setVoiceSaving(false)
+    }
+
+  }
+
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [channelName, setChannelName] = useState('')
+  const [selectedIds, setSelectedIds] = useState([])
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState(null)
+
+  const toggleSelection = (userId) => {
+    setSelectedIds((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
+  }
+
+  const closeCreateDialog = () => {
+    if (creating) return
+    setCreateDialogOpen(false)
+    setChannelName('')
+    setSelectedIds([])
+    setCreateError(null)
+  }
+
+  const handleCreatePrivateChannel = async () => {
+    if (creating) return
+    if (!channelName.trim()) {
+      setCreateError('Введите название канала')
+      return
+    }
+    setCreating(true)
+    setCreateError(null)
+    try {
+      const channel = await createPrivateChannel(channelName, selectedIds)
+      if (channel?.id) switchChannel(channel.id)
+      closeCreateDialog()
+    } catch (err) {
+      console.error('create private channel failed', err)
+      setCreateError('Не удалось создать канал')
+    } finally {
+      setCreating(false)
     }
   }
 
@@ -302,9 +342,52 @@ export default function Sidebar() {
             ) : (
               <div className="text-sm text-white/40 px-2">Приватных комнат пока нет</div>
             )
+
           ) : (
             <div className="text-xs text-white/30 px-2">Секция скрыта</div>
           )}
+          })}
+          {publicChannels.length === 0 && <div className="text-sm text-white/40 px-2">Общих каналов пока нет</div>}
+        </div>
+
+        <div className="space-y-2">
+          <div className="px-2 text-xs uppercase tracking-[0.2em] text-white/40 flex items-center justify-between">
+            <span>Приватные комнаты</span>
+            <button
+              type="button"
+              onClick={() => setCreateDialogOpen(true)}
+              className="text-white/40 hover:text-white/80 transition text-lg leading-none"
+            >
+              +
+            </button>
+          </div>
+          {privateChannels.map((channel) => {
+            const active = channel.id === activeChannelId
+            const unreadCount = unread[channel.id] || 0
+            const role = channel.membershipRole === 'owner' ? 'Создатель' : channel.membershipRole === 'admin' ? 'Админ' : 'Участник'
+            return (
+              <button
+                key={channel.id}
+                type="button"
+                onClick={() => switchChannel(channel.id)}
+                className={`w-full flex items-center justify-between px-3 py-3 rounded-2xl transition-colors ${active ? 'panel' : 'glass hover:bg-white/10'}`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className="avatar">🔒</div>
+                  <div>
+                    <div className="text-sm font-medium">{channel.name}</div>
+                    <div className="text-xs text-white/60 flex items-center gap-2">
+                      <span>{role}</span>
+                      <span>•</span>
+                      <span>{channel.memberCount} участн.</span>
+                    </div>
+                  </div>
+                </div>
+                {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
+              </button>
+            )
+          })}
+          {privateChannels.length === 0 && <div className="text-sm text-white/40 px-2">Приватных комнат пока нет</div>}
         </div>
 
         <div>
@@ -616,7 +699,21 @@ export default function Sidebar() {
                     <div className="text-sm text-white/80">
                       @{users.find((u) => u.id === editingRoom.createdBy)?.username || editingRoom.createdBy}
                     </div>
+
                     <span className="text-[11px] text-white/40">Создатель</span>
+
+                    <div className="text-xs text-white/50">В голосе: {count}</div>
+                    {active && voiceStatus && (
+                      <div className="text-[11px] text-white/40">
+                        {voiceStatus === 'connecting'
+                          ? 'Подключение...'
+                          : voiceStatus === 'error'
+                          ? 'Ошибка соединения'
+                          : voiceStatus === 'room_closed'
+                          ? 'Комната закрыта'
+                          : 'Подключено'}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

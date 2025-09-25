@@ -294,6 +294,50 @@ ensureColumn('messages', 'updated_at', 'INTEGER DEFAULT 0')
 
 const hasMessageUpdatedAtColumn = tableHasColumn('messages', 'updated_at')
 
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN avatar_seed TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN avatar_updated_at INTEGER DEFAULT 0').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE files ADD COLUMN iv TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE files ADD COLUMN auth_tag TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN claim_token TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN claimed_at INTEGER').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN used_by TEXT').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN used_at INTEGER').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE invites ADD COLUMN revoked_at INTEGER').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE channels ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE channels ADD COLUMN created_by TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE messages ADD COLUMN updated_at INTEGER DEFAULT 0').run()
+} catch (err) {}
+
+
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
 const selectUserById = db.prepare('SELECT * FROM users WHERE id=?')
@@ -311,6 +355,7 @@ const listVoiceRoomsForUserStmt = db.prepare(
 )
 const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
 const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
+
 const selectVoiceRoomStmt = db.prepare('SELECT id, name, created_by FROM voice_rooms WHERE id=?')
 const insertVoiceRoomMemberStmt = db.prepare(
   'INSERT OR REPLACE INTO voice_room_members (room_id, user_id, role, added_at, added_by) VALUES (?,?,?,?,?)'
@@ -324,6 +369,7 @@ const listVoiceRoomMembersStmt = db.prepare(
    ORDER BY u.username COLLATE NOCASE ASC`
 )
 const selectVoiceRoomMemberStmt = db.prepare('SELECT role FROM voice_room_members WHERE room_id=? AND user_id=?')
+const selectVoiceRoomStmt = db.prepare('SELECT id, name FROM voice_rooms WHERE id=?')
 const insertInviteStmt = db.prepare(
   'INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at, revoked_at) VALUES (?,?,?,?,?, ?, NULL, NULL, NULL, NULL)'
 )
@@ -340,6 +386,26 @@ const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
 const updateMessageContentStmt = hasMessageUpdatedAtColumn
   ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
   : db.prepare('UPDATE messages SET content=? WHERE id=?')
+const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
+const insertChannelStmt = db.prepare(
+  'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
+)
+const listAllChannelsStmt = db.prepare('SELECT * FROM channels WHERE workspace_id=? ORDER BY created_at ASC')
+const listUserChannelMembershipsStmt = db.prepare('SELECT channel_id, role FROM channel_members WHERE user_id=?')
+const listChannelMembersStmt = db.prepare('SELECT user_id, role FROM channel_members WHERE channel_id=? ORDER BY user_id ASC')
+const listChannelMembersDetailedStmt = db.prepare(
+  "SELECT m.user_id, m.role, u.username FROM channel_members m JOIN users u ON u.id = m.user_id WHERE m.channel_id=? ORDER BY u.username ASC",
+)
+const insertChannelMemberStmt = db.prepare('INSERT OR REPLACE INTO channel_members (channel_id, user_id, role) VALUES (?,?,?)')
+const deleteChannelMemberStmt = db.prepare('DELETE FROM channel_members WHERE channel_id=? AND user_id=?')
+const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
+const countChannelMembersStmt = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id=?')
+const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
+
+const updateMessageContentStmt = hasMessageUpdatedAtColumn
+  ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
+  : db.prepare('UPDATE messages SET content=? WHERE id=?')
+
 const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
 const insertChannelStmt = db.prepare(
   'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
@@ -1333,6 +1399,7 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   }
   if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
     return res.status(403).json({ error: 'forbidden' })
+
   const updatedAtRaw = Date.now()
   if (hasMessageUpdatedAtColumn) {
     updateMessageContentStmt.run(encryptText(rawContent), updatedAtRaw, message.id)
@@ -1340,6 +1407,9 @@ app.patch('/api/messages/:id', auth, (req, res) => {
     updateMessageContentStmt.run(encryptText(rawContent), message.id)
   }
   const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
+
+  updateMessageContentStmt.run(encryptText(rawContent), updatedAt, message.id)
+
   const payload = {
     id: message.id,
     channelId: message.channel_id,
@@ -1366,9 +1436,19 @@ app.patch('/api/messages/:id', auth, (req, res) => {
 
 const onlineUsers = new Map()
 const listMessages = db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
+
 const insertMessage = hasMessageUpdatedAtColumn
   ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
   : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+
+
+const insertMessage = hasMessageUpdatedAtColumn
+  ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
+  : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+
+
+
+
 const voiceParticipants = new Map()
 const typingState = new Map()
 
@@ -1773,12 +1853,6 @@ process.on('unhandledRejection', (reason) => {
 })
 
 server.listen(PORT, () => log('Server listening on', PORT))
-
-
-
-
-
-
 
 
 
