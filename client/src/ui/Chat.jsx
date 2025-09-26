@@ -219,11 +219,14 @@ const guessFileDescriptor = (file) => {
 function AudioAttachment({ token, openFile }) {
   const { fileName, inlineUrl } = useAttachmentMeta(token)
   const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const audioVolume = useStore((s) => s.audioVolume)
+  const setAudioVolume = useStore((s) => s.setAudioVolume)
   const audioRef = useRef(null)
   const [duration, setDuration] = useState(0)
   const [currentTime, setCurrentTime] = useState(0)
   const [loading, setLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
+  const [volume, setVolume] = useState(typeof audioVolume === 'number' ? audioVolume : 1)
 
   useEffect(() => {
     const element = audioRef.current
@@ -288,6 +291,19 @@ function AudioAttachment({ token, openFile }) {
     }
   }, [inlineUrl, audioOutputDeviceId])
 
+  useEffect(() => {
+    if (typeof audioVolume === 'number' && !Number.isNaN(audioVolume)) {
+      setVolume((prev) => (prev === audioVolume ? prev : audioVolume))
+    }
+  }, [audioVolume])
+
+  useEffect(() => {
+    const element = audioRef.current
+    if (!element) return
+    const next = Number.isFinite(volume) ? Math.min(Math.max(volume, 0), 1) : 1
+    element.volume = next
+  }, [volume])
+
   useEffect(
     () => () => {
       const element = audioRef.current
@@ -315,6 +331,18 @@ function AudioAttachment({ token, openFile }) {
     if (Number.isFinite(value)) {
       element.currentTime = Math.max(0, Math.min(value, element.duration || value))
     }
+  }
+
+  const handleVolumeChange = (event) => {
+    const value = Number(event.target.value)
+    if (!Number.isFinite(value)) return
+    const clamped = Math.min(Math.max(value, 0), 1)
+    setVolume(clamped)
+    if (typeof setAudioVolume === 'function') {
+      setAudioVolume(clamped)
+    }
+    const element = audioRef.current
+    if (element) element.volume = clamped
   }
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0
@@ -362,6 +390,20 @@ function AudioAttachment({ token, openFile }) {
           </div>
           {loading && inlineUrl && <div className="text-[11px] text-white/40">Буферизация...</div>}
           {!inlineUrl && <div className="text-[11px] text-white/40">Загрузка аудио...</div>}
+          <div className="flex items-center gap-2 text-xs text-white/60">
+            <span className="whitespace-nowrap">Громкость:</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={Number.isFinite(volume) ? volume : 1}
+              onChange={handleVolumeChange}
+              className="flex-1"
+              aria-label="Громкость аудио"
+            />
+            <span className="tabular-nums text-white/50">{Math.round((Number.isFinite(volume) ? volume : 1) * 100)}%</span>
+          </div>
         </div>
       </div>
       <audio ref={audioRef} preload="metadata" className="hidden" />

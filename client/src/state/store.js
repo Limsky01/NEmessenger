@@ -100,6 +100,20 @@ const loadStoredDevice = (key) => {
   }
 }
 
+const loadStoredVolume = () => {
+  try {
+    const raw = localStorage.getItem('audioVolume')
+    if (!raw) return 1
+    const value = parseFloat(raw)
+    if (Number.isFinite(value)) {
+      return Math.min(Math.max(value, 0), 1)
+    }
+  } catch (err) {
+    console.warn('audio volume restore failed', err)
+  }
+  return 1
+}
+
 const teardownVoicePeer = (socketId, set) => {
   const pc = voicePeerConnections.get(socketId)
   if (pc) {
@@ -371,6 +385,7 @@ const useStore = create((set, get) => ({
   audioDevices: { inputs: [], outputs: [] },
   audioInputDeviceId: loadStoredDevice('audioInputDeviceId'),
   audioOutputDeviceId: loadStoredDevice('audioOutputDeviceId'),
+  audioVolume: loadStoredVolume(),
   voiceRooms: [],
   voiceParticipants: {},
   voiceRemoteStreams: {},
@@ -449,6 +464,15 @@ const useStore = create((set, get) => ({
       }
       set({ audioOutputDeviceId: deviceId || null })
     }
+  },
+  setAudioVolume: (value) => {
+    const next = Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 1
+    try {
+      localStorage.setItem('audioVolume', String(next))
+    } catch (err) {
+      console.warn('audio volume save failed', err)
+    }
+    set({ audioVolume: next })
   },
   joinVoiceRoom: async (roomId) => {
     const socket = get().socket
