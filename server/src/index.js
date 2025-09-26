@@ -356,7 +356,7 @@ const listVoiceRoomsForUserStmt = db.prepare(
 const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
 const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
 
-const selectVoiceRoomStmt = db.prepare('SELECT id, name, created_by FROM voice_rooms WHERE id=?')
+const selectVoiceRoomStmt = db.prepare('SELECT id, name, created_at, created_by FROM voice_rooms WHERE id=?')
 const insertVoiceRoomMemberStmt = db.prepare(
   'INSERT OR REPLACE INTO voice_room_members (room_id, user_id, role, added_at, added_by) VALUES (?,?,?,?,?)'
 )
