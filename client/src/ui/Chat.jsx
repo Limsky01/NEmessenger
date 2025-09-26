@@ -532,6 +532,7 @@ export default function Chat() {
   const fetchChannelMembers = useStore((s) => s.fetchChannelMembers)
   const addChannelMember = useStore((s) => s.addChannelMember)
   const removeChannelMember = useStore((s) => s.removeChannelMember)
+  const deleteChannel = useStore((s) => s.deleteChannel)
   const typingMap = useStore((s) => s.typing)
   const socket = useStore((s) => s.socket)
 
@@ -544,6 +545,7 @@ export default function Chat() {
   const [membersDialogOpen, setMembersDialogOpen] = useState(false)
   const [membersLoading, setMembersLoading] = useState(false)
   const [membersError, setMembersError] = useState(null)
+  const [channelDeleteState, setChannelDeleteState] = useState({ loading: false, error: null })
   const [selectedNewMembers, setSelectedNewMembers] = useState([])
   const [selfTyping, setSelfTyping] = useState(false)
   const listRef = useRef(null)
@@ -614,11 +616,15 @@ export default function Chat() {
     return users.filter((user) => !existing.has(user.id))
   }, [channelMembers, users, currentChannel?.id, me?.id])
 
+  const deletingChannel = channelDeleteState.loading
+  const membersBusy = membersLoading || deletingChannel
+
   useEffect(() => {
     setMembersDialogOpen(false)
     setMembersError(null)
     setSelectedNewMembers([])
     setMembersLoading(false)
+    setChannelDeleteState({ loading: false, error: null })
   }, [activeChannelId])
 
   useEffect(() => {
@@ -1005,11 +1011,12 @@ export default function Chat() {
   }
 
   const handleSelectedMemberToggle = (userId) => {
+    if (membersBusy) return
     setSelectedNewMembers((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
   }
 
   const handleAddMembers = async () => {
-    if (!currentChannel?.id || !selectedNewMembers.length) return
+    if (!currentChannel?.id || !selectedNewMembers.length || deletingChannel) return
     setMembersLoading(true)
     setMembersError(null)
     try {
@@ -1027,7 +1034,7 @@ export default function Chat() {
   }
 
   const handleRemoveMember = async (userId) => {
-    if (!currentChannel?.id) return
+    if (!currentChannel?.id || deletingChannel) return
     setMembersLoading(true)
     setMembersError(null)
     try {
@@ -1040,6 +1047,24 @@ export default function Chat() {
       setMembersError('Не удалось удалить участника')
     } finally {
       setMembersLoading(false)
+    }
+  }
+
+  const handleDeleteChannel = async () => {
+    if (!currentChannel?.id) return
+    const confirmation = window.confirm(`Удалить канал #${currentChannel.name}? Это действие нельзя отменить.`)
+    if (!confirmation) return
+    setChannelDeleteState({ loading: true, error: null })
+    try {
+      await deleteChannel(currentChannel.id)
+      setChannelDeleteState({ loading: false, error: null })
+      setMembersDialogOpen(false)
+      setMembersError(null)
+      setSelectedNewMembers([])
+      setMembersLoading(false)
+    } catch (err) {
+      console.error('delete channel failed', err)
+      setChannelDeleteState({ loading: false, error: 'Не удалось удалить канал' })
     }
   }
 
@@ -1094,15 +1119,17 @@ export default function Chat() {
     if (!currentChannel?.id) return
     setMembersDialogOpen(true)
     setMembersError(null)
+    setChannelDeleteState({ loading: false, error: null })
     setSelectedNewMembers([])
   }
 
   const closeMembersDialog = () => {
-    if (membersLoading) return
+    if (membersBusy) return
     setMembersDialogOpen(false)
     setMembersError(null)
     setSelectedNewMembers([])
     setMembersLoading(false)
+    setChannelDeleteState({ loading: false, error: null })
   }
 
   const headerTitle = isDirectChannel
@@ -1353,12 +1380,15 @@ export default function Chat() {
                 type="button"
                 onClick={closeMembersDialog}
                 className="text-white/40 hover:text-white/80 transition"
-                disabled={membersLoading}
+                disabled={membersBusy}
               >
                 ✕
               </button>
             </div>
             {membersError && <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{membersError}</div>}
+            {channelDeleteState.error && (
+              <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{channelDeleteState.error}</div>
+            )}
             <div className="px-6 py-4 space-y-6 max-h-[70vh] overflow-y-auto scroll-thin">
               <div>
                 <div className="text-xs uppercase tracking-[0.2em] text-white/40 mb-2">Текущие участники</div>
@@ -1389,7 +1419,7 @@ export default function Chat() {
                             type="button"
                             onClick={() => handleRemoveMember(entry.user.id)}
                             className="text-xs text-red-300 hover:text-red-200 transition"
-                            disabled={membersLoading}
+                            disabled={membersBusy}
                           >
                             Удалить
                           </button>
@@ -1420,7 +1450,7 @@ export default function Chat() {
                             type="checkbox"
                             checked={checked}
                             onChange={() => handleSelectedMemberToggle(user.id)}
-                            disabled={membersLoading}
+                            disabled={membersBusy}
                           />
                         </label>
                       )
@@ -1432,19 +1462,33 @@ export default function Chat() {
               </div>
             </div>
             <div className="px-6 py-4 border-t border-white/10 flex items-center justify-between gap-3">
-              <div className="text-xs text-white/40">
-                {membersLoading
-                  ? 'Обновление списка...'
-                  : selectedNewMembers.length
-                  ? `${selectedNewMembers.length} выбран(о)`
-                  : ''}
+              <div className="flex items-center gap-3">
+                {canModerateChannel && (
+                  <button
+                    type="button"
+                    onClick={handleDeleteChannel}
+                    className="px-4 py-2 rounded-2xl bg-red-500/80 text-white hover:bg-red-500 transition text-sm disabled:opacity-50"
+                    disabled={membersBusy}
+                  >
+                    {deletingChannel ? 'Удаление...' : 'Удалить канал'}
+                  </button>
+                )}
+                <div className="text-xs text-white/40">
+                  {deletingChannel
+                    ? 'Удаление канала...'
+                    : membersLoading
+                    ? 'Обновление списка...'
+                    : selectedNewMembers.length
+                    ? `${selectedNewMembers.length} выбран(о)`
+                    : ''}
+                </div>
               </div>
               <div className="flex items-center gap-3">
                 <button
                   type="button"
                   onClick={closeMembersDialog}
                   className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
-                  disabled={membersLoading}
+                  disabled={membersBusy}
                 >
                   Закрыть
                 </button>
@@ -1452,7 +1496,7 @@ export default function Chat() {
                   type="button"
                   onClick={handleAddMembers}
                   className="px-4 py-2 rounded-2xl bg-white/80 text-black hover:bg-white transition text-sm disabled:bg-white/40 disabled:text-white/60"
-                  disabled={membersLoading || selectedNewMembers.length === 0}
+                  disabled={membersBusy || selectedNewMembers.length === 0}
                 >
                   {membersLoading ? 'Сохранение...' : 'Добавить'}
                 </button>
