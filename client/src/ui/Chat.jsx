@@ -1726,6 +1726,7 @@ export default function Chat() {
                     const descriptor = guessFileDescriptor(item.file)
                     const glyph = guessFileGlyph(item.file)
                     const sizeLabel = formatFileSize(item.file.size)
+                    const isImage = isFileLikelyImage(item.file)
                     return (
                       <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
                         <button
@@ -1758,20 +1759,20 @@ export default function Chat() {
                             <span>{sizeLabel}</span>
                           </div>
                         </div>
+                        {isImage && (
+                          <label className="flex items-center gap-2 text-xs text-white/70">
+                            <input
+                              type="checkbox"
+                              checked={item.mode === 'file'}
+                              onChange={(e) => updateUploadItemMode(item.id, e.target.checked ? 'file' : 'photo')}
+                              disabled={uploadDialog.loading}
+                            />
+                            Отправить как файл
+                          </label>
+                        )}
                       </div>
-                    </div>
-                    {isImage && (
-                      <label className="flex items-center gap-2 text-xs text-white/70">
-                        <input
-                          type="checkbox"
-                          checked={item.mode === 'file'}
-                          onChange={(e) => updateUploadItemMode(item.id, e.target.checked ? 'file' : 'photo')}
-                          disabled={uploadDialog.loading}
-                        />
-                        Отправить как файл
-                      </label>
-                    )}
-                  </div>
+                    )
+                  })}
                 </div>
               )}
               {uploadDialogItems.length === 0 && (
