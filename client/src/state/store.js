@@ -981,6 +981,68 @@ const useStore = create((set, get) => ({
     return channel
   },
 
+  deleteChannel: async (channelId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!channelId) throw new Error('invalid_channel')
+    await axios.delete(`${get().serverUrl}/api/channels/${channelId}`, {
+      headers: buildAuthHeaders(token),
+    })
+    set((state) => {
+      const patch = {}
+      let changed = false
+      const nextChannels = state.channels.filter((channel) => channel.id !== channelId)
+      const channelExists = nextChannels.length !== state.channels.length
+      if (channelExists) {
+        patch.channels = nextChannels
+        changed = true
+      }
+      const removeEntry = (collection) => {
+        if (!collection || typeof collection !== 'object') return null
+        if (!Object.prototype.hasOwnProperty.call(collection, channelId)) return null
+        const next = { ...collection }
+        delete next[channelId]
+        return next
+      }
+      const nextMessages = removeEntry(state.messages)
+      if (nextMessages) {
+        patch.messages = nextMessages
+        changed = true
+      }
+      const nextUnread = removeEntry(state.unread)
+      if (nextUnread) {
+        patch.unread = nextUnread
+        changed = true
+      }
+      const nextHistoryLoading = removeEntry(state.historyLoading)
+      if (nextHistoryLoading) {
+        patch.historyLoading = nextHistoryLoading
+        changed = true
+      }
+      const nextHistoryComplete = removeEntry(state.historyComplete)
+      if (nextHistoryComplete) {
+        patch.historyComplete = nextHistoryComplete
+        changed = true
+      }
+      const nextTyping = removeEntry(state.typing)
+      if (nextTyping) {
+        patch.typing = nextTyping
+        changed = true
+      }
+      const nextChannelMembers = removeEntry(state.channelMembers)
+      if (nextChannelMembers) {
+        patch.channelMembers = nextChannelMembers
+        changed = true
+      }
+      if (state.activeChannelId === channelId) {
+        patch.activeChannelId = nextChannels[0]?.id || null
+        changed = true
+      }
+      return changed ? patch : state
+    })
+    return true
+  },
+
   fetchChannelMembers: async (channelId) => {
     const token = get().token
     if (!token) throw new Error('not_authenticated')

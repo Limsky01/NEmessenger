@@ -397,6 +397,9 @@ const listChannelMembersDetailedStmt = db.prepare(
 )
 const insertChannelMemberStmt = db.prepare('INSERT OR REPLACE INTO channel_members (channel_id, user_id, role) VALUES (?,?,?)')
 const deleteChannelMemberStmt = db.prepare('DELETE FROM channel_members WHERE channel_id=? AND user_id=?')
+const deleteChannelMembersStmt = db.prepare('DELETE FROM channel_members WHERE channel_id=?')
+const deleteMessagesByChannelStmt = db.prepare('DELETE FROM messages WHERE channel_id=?')
+const deleteChannelStmt = db.prepare('DELETE FROM channels WHERE id=?')
 const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
 const countChannelMembersStmt = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id=?')
 const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
@@ -918,6 +921,31 @@ app.delete('/api/channels/:id/members/:userId', auth, (req, res) => {
   const members = getChannelMembersDetailed(req.params.id)
   log('[CHANNELS] member:remove', req.params.id, 'actor=' + req.user.id, 'target=' + targetId)
   res.json({ members })
+})
+
+app.delete('/api/channels/:id', auth, (req, res) => {
+  const user = selectUserById.get(req.user.id)
+  if (!user) return res.status(404).json({ error: 'not_found' })
+  const channel = selectChannelByIdStmt.get(req.params.id)
+  if (!channel) return res.status(404).json({ error: 'not_found' })
+  if (!channel.is_private) return res.status(400).json({ error: 'not_private' })
+  const isOwner = channel.created_by && channel.created_by === user.id
+  const isAdmin = user.role === 'admin'
+  if (!isOwner && !isAdmin) return res.status(403).json({ error: 'forbidden' })
+  const audience = getChannelAudienceUserIds(channel)
+  const memberRows = listChannelMembersStmt.all(channel.id)
+  const notifyIds = new Set(audience)
+  if (channel.created_by) notifyIds.add(channel.created_by)
+  memberRows.forEach((row) => {
+    if (row?.user_id) notifyIds.add(row.user_id)
+  })
+  notifyIds.forEach((userId) => removeUserFromChannelRoom(channel.id, userId))
+  deleteMessagesByChannelStmt.run(channel.id)
+  deleteChannelMembersStmt.run(channel.id)
+  deleteChannelStmt.run(channel.id)
+  emitChannelListForUsers(audience)
+  log('[CHANNELS] delete', req.params.id, 'actor=' + req.user.id)
+  res.json({ ok: true })
 })
 
 app.get('/api/users', auth, (req, res) => {
