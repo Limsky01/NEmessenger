@@ -919,6 +919,7 @@ export default function Chat() {
     if (!itemsToUpload.length) return
 
     const attachments = []
+    let result = null
     try {
       for (let index = 0; index < itemsToUpload.length; index += 1) {
         const entry = itemsToUpload[index]
@@ -942,7 +943,7 @@ export default function Chat() {
         const currentValue = textareaRef.current ? textareaRef.current.value : text
         const nextValue = currentValue ? `${currentValue}\n${addition}` : addition
         handleTextChange(nextValue)
-
+        result = nextValue
       }
     } catch (err) {
       console.error(err)
@@ -950,7 +951,7 @@ export default function Chat() {
     } finally {
       setUploadState(null)
     }
-    return null
+    return result
   }
 
   const openFile = async (id, name) => {
