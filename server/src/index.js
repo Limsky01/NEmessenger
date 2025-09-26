@@ -369,7 +369,6 @@ const listVoiceRoomMembersStmt = db.prepare(
    ORDER BY u.username COLLATE NOCASE ASC`
 )
 const selectVoiceRoomMemberStmt = db.prepare('SELECT role FROM voice_room_members WHERE room_id=? AND user_id=?')
-const selectVoiceRoomStmt = db.prepare('SELECT id, name FROM voice_rooms WHERE id=?')
 const insertInviteStmt = db.prepare(
   'INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at, revoked_at) VALUES (?,?,?,?,?, ?, NULL, NULL, NULL, NULL)'
 )
@@ -377,35 +376,15 @@ const selectInviteByCodeStmt = db.prepare('SELECT * FROM invites WHERE code=?')
 const selectInviteByIdStmt = db.prepare('SELECT * FROM invites WHERE id=?')
 const listInvitesByCreatorStmt = db.prepare('SELECT * FROM invites WHERE created_by=? ORDER BY created_at DESC')
 const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, claimed_at=? WHERE id=?')
-const clearInviteClaimStmt = db.prepare('UPDATE invites SET claim_token="", claimed_at=NULL WHERE id=?')
+const clearInviteClaimStmt = db.prepare("UPDATE invites SET claim_token='', claimed_at=NULL WHERE id=?")
 const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='', revoked_at=NULL WHERE id=?")
-const revokeInviteStmt = db.prepare('UPDATE invites SET revoked_at=?, claim_token="" WHERE id=?')
+const revokeInviteStmt = db.prepare("UPDATE invites SET revoked_at=?, claim_token='' WHERE id=?")
 const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
 const selectMessageFullById = db.prepare('SELECT * FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
 const updateMessageContentStmt = hasMessageUpdatedAtColumn
   ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
   : db.prepare('UPDATE messages SET content=? WHERE id=?')
-const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
-const insertChannelStmt = db.prepare(
-  'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
-)
-const listAllChannelsStmt = db.prepare('SELECT * FROM channels WHERE workspace_id=? ORDER BY created_at ASC')
-const listUserChannelMembershipsStmt = db.prepare('SELECT channel_id, role FROM channel_members WHERE user_id=?')
-const listChannelMembersStmt = db.prepare('SELECT user_id, role FROM channel_members WHERE channel_id=? ORDER BY user_id ASC')
-const listChannelMembersDetailedStmt = db.prepare(
-  "SELECT m.user_id, m.role, u.username FROM channel_members m JOIN users u ON u.id = m.user_id WHERE m.channel_id=? ORDER BY u.username ASC",
-)
-const insertChannelMemberStmt = db.prepare('INSERT OR REPLACE INTO channel_members (channel_id, user_id, role) VALUES (?,?,?)')
-const deleteChannelMemberStmt = db.prepare('DELETE FROM channel_members WHERE channel_id=? AND user_id=?')
-const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
-const countChannelMembersStmt = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id=?')
-const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
-
-const updateMessageContentStmt = hasMessageUpdatedAtColumn
-  ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
-  : db.prepare('UPDATE messages SET content=? WHERE id=?')
-
 const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
 const insertChannelStmt = db.prepare(
   'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
@@ -1408,8 +1387,6 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   }
   const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
 
-  updateMessageContentStmt.run(encryptText(rawContent), updatedAt, message.id)
-
   const payload = {
     id: message.id,
     channelId: message.channel_id,
@@ -1440,14 +1417,6 @@ const listMessages = db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER
 const insertMessage = hasMessageUpdatedAtColumn
   ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
   : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
-
-
-const insertMessage = hasMessageUpdatedAtColumn
-  ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
-  : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
-
-
-
 
 const voiceParticipants = new Map()
 const typingState = new Map()
