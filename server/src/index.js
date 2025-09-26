@@ -926,12 +926,16 @@ app.delete('/api/channels/:id/members/:userId', auth, (req, res) => {
 app.delete('/api/channels/:id', auth, (req, res) => {
   const user = selectUserById.get(req.user.id)
   if (!user) return res.status(404).json({ error: 'not_found' })
-  const channel = selectChannelByIdStmt.get(req.params.id)
+  const access = resolveChannelAccess(user, req.params.id)
+  const channel = access.channel || selectChannelByIdStmt.get(req.params.id)
   if (!channel) return res.status(404).json({ error: 'not_found' })
   if (!channel.is_private) return res.status(400).json({ error: 'not_private' })
-  const isOwner = channel.created_by && channel.created_by === user.id
-  const isAdmin = user.role === 'admin'
-  if (!isOwner && !isAdmin) return res.status(403).json({ error: 'forbidden' })
+  const role = access.role || null
+  const isAdmin = user.role === 'admin' || role === 'admin'
+  const isOwner = role === 'owner'
+  if (!isAdmin && !isOwner) {
+    return res.status(403).json({ error: 'forbidden' })
+  }
   const audience = getChannelAudienceUserIds(channel)
   const memberRows = listChannelMembersStmt.all(channel.id)
   const notifyIds = new Set(audience)
@@ -939,11 +943,12 @@ app.delete('/api/channels/:id', auth, (req, res) => {
   memberRows.forEach((row) => {
     if (row?.user_id) notifyIds.add(row.user_id)
   })
-  notifyIds.forEach((userId) => removeUserFromChannelRoom(channel.id, userId))
+  const notifyList = Array.from(notifyIds)
+  notifyList.forEach((userId) => removeUserFromChannelRoom(channel.id, userId))
   deleteMessagesByChannelStmt.run(channel.id)
   deleteChannelMembersStmt.run(channel.id)
   deleteChannelStmt.run(channel.id)
-  emitChannelListForUsers(audience)
+  emitChannelListForUsers(notifyList)
   log('[CHANNELS] delete', req.params.id, 'actor=' + req.user.id)
   res.json({ ok: true })
 })
