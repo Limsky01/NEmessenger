@@ -88,16 +88,28 @@ const parseAttachmentToken = (token) => {
   const parts = token.split(':')
   const id = parts.shift()
   if (!id) return null
-  const name = parts.join(':') || `file-${id}`
-  return { id, name }
+  let name = parts.join(':') || `file-${id}`
+  let mode
+  if (name.endsWith('|document')) {
+    name = name.slice(0, -'|document'.length)
+    mode = 'file'
+  }
+  if (!name) name = `file-${id}`
+  return { id, name, mode }
 }
 
 const isTokenLikelyImage = (token) => {
+  if (!token || token.mode === 'file') return false
   const name = token?.name || ''
   const mime = token?.mime || ''
   const byMime = typeof mime === 'string' && mime.startsWith('image/')
   const byExt = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name)
   return byMime || byExt
+}
+
+const isFileLikelyImage = (file) => {
+  if (!file) return false
+  return isTokenLikelyImage({ name: file.name, mime: file.type })
 }
 
 const defaultUploadOptions = { group: false, compress: false, remember: false, comment: '' }
@@ -162,10 +174,10 @@ const useAttachmentMeta = (token) => {
     ensureFileMeta(token.id).catch((err) => console.error('file meta load failed', err))
   }, [token?.id, meta, ensureFileMeta])
 
-  const resolved = meta || token
+  const resolved = meta ? { ...token, ...meta } : token
   const fileName = resolved?.name || token?.name || 'файл'
   const mime = (resolved?.mime || '').toLowerCase()
-  const isImage = isTokenLikelyImage({ name: fileName, mime })
+  const isImage = isTokenLikelyImage({ ...resolved, name: fileName, mime })
   const isAudio = mime.startsWith('audio/') || /\.(mp3|wav|ogg)$/i.test(fileName)
   const inlineUrl = token?.id ? buildFileUrl?.(token.id, { inline: true }) : null
   return { fileName, mime, isImage, isAudio, inlineUrl }
@@ -219,11 +231,14 @@ const guessFileDescriptor = (file) => {
 function AudioAttachment({ token, openFile }) {
   const { fileName, inlineUrl } = useAttachmentMeta(token)
   const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const audioVolume = useStore((s) => s.audioVolume)
+  const setAudioVolume = useStore((s) => s.setAudioVolume)
   const audioRef = useRef(null)
   const [duration, setDuration] = useState(0)
   const [currentTime, setCurrentTime] = useState(0)
   const [loading, setLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
+  const [volume, setVolume] = useState(typeof audioVolume === 'number' ? audioVolume : 1)
 
   useEffect(() => {
     const element = audioRef.current
@@ -288,6 +303,19 @@ function AudioAttachment({ token, openFile }) {
     }
   }, [inlineUrl, audioOutputDeviceId])
 
+  useEffect(() => {
+    if (typeof audioVolume === 'number' && !Number.isNaN(audioVolume)) {
+      setVolume((prev) => (prev === audioVolume ? prev : audioVolume))
+    }
+  }, [audioVolume])
+
+  useEffect(() => {
+    const element = audioRef.current
+    if (!element) return
+    const next = Number.isFinite(volume) ? Math.min(Math.max(volume, 0), 1) : 1
+    element.volume = next
+  }, [volume])
+
   useEffect(
     () => () => {
       const element = audioRef.current
@@ -315,6 +343,18 @@ function AudioAttachment({ token, openFile }) {
     if (Number.isFinite(value)) {
       element.currentTime = Math.max(0, Math.min(value, element.duration || value))
     }
+  }
+
+  const handleVolumeChange = (event) => {
+    const value = Number(event.target.value)
+    if (!Number.isFinite(value)) return
+    const clamped = Math.min(Math.max(value, 0), 1)
+    setVolume(clamped)
+    if (typeof setAudioVolume === 'function') {
+      setAudioVolume(clamped)
+    }
+    const element = audioRef.current
+    if (element) element.volume = clamped
   }
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0
@@ -362,6 +402,20 @@ function AudioAttachment({ token, openFile }) {
           </div>
           {loading && inlineUrl && <div className="text-[11px] text-white/40">Буферизация...</div>}
           {!inlineUrl && <div className="text-[11px] text-white/40">Загрузка аудио...</div>}
+          <div className="flex items-center gap-2 text-xs text-white/60">
+            <span className="whitespace-nowrap">Громкость:</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={Number.isFinite(volume) ? volume : 1}
+              onChange={handleVolumeChange}
+              className="flex-1"
+              aria-label="Громкость аудио"
+            />
+            <span className="tabular-nums text-white/50">{Math.round((Number.isFinite(volume) ? volume : 1) * 100)}%</span>
+          </div>
         </div>
       </div>
       <audio ref={audioRef} preload="metadata" className="hidden" />
@@ -541,6 +595,7 @@ export default function Chat() {
   const [deleteDialog, setDeleteDialog] = useState(null)
   const [editDialog, setEditDialog] = useState(null)
   const [imagePreview, setImagePreview] = useState(null)
+  const [replyTarget, setReplyTarget] = useState(null)
   const [uploadDialog, setUploadDialog] = useState(null)
   const [membersDialogOpen, setMembersDialogOpen] = useState(false)
   const [membersLoading, setMembersLoading] = useState(false)
@@ -694,6 +749,35 @@ export default function Chat() {
   }
 
   const nameById = (id) => userMap.get(id)?.username || 'user'
+  const summarizeMessage = useCallback((message) => {
+    if (!message) return 'Без текста'
+    const { textSegments, attachments } = extractTextAndAttachments(message.content)
+    const text = textSegments.join(' ').trim()
+    if (text) return text.length > 140 ? `${text.slice(0, 137)}...` : text
+    if (attachments.length === 1) return 'Вложение'
+    if (attachments.length > 1) return `Вложения (${attachments.length})`
+    return 'Без текста'
+  }, [])
+
+  const handleSelectReply = useCallback(
+    (message) => {
+      if (!message) return
+      setReplyTarget({
+        id: message.id,
+        authorId: message.senderId,
+        author: nameById(message.senderId),
+        preview: summarizeMessage(message),
+      })
+      textareaRef.current?.focus()
+    },
+    [nameById, summarizeMessage],
+  )
+
+  const clearReplyTarget = useCallback(() => {
+    setReplyTarget(null)
+    textareaRef.current?.focus()
+  }, [])
+
   const avatarSrcById = (id) => {
     const user = userMap.get(id)
     return user ? buildAvatarUrl?.(user) : null
@@ -707,6 +791,17 @@ export default function Chat() {
   useEffect(() => {
     uploadDialogRef.current = uploadDialog
   }, [uploadDialog])
+
+  useEffect(() => {
+    setReplyTarget(null)
+  }, [activeChannelId])
+
+  useEffect(() => {
+    if (!replyTarget) return
+    if (!messages.some((message) => message.id === replyTarget.id)) {
+      setReplyTarget(null)
+    }
+  }, [messages, replyTarget])
 
   useEffect(
     () => () => {
@@ -803,6 +898,14 @@ export default function Chat() {
     })
   }
 
+  const updateUploadItemMode = (id, mode) => {
+    setUploadDialog((state) => {
+      if (!state) return state
+      const nextItems = state.items.map((item) => (item.id === id ? { ...item, mode } : item))
+      return { ...state, items: nextItems }
+    })
+  }
+
   const removePendingFile = (id) => {
     setUploadDialog((state) => {
       if (!state) return state
@@ -812,21 +915,26 @@ export default function Chat() {
       return { ...state, items: nextItems }
     })
   }
+  const uploadAttachments = async (itemsToUpload, comment = '') => {
+    if (!itemsToUpload.length) return
 
-  const uploadAttachments = async (filesToUpload, comment = '') => {
-    if (!filesToUpload.length) return
     const attachments = []
     try {
-      for (let index = 0; index < filesToUpload.length; index += 1) {
-        const file = filesToUpload[index]
-        setUploadState({ current: index + 1, total: filesToUpload.length, progress: 0 })
+      for (let index = 0; index < itemsToUpload.length; index += 1) {
+        const entry = itemsToUpload[index]
+        const file = entry.file
+        const entryMode = entry.mode || (file.type?.startsWith('image/') ? 'photo' : 'file')
+        setUploadState({ current: index + 1, total: itemsToUpload.length, progress: 0 })
         const uploaded = await uploadFile(file, (progress) => {
           setUploadState((state) => (state ? { ...state, progress } : state))
         })
-        if (uploaded) attachments.push(uploaded)
+        if (uploaded) attachments.push({ file: uploaded, mode: entryMode })
       }
       if (attachments.length) {
-        const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
+        const tokens = attachments.map(({ file, mode }) => {
+          const suffix = mode === 'file' ? '|document' : ''
+          return `[file:${file.id}:${file.name}${suffix}]`
+        })
         const blocks = []
         if (comment) blocks.push(comment)
         blocks.push(tokens.join('\n'))
@@ -834,6 +942,7 @@ export default function Chat() {
         const currentValue = textareaRef.current ? textareaRef.current.value : text
         const nextValue = currentValue ? `${currentValue}\n${addition}` : addition
         handleTextChange(nextValue)
+
       }
     } catch (err) {
       console.error(err)
@@ -841,6 +950,7 @@ export default function Chat() {
     } finally {
       setUploadState(null)
     }
+    return null
   }
 
   const openFile = async (id, name) => {
@@ -877,11 +987,12 @@ export default function Chat() {
     try {
       const processed = []
       for (const item of dialog.items) {
+        const baseMode = item.mode || (item.file.type?.startsWith('image/') ? 'photo' : 'file')
         let file = item.file
-        if (dialog.options.compress && file.type?.startsWith('image/')) {
+        if (baseMode === 'photo' && dialog.options.compress && file.type?.startsWith('image/')) {
           file = await compressImageFile(file)
         }
-        processed.push(file)
+        processed.push({ file, mode: baseMode })
       }
       if (dialog.options.remember) {
         localStorage.setItem(
@@ -895,8 +1006,7 @@ export default function Chat() {
         localStorage.removeItem('uploadOptions')
       }
       await uploadAttachments(processed, dialog.options.comment.trim())
-      cleanupUploadDialog(dialog)
-      setUploadDialog(null)
+      closeUploadDialog()
     } catch (err) {
       console.error(err)
       setUploadDialog((state) => (state ? { ...state, loading: false, error: 'Не удалось загрузить файлы' } : state))
@@ -947,10 +1057,12 @@ export default function Chat() {
     }
   }
 
-  const handleSend = () => {
-    if (!text.trim()) return
-    sendMessage(text)
+  const handleSend = (override) => {
+    const value = typeof override === 'string' ? override : text
+    if (!value.trim()) return
+    sendMessage(value)
     setText('')
+    clearReplyTarget()
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current)
       typingTimeoutRef.current = null
@@ -959,6 +1071,13 @@ export default function Chat() {
       emitTypingState(false)
       selfTypingRef.current = false
       setSelfTyping(false)
+    }
+  }
+
+  const sendUploadedAttachments = async (filesToUpload, comment = '') => {
+    const payload = await uploadAttachments(filesToUpload, comment)
+    if (typeof payload === 'string') {
+      handleSend(payload)
     }
   }
 
@@ -973,9 +1092,23 @@ export default function Chat() {
     fileInputRef.current?.click()
   }
 
-  const handleFileChange = (ev) => {
+  const handleFileChange = async (ev) => {
     const files = Array.from(ev.target.files || [])
     if (!files.length) return
+    const hasImages = files.some((file) => isFileLikelyImage(file))
+    const dialogOpen = Boolean(uploadDialogRef.current)
+    if (!hasImages && !dialogOpen) {
+      try {
+        if (text.trim()) {
+          await uploadAttachments(files)
+        } else {
+          await sendUploadedAttachments(files)
+        }
+      } finally {
+        if (ev.target) ev.target.value = ''
+      }
+      return
+    }
     const items = files.map((file, index) => ({
       id:
         typeof crypto !== 'undefined' && crypto.randomUUID
@@ -983,6 +1116,8 @@ export default function Chat() {
           : `${Date.now()}-${index}`,
       file,
       preview: file.type?.startsWith('image/') ? URL.createObjectURL(file) : null,
+      mode: file.type?.startsWith('image/') ? 'photo' : 'file',
+
     }))
     setUploadDialog((state) => {
       if (state) {
@@ -1138,6 +1273,18 @@ export default function Chat() {
   const headerSubtitle = isDirectChannel
     ? 'Приватный диалог'
     : currentChannel ? 'Общий канал' : ''
+  const replyTargetAuthorName = replyTarget?.author || (replyTarget?.authorId ? nameById(replyTarget.authorId) : null)
+  const replyTargetAuthorLabel = replyTargetAuthorName
+    ? replyTargetAuthorName.startsWith('@')
+      ? replyTargetAuthorName
+      : `@${replyTargetAuthorName}`
+    : '@user'
+  const replyTargetPreviewText = replyTarget?.preview || 'Без текста'
+
+  const uploadDialogItems = uploadDialog?.items || []
+  const uploadDialogImageItems = uploadDialogItems.filter((item) => isFileLikelyImage(item.file))
+  const uploadDialogOtherItems = uploadDialogItems.filter((item) => !isFileLikelyImage(item.file))
+  const uploadDialogHasImages = uploadDialogImageItems.length > 0
 
   return (
     <div className="flex-1 flex flex-col h-full relative">
@@ -1176,6 +1323,16 @@ export default function Chat() {
           const canDelete = mine || me?.role === 'admin' || canModerateChannel
           const canEdit = mine || canModerateChannel
           const edited = m.updatedAt && m.updatedAt > (m.createdAt || 0)
+          const replyInfo = m.replyTo || null
+          const replyAuthorRaw = replyInfo?.author || (replyInfo?.authorId ? nameById(replyInfo.authorId) : null)
+          const replyAuthorLabel = replyAuthorRaw
+            ? replyAuthorRaw.startsWith('@')
+              ? replyAuthorRaw
+              : `@${replyAuthorRaw}`
+            : '@user'
+          const replyPreviewText = replyInfo
+            ? replyInfo.preview || (replyInfo.missing ? 'Сообщение недоступно' : 'Без текста')
+            : ''
           return (
             <div key={m.id} className={`max-w-[72%] px-4 py-3 rounded-3xl shadow-glass ${mine ? 'ml-auto panel' : 'glass'}`}>
               <div className="flex items-center justify-between text-[11px] text-white/70 mb-2">
@@ -1187,30 +1344,43 @@ export default function Chat() {
                     {edited ? ' · изменено' : ''}
                   </span>
                 </div>
-                {(canEdit || canDelete) && (
-                  <div className="flex items-center gap-2 text-white/40">
-                    {canEdit && (
-                      <button
-                        type="button"
-                        className="hover:text-white transition"
-                        onClick={() => handleRequestEdit(m)}
-                      >
-                        <EditIcon />
-                      </button>
-                    )}
-                    {canDelete && (
-                      <button
-                        type="button"
-                        className="hover:text-red-400 transition"
-                        onClick={() => handleRequestDelete(m)}
-                      >
-                        <TrashIcon />
-                      </button>
-                    )}
-                  </div>
-                )}
+                <div className="flex items-center gap-2 text-white/40">
+                  <button
+                    type="button"
+                    className="text-xs uppercase tracking-[0.12em] hover:text-white transition"
+                    onClick={() => handleSelectReply(m)}
+                  >
+                    Ответить
+                  </button>
+                  {canEdit && (
+                    <button
+                      type="button"
+                      className="hover:text-white transition"
+                      onClick={() => handleRequestEdit(m)}
+                    >
+                      <EditIcon />
+                    </button>
+                  )}
+                  {canDelete && (
+                    <button
+                      type="button"
+                      className="hover:text-red-400 transition"
+                      onClick={() => handleRequestDelete(m)}
+                    >
+                      <TrashIcon />
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="whitespace-pre-wrap leading-relaxed break-words space-y-3">
+                {replyInfo && (
+                  <div className="px-3 py-2 rounded-2xl bg-white/5 border border-white/10">
+                    <div className="text-xs text-white/50 mb-1">Ответ {replyAuthorLabel}</div>
+                    <div className="text-sm text-white/80 whitespace-pre-wrap break-words">
+                      {replyPreviewText}
+                    </div>
+                  </div>
+                )}
                 {textSegments.filter((segment) => segment && segment.trim()).map((segment, idx) => (
                   <div key={`text-${m.id}-${idx}`}>{segment}</div>
                 ))}
@@ -1236,6 +1406,24 @@ export default function Chat() {
       )}
 
       <div className="px-6 py-4 border-t border-white/10">
+        {replyTarget && (
+          <div className="mb-3 px-4 py-3 rounded-2xl bg-white/10 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-xs text-white/60 uppercase tracking-[0.15em] mb-1">Ответ {replyTargetAuthorLabel}</div>
+              <div className="text-sm text-white/80 whitespace-pre-wrap break-words max-h-24 overflow-hidden">
+                {replyTargetPreviewText}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={clearReplyTarget}
+              className="text-white/60 hover:text-white transition"
+              title="Отменить ответ"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <div className="panel rounded-3xl px-4 py-2 flex items-center gap-3">
           <IconButton onClick={handleFilePick} title="Прикрепить файлы">
             <PaperclipIcon />
@@ -1255,7 +1443,7 @@ export default function Chat() {
             <IconButton onClick={() => {}} title="Смайлы" disabled>
               <SmileIcon />
             </IconButton>
-            <IconButton onClick={handleSend} title="Отправить" disabled={!text.trim()} variant="primary">
+            <IconButton onClick={() => handleSend()} title="Отправить" disabled={!text.trim()} variant="primary">
               <SendIcon className="w-5 h-5" />
             </IconButton>
           </div>
@@ -1530,75 +1718,89 @@ export default function Chat() {
             {uploadDialog.error && (
               <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{uploadDialog.error}</div>
             )}
-            <div className="flex-1 overflow-y-auto px-6 py-4 grid gap-4 md:grid-cols-2">
-              {uploadDialog.items.map((item, index) => {
-                const isImage = item.file.type?.startsWith('image/')
-                const descriptor = guessFileDescriptor(item.file)
-                const glyph = guessFileGlyph(item.file)
-                const sizeLabel = formatFileSize(item.file.size)
-                return (
-                  <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
-                    <button
-                      type="button"
-                      className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
-                      onClick={() => removePendingFile(item.id)}
-                      disabled={uploadDialog.loading}
-                    >
-                      ✕
-                    </button>
-                    <div
-                      className={`h-40 rounded-2xl overflow-hidden flex items-center justify-center relative ${
-                        isImage ? 'bg-black/40' : 'bg-gradient-to-br from-white/10 via-white/5 to-white/0'
-                      }`}
-                    >
-                      {item.preview && isImage ? (
-                        <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
-                      ) : (
-                        <div className="flex flex-col items-center justify-center text-center px-4 text-white/70">
-                          <div className="text-3xl mb-2">{glyph}</div>
-                          <div className="text-xs uppercase tracking-[0.3em] text-white/50">{descriptor}</div>
+            <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+              {uploadDialogHasImages && (
+                <div className="grid gap-4 md:grid-cols-2">
+                  {uploadDialogImageItems.map((item, index) => {
+                    const descriptor = guessFileDescriptor(item.file)
+                    const glyph = guessFileGlyph(item.file)
+                    const sizeLabel = formatFileSize(item.file.size)
+                    return (
+                      <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
+                        <button
+                          type="button"
+                          className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
+                          onClick={() => removePendingFile(item.id)}
+                          disabled={uploadDialog.loading}
+                        >
+                          ✕
+                        </button>
+                        <div className="h-40 rounded-2xl overflow-hidden flex items-center justify-center relative bg-black/40">
+                          {item.preview ? (
+                            <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
+                          ) : (
+                            <div className="flex flex-col items-center justify-center text-center px-4 text-white/70">
+                              <div className="text-3xl mb-2">{glyph}</div>
+                              <div className="text-xs uppercase tracking-[0.3em] text-white/50">{descriptor}</div>
+                            </div>
+                          )}
+                          <div className="absolute left-3 top-3 text-[11px] uppercase tracking-[0.3em] text-white/50">
+                            {String(index + 1).padStart(2, '0')}
+                          </div>
                         </div>
-                      )}
-                      <div className="absolute left-3 top-3 text-[11px] uppercase tracking-[0.3em] text-white/50">
-                        {String(index + 1).padStart(2, '0')}
+                        <div className="space-y-1">
+                          <div className="text-sm text-white/90 truncate" title={item.file.name}>
+                            {item.file.name}
+                          </div>
+                          <div className="flex items-center justify-between text-xs text-white/50">
+                            <span>{descriptor}</span>
+                            <span>{sizeLabel}</span>
+                          </div>
+                        </div>
                       </div>
                     </div>
-                    <div className="space-y-1">
-                      <div className="text-sm text-white/90 truncate" title={item.file.name}>
-                        {item.file.name}
-                      </div>
-                      <div className="flex items-center justify-between text-xs text-white/50">
-                        <span>{descriptor}</span>
-                        <span>{sizeLabel}</span>
-                      </div>
-                    </div>
+                    {isImage && (
+                      <label className="flex items-center gap-2 text-xs text-white/70">
+                        <input
+                          type="checkbox"
+                          checked={item.mode === 'file'}
+                          onChange={(e) => updateUploadItemMode(item.id, e.target.checked ? 'file' : 'photo')}
+                          disabled={uploadDialog.loading}
+                        />
+                        Отправить как файл
+                      </label>
+                    )}
                   </div>
-                )
-              })}
-              {uploadDialog.items.length === 0 && (
-                <div className="col-span-full text-sm text-white/50">Файлы не выбраны</div>
+                </div>
+              )}
+              {uploadDialogItems.length === 0 && (
+                <div className="text-sm text-white/50">Файлы не выбраны</div>
               )}
             </div>
             <div className="px-6 py-4 border-t border-white/10 space-y-4">
               <div className="flex flex-wrap gap-4 text-sm text-white/70">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={uploadDialog.options.group}
-                    onChange={(e) => updateUploadOptions({ group: e.target.checked })}
-                    disabled={uploadDialog.loading}
-                  />
-                  Группировать
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={uploadDialog.options.compress}
-                    onChange={(e) => updateUploadOptions({ compress: e.target.checked })}
-                    disabled={uploadDialog.loading}
-                  />
-                  Сжать изображения
-                </label>
+                {uploadDialogHasImages && (
+                  <>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={uploadDialog.options.group}
+                        onChange={(e) => updateUploadOptions({ group: e.target.checked })}
+                        disabled={uploadDialog.loading}
+                      />
+                      Группировать
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={uploadDialog.options.compress}
+                        onChange={(e) => updateUploadOptions({ compress: e.target.checked })}
+                        disabled={uploadDialog.loading}
+                      />
+                      Сжать изображения
+                    </label>
+                  </>
+                )}
                 <label className="flex items-center gap-2">
                   <input
                     type="checkbox"

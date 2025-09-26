@@ -280,7 +280,7 @@ const ChatArea = () => {
   const handleSubmit = (event) => {
     event.preventDefault();
     if (!content.trim() || !activeConversationId) return;
-    sendMessage(activeConversationId, content.trim());
+    sendMessage(content.trim());
     setTyping(activeConversationId, false);
     setContent("");
   };
