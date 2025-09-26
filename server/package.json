@@ -1,6 +1,6 @@
 {
   "name": "NE-server",
-  "version": "0.9",
+  "version": "0.9.5",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
