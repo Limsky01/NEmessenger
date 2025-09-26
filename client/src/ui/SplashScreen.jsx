@@ -44,7 +44,15 @@ const orbTransition = {
   ease: [0.66, 0, 0.34, 1],
 }
 
-export default function SplashScreen({ showSplash, onExitComplete, heading = 'Загрузка', subheading = 'Подготовка данных…' }) {
+export default function SplashScreen({
+  showSplash,
+  onExitComplete,
+  heading = 'Загрузка',
+  subheading = 'Подготовка данных…',
+  statusText = '',
+  secondaryActionLabel,
+  onSecondaryAction,
+}) {
   return (
     <AnimatePresence onExitComplete={onExitComplete}>
       {showSplash && (
@@ -108,11 +116,31 @@ export default function SplashScreen({ showSplash, onExitComplete, heading = 'З
               {subheading}
             </motion.p>
 
+            {statusText ? (
+              <motion.p
+                className="mt-3 text-sm text-center text-white/80 leading-relaxed"
+                animate={{ opacity: [0.45, 0.75, 0.45] }}
+                transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
+              >
+                {statusText}
+              </motion.p>
+            ) : null}
+
             <motion.div
               className="splash-progress"
               animate={{ width: ['12%', '68%', '42%', '96%'] }}
               transition={{ duration: 5.4, repeat: Infinity, ease: 'easeInOut' }}
             />
+
+            {secondaryActionLabel && onSecondaryAction ? (
+              <button
+                type="button"
+                className="mt-4 inline-flex items-center justify-center rounded-full bg-white/10 px-5 py-2 text-sm font-medium text-white transition hover:bg-white/20 focus:outline-none focus:ring-2 focus:ring-white/60"
+                onClick={onSecondaryAction}
+              >
+                {secondaryActionLabel}
+              </button>
+            ) : null}
           </motion.div>
         </motion.div>
       )}

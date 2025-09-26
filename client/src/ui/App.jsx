@@ -60,12 +60,24 @@ export default function App() {
   const connect = useStore((s) => s.connect)
   const view = useStore((s) => s.view)
   const socketConnected = useStore((s) => s.socket?.connected ?? false)
+  const connectionStatus = useStore((s) => s.connectionStatus)
+  const retrySecondsRemaining = useStore((s) => s.retrySecondsRemaining)
+  const retryDelay = useStore((s) => s.retryDelay)
+  const connectionError = useStore((s) => s.connectionError)
+  const triggerReconnectNow = useStore((s) => s.triggerReconnectNow)
   const [showSplash, setShowSplash] = useState(true)
   const [minimumVisible, setMinimumVisible] = useState(false)
 
   useEffect(() => {
     if (token) connect()
   }, [token, connect])
+
+  useEffect(() => {
+    if (!token) return
+    if (!showSplash && ['connecting', 'retrying', 'awaiting_manual'].includes(connectionStatus)) {
+      setShowSplash(true)
+    }
+  }, [token, connectionStatus, showSplash])
 
   useEffect(() => {
     if (!showSplash) return undefined
@@ -80,17 +92,50 @@ export default function App() {
       setShowSplash(false)
       return
     }
-    if (socketConnected) {
+    if (['retrying', 'awaiting_manual', 'connecting'].includes(connectionStatus)) {
+      return
+    }
+    if (socketConnected && connectionStatus === 'connected') {
       const delay = setTimeout(() => setShowSplash(false), 250)
       return () => clearTimeout(delay)
     }
-  }, [minimumVisible, showSplash, token, socketConnected])
+  }, [minimumVisible, showSplash, token, socketConnected, connectionStatus])
 
   const splashSubheading = useMemo(() => {
     if (!token) return 'Подготовка формы входа…'
-    if (!socketConnected) return 'Подключаемся к серверу и загружаем рабочие пространства…'
+    if (connectionStatus === 'retrying') return 'Пытаемся восстановить соединение…'
+    if (connectionStatus === 'awaiting_manual') return 'Соединение потеряно'
+    if (connectionStatus === 'connecting' || !socketConnected)
+      return 'Подключаемся к серверу и загружаем рабочие пространства…'
     return 'Почти готово!'
-  }, [token, socketConnected])
+  }, [token, socketConnected, connectionStatus])
+
+  const countdownSeconds = useMemo(() => {
+    if (typeof retrySecondsRemaining === 'number') return Math.max(0, retrySecondsRemaining)
+    if (typeof retryDelay === 'number') return Math.max(0, Math.ceil(retryDelay / 1000))
+    return null
+  }, [retrySecondsRemaining, retryDelay])
+
+  const splashStatusText = useMemo(() => {
+    if (!token) return null
+    if (connectionStatus === 'retrying') {
+      if (countdownSeconds !== null) {
+        const seconds = Math.max(1, countdownSeconds)
+        return `Нет соединения. Переподключение через ${seconds} сек.`
+      }
+      return 'Нет соединения. Пытаемся переподключиться…'
+    }
+    if (connectionStatus === 'awaiting_manual') {
+      const base = 'Нет соединения. Попробуйте переподключиться вручную.'
+      if (!connectionError) return base
+      const normalizedError = String(connectionError).trim()
+      if (!normalizedError.length) return base
+      return `${base} (${normalizedError})`
+    }
+    return null
+  }, [token, connectionStatus, countdownSeconds, connectionError])
+
+  const manualActionLabel = connectionStatus === 'awaiting_manual' ? 'Подключиться сейчас' : undefined
 
   return (
     <div className="h-full w-full app-bg font-mc">
@@ -98,6 +143,9 @@ export default function App() {
         showSplash={showSplash}
         heading={token ? 'Секунду…' : 'Добро пожаловать'}
         subheading={splashSubheading}
+        statusText={splashStatusText}
+        secondaryActionLabel={manualActionLabel}
+        onSecondaryAction={manualActionLabel ? triggerReconnectNow : undefined}
       />
 
       <div className="h-full w-full overflow-hidden relative">
