@@ -100,6 +100,11 @@ const isTokenLikelyImage = (token) => {
   return byMime || byExt
 }
 
+const isFileLikelyImage = (file) => {
+  if (!file) return false
+  return isTokenLikelyImage({ name: file.name, mime: file.type })
+}
+
 const defaultUploadOptions = { group: false, compress: false, remember: false, comment: '' }
 
 const readStoredUploadOptions = () => {
@@ -922,7 +927,7 @@ export default function Chat() {
   }
 
   const uploadAttachments = async (filesToUpload, comment = '') => {
-    if (!filesToUpload.length) return
+    if (!filesToUpload.length) return null
     const attachments = []
     try {
       for (let index = 0; index < filesToUpload.length; index += 1) {
@@ -942,6 +947,7 @@ export default function Chat() {
     } finally {
       setUploadState(null)
     }
+    return null
   }
 
   const openFile = async (id, name) => {
@@ -1047,9 +1053,10 @@ export default function Chat() {
     }
   }
 
-  const handleSend = () => {
-    if (!text.trim()) return
-    sendMessage(text, replyTarget?.id || null)
+  const handleSend = (override) => {
+    const value = typeof override === 'string' ? override : text
+    if (!value.trim()) return
+    sendMessage(value)
     setText('')
     clearReplyTarget()
     if (typingTimeoutRef.current) {
@@ -1060,6 +1067,13 @@ export default function Chat() {
       emitTypingState(false)
       selfTypingRef.current = false
       setSelfTyping(false)
+    }
+  }
+
+  const sendUploadedAttachments = async (filesToUpload, comment = '') => {
+    const payload = await uploadAttachments(filesToUpload, comment)
+    if (typeof payload === 'string') {
+      handleSend(payload)
     }
   }
 
@@ -1074,16 +1088,30 @@ export default function Chat() {
     fileInputRef.current?.click()
   }
 
-  const handleFileChange = (ev) => {
+  const handleFileChange = async (ev) => {
     const files = Array.from(ev.target.files || [])
     if (!files.length) return
+    const hasImages = files.some((file) => isFileLikelyImage(file))
+    const dialogOpen = Boolean(uploadDialogRef.current)
+    if (!hasImages && !dialogOpen) {
+      try {
+        if (text.trim()) {
+          await uploadAttachments(files)
+        } else {
+          await sendUploadedAttachments(files)
+        }
+      } finally {
+        if (ev.target) ev.target.value = ''
+      }
+      return
+    }
     const items = files.map((file, index) => ({
       id:
         typeof crypto !== 'undefined' && crypto.randomUUID
           ? crypto.randomUUID()
           : `${Date.now()}-${index}`,
       file,
-      preview: file.type?.startsWith('image/') ? URL.createObjectURL(file) : null,
+      preview: isFileLikelyImage(file) ? URL.createObjectURL(file) : null,
     }))
     setUploadDialog((state) => {
       if (state) {
@@ -1247,6 +1275,11 @@ export default function Chat() {
     : '@user'
   const replyTargetPreviewText = replyTarget?.preview || 'Без текста'
 
+  const uploadDialogItems = uploadDialog?.items || []
+  const uploadDialogImageItems = uploadDialogItems.filter((item) => isFileLikelyImage(item.file))
+  const uploadDialogOtherItems = uploadDialogItems.filter((item) => !isFileLikelyImage(item.file))
+  const uploadDialogHasImages = uploadDialogImageItems.length > 0
+
   return (
     <div className="flex-1 flex flex-col h-full relative">
       <div className="panel px-6 py-3 border-b border-white/10 flex items-center justify-between">
@@ -1404,7 +1437,7 @@ export default function Chat() {
             <IconButton onClick={() => {}} title="Смайлы" disabled>
               <SmileIcon />
             </IconButton>
-            <IconButton onClick={handleSend} title="Отправить" disabled={!text.trim()} variant="primary">
+            <IconButton onClick={() => handleSend()} title="Отправить" disabled={!text.trim()} variant="primary">
               <SendIcon className="w-5 h-5" />
             </IconButton>
           </div>
@@ -1679,75 +1712,122 @@ export default function Chat() {
             {uploadDialog.error && (
               <div className="px-6 py-3 text-sm text-red-300 bg-red-500/10">{uploadDialog.error}</div>
             )}
-            <div className="flex-1 overflow-y-auto px-6 py-4 grid gap-4 md:grid-cols-2">
-              {uploadDialog.items.map((item, index) => {
-                const isImage = item.file.type?.startsWith('image/')
-                const descriptor = guessFileDescriptor(item.file)
-                const glyph = guessFileGlyph(item.file)
-                const sizeLabel = formatFileSize(item.file.size)
-                return (
-                  <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
-                    <button
-                      type="button"
-                      className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
-                      onClick={() => removePendingFile(item.id)}
-                      disabled={uploadDialog.loading}
-                    >
-                      ✕
-                    </button>
-                    <div
-                      className={`h-40 rounded-2xl overflow-hidden flex items-center justify-center relative ${
-                        isImage ? 'bg-black/40' : 'bg-gradient-to-br from-white/10 via-white/5 to-white/0'
-                      }`}
-                    >
-                      {item.preview && isImage ? (
-                        <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
-                      ) : (
-                        <div className="flex flex-col items-center justify-center text-center px-4 text-white/70">
-                          <div className="text-3xl mb-2">{glyph}</div>
-                          <div className="text-xs uppercase tracking-[0.3em] text-white/50">{descriptor}</div>
+            <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+              {uploadDialogHasImages && (
+                <div className="grid gap-4 md:grid-cols-2">
+                  {uploadDialogImageItems.map((item, index) => {
+                    const descriptor = guessFileDescriptor(item.file)
+                    const glyph = guessFileGlyph(item.file)
+                    const sizeLabel = formatFileSize(item.file.size)
+                    return (
+                      <div key={item.id} className="glass rounded-3xl p-4 space-y-3 relative">
+                        <button
+                          type="button"
+                          className="absolute top-3 right-3 text-white/50 hover:text-red-300 transition"
+                          onClick={() => removePendingFile(item.id)}
+                          disabled={uploadDialog.loading}
+                        >
+                          ✕
+                        </button>
+                        <div className="h-40 rounded-2xl overflow-hidden flex items-center justify-center relative bg-black/40">
+                          {item.preview ? (
+                            <img src={item.preview} alt={item.file.name} className="w-full h-full object-contain" />
+                          ) : (
+                            <div className="flex flex-col items-center justify-center text-center px-4 text-white/70">
+                              <div className="text-3xl mb-2">{glyph}</div>
+                              <div className="text-xs uppercase tracking-[0.3em] text-white/50">{descriptor}</div>
+                            </div>
+                          )}
+                          <div className="absolute left-3 top-3 text-[11px] uppercase tracking-[0.3em] text-white/50">
+                            {String(index + 1).padStart(2, '0')}
+                          </div>
                         </div>
-                      )}
-                      <div className="absolute left-3 top-3 text-[11px] uppercase tracking-[0.3em] text-white/50">
-                        {String(index + 1).padStart(2, '0')}
+                        <div className="space-y-1">
+                          <div className="text-sm text-white/90 truncate" title={item.file.name}>
+                            {item.file.name}
+                          </div>
+                          <div className="flex items-center justify-between text-xs text-white/50">
+                            <span>{descriptor}</span>
+                            <span>{sizeLabel}</span>
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                    <div className="space-y-1">
-                      <div className="text-sm text-white/90 truncate" title={item.file.name}>
-                        {item.file.name}
-                      </div>
-                      <div className="flex items-center justify-between text-xs text-white/50">
-                        <span>{descriptor}</span>
-                        <span>{sizeLabel}</span>
-                      </div>
-                    </div>
+                    )
+                  })}
+                </div>
+              )}
+              {uploadDialogOtherItems.length > 0 && (
+                <div className="glass rounded-3xl p-4 space-y-4">
+                  <div className="text-xs uppercase tracking-[0.3em] text-white/50">Файлы без предпросмотра</div>
+                  <div className="space-y-2">
+                    {uploadDialogOtherItems.map((item, index) => {
+                      const descriptor = guessFileDescriptor(item.file)
+                      const glyph = guessFileGlyph(item.file)
+                      const sizeLabel = formatFileSize(item.file.size)
+                      const orderLabel = String(uploadDialogImageItems.length + index + 1).padStart(2, '0')
+                      return (
+                        <div
+                          key={item.id}
+                          className="flex items-center justify-between gap-3 rounded-2xl bg-white/5 px-4 py-3"
+                        >
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="w-10 h-10 rounded-2xl bg-white/10 flex items-center justify-center text-lg">
+                              {glyph}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="text-sm text-white/90 truncate" title={item.file.name}>
+                                {item.file.name}
+                              </div>
+                              <div className="text-xs text-white/50">
+                                {descriptor} · {sizeLabel}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <div className="text-[11px] uppercase tracking-[0.3em] text-white/40">{orderLabel}</div>
+                            <button
+                              type="button"
+                              className="text-white/50 hover:text-red-300 transition"
+                              onClick={() => removePendingFile(item.id)}
+                              disabled={uploadDialog.loading}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })}
                   </div>
-                )
-              })}
-              {uploadDialog.items.length === 0 && (
-                <div className="col-span-full text-sm text-white/50">Файлы не выбраны</div>
+                </div>
+              )}
+              {uploadDialogItems.length === 0 && (
+                <div className="text-sm text-white/50">Файлы не выбраны</div>
               )}
             </div>
             <div className="px-6 py-4 border-t border-white/10 space-y-4">
               <div className="flex flex-wrap gap-4 text-sm text-white/70">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={uploadDialog.options.group}
-                    onChange={(e) => updateUploadOptions({ group: e.target.checked })}
-                    disabled={uploadDialog.loading}
-                  />
-                  Группировать
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={uploadDialog.options.compress}
-                    onChange={(e) => updateUploadOptions({ compress: e.target.checked })}
-                    disabled={uploadDialog.loading}
-                  />
-                  Сжать изображения
-                </label>
+                {uploadDialogHasImages && (
+                  <>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={uploadDialog.options.group}
+                        onChange={(e) => updateUploadOptions({ group: e.target.checked })}
+                        disabled={uploadDialog.loading}
+                      />
+                      Группировать
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={uploadDialog.options.compress}
+                        onChange={(e) => updateUploadOptions({ compress: e.target.checked })}
+                        disabled={uploadDialog.loading}
+                      />
+                      Сжать изображения
+                    </label>
+                  </>
+                )}
                 <label className="flex items-center gap-2">
                   <input
                     type="checkbox"
