@@ -95,6 +95,7 @@ export default function Titlebar() {
 
   const handleMouseDown = (event) => {
     if (event.button !== 0) return
+    if (event.target.closest?.('.no-drag')) return
     if (!api?.beginDrag) return
     const screenX = window.screenX + event.clientX
     const screenY = window.screenY + event.clientY
