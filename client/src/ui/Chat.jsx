@@ -88,11 +88,18 @@ const parseAttachmentToken = (token) => {
   const parts = token.split(':')
   const id = parts.shift()
   if (!id) return null
-  const name = parts.join(':') || `file-${id}`
-  return { id, name }
+  let name = parts.join(':') || `file-${id}`
+  let mode
+  if (name.endsWith('|document')) {
+    name = name.slice(0, -'|document'.length)
+    mode = 'file'
+  }
+  if (!name) name = `file-${id}`
+  return { id, name, mode }
 }
 
 const isTokenLikelyImage = (token) => {
+  if (!token || token.mode === 'file') return false
   const name = token?.name || ''
   const mime = token?.mime || ''
   const byMime = typeof mime === 'string' && mime.startsWith('image/')
@@ -162,10 +169,10 @@ const useAttachmentMeta = (token) => {
     ensureFileMeta(token.id).catch((err) => console.error('file meta load failed', err))
   }, [token?.id, meta, ensureFileMeta])
 
-  const resolved = meta || token
+  const resolved = meta ? { ...token, ...meta } : token
   const fileName = resolved?.name || token?.name || 'файл'
   const mime = (resolved?.mime || '').toLowerCase()
-  const isImage = isTokenLikelyImage({ name: fileName, mime })
+  const isImage = isTokenLikelyImage({ ...resolved, name: fileName, mime })
   const isAudio = mime.startsWith('audio/') || /\.(mp3|wav|ogg)$/i.test(fileName)
   const inlineUrl = token?.id ? buildFileUrl?.(token.id, { inline: true }) : null
   return { fileName, mime, isImage, isAudio, inlineUrl }
@@ -803,6 +810,14 @@ export default function Chat() {
     })
   }
 
+  const updateUploadItemMode = (id, mode) => {
+    setUploadDialog((state) => {
+      if (!state) return state
+      const nextItems = state.items.map((item) => (item.id === id ? { ...item, mode } : item))
+      return { ...state, items: nextItems }
+    })
+  }
+
   const removePendingFile = (id) => {
     setUploadDialog((state) => {
       if (!state) return state
@@ -813,20 +828,25 @@ export default function Chat() {
     })
   }
 
-  const uploadAttachments = async (filesToUpload, comment = '') => {
-    if (!filesToUpload.length) return
+  const uploadAttachments = async (itemsToUpload, comment = '') => {
+    if (!itemsToUpload.length) return
     const attachments = []
     try {
-      for (let index = 0; index < filesToUpload.length; index += 1) {
-        const file = filesToUpload[index]
-        setUploadState({ current: index + 1, total: filesToUpload.length, progress: 0 })
+      for (let index = 0; index < itemsToUpload.length; index += 1) {
+        const entry = itemsToUpload[index]
+        const file = entry.file
+        const entryMode = entry.mode || (file.type?.startsWith('image/') ? 'photo' : 'file')
+        setUploadState({ current: index + 1, total: itemsToUpload.length, progress: 0 })
         const uploaded = await uploadFile(file, (progress) => {
           setUploadState((state) => (state ? { ...state, progress } : state))
         })
-        if (uploaded) attachments.push(uploaded)
+        if (uploaded) attachments.push({ file: uploaded, mode: entryMode })
       }
       if (attachments.length) {
-        const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
+        const tokens = attachments.map(({ file, mode }) => {
+          const suffix = mode === 'file' ? '|document' : ''
+          return `[file:${file.id}:${file.name}${suffix}]`
+        })
         const blocks = []
         if (comment) blocks.push(comment)
         blocks.push(tokens.join('\n'))
@@ -877,11 +897,12 @@ export default function Chat() {
     try {
       const processed = []
       for (const item of dialog.items) {
+        const baseMode = item.mode || (item.file.type?.startsWith('image/') ? 'photo' : 'file')
         let file = item.file
-        if (dialog.options.compress && file.type?.startsWith('image/')) {
+        if (baseMode === 'photo' && dialog.options.compress && file.type?.startsWith('image/')) {
           file = await compressImageFile(file)
         }
-        processed.push(file)
+        processed.push({ file, mode: baseMode })
       }
       if (dialog.options.remember) {
         localStorage.setItem(
@@ -983,6 +1004,7 @@ export default function Chat() {
           : `${Date.now()}-${index}`,
       file,
       preview: file.type?.startsWith('image/') ? URL.createObjectURL(file) : null,
+      mode: file.type?.startsWith('image/') ? 'photo' : 'file',
     }))
     setUploadDialog((state) => {
       if (state) {
@@ -1572,6 +1594,17 @@ export default function Chat() {
                         <span>{sizeLabel}</span>
                       </div>
                     </div>
+                    {isImage && (
+                      <label className="flex items-center gap-2 text-xs text-white/70">
+                        <input
+                          type="checkbox"
+                          checked={item.mode === 'file'}
+                          onChange={(e) => updateUploadItemMode(item.id, e.target.checked ? 'file' : 'photo')}
+                          disabled={uploadDialog.loading}
+                        />
+                        Отправить как файл
+                      </label>
+                    )}
                   </div>
                 )
               })}
