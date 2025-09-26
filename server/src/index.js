@@ -233,7 +233,8 @@ CREATE TABLE IF NOT EXISTS messages (
   sender_id TEXT NOT NULL,
   content TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER DEFAULT 0
+  updated_at INTEGER DEFAULT 0,
+  reply_to TEXT REFERENCES messages(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS channel_members (
   channel_id TEXT NOT NULL,
@@ -308,8 +309,10 @@ ensureColumn('voice_rooms', 'avatar_url', 'TEXT DEFAULT ""')
 ensureColumn('voice_rooms', 'avatar_updated_at', 'INTEGER DEFAULT 0')
 ensureColumn('voice_rooms', 'avatar_mime', 'TEXT DEFAULT ""')
 ensureColumn('messages', 'updated_at', 'INTEGER DEFAULT 0')
+ensureColumn('messages', 'reply_to', 'TEXT REFERENCES messages(id) ON DELETE SET NULL')
 
 const hasMessageUpdatedAtColumn = tableHasColumn('messages', 'updated_at')
+const hasMessageReplyColumn = tableHasColumn('messages', 'reply_to')
 
 try {
   db.prepare('ALTER TABLE users ADD COLUMN avatar_seed TEXT DEFAULT ""').run()
@@ -371,6 +374,9 @@ try {
 try {
   db.prepare('ALTER TABLE messages ADD COLUMN updated_at INTEGER DEFAULT 0').run()
 } catch (err) {}
+try {
+  db.prepare('ALTER TABLE messages ADD COLUMN reply_to TEXT REFERENCES messages(id) ON DELETE SET NULL').run()
+} catch (err) {}
 
 
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
@@ -418,12 +424,41 @@ const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, clai
 const clearInviteClaimStmt = db.prepare("UPDATE invites SET claim_token='', claimed_at=NULL WHERE id=?")
 const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='', revoked_at=NULL WHERE id=?")
 const revokeInviteStmt = db.prepare("UPDATE invites SET revoked_at=?, claim_token='' WHERE id=?")
-const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
-const selectMessageFullById = db.prepare('SELECT * FROM messages WHERE id=?')
+const findMessageById = hasMessageReplyColumn
+  ? db.prepare('SELECT id, channel_id, sender_id, reply_to FROM messages WHERE id=?')
+  : db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
+
+const messageSelectBase = hasMessageReplyColumn
+  ? `SELECT m.*, parent.sender_id AS reply_sender_id, parent.content AS reply_content, parent.created_at AS reply_created_at,
+     parent.updated_at AS reply_updated_at, parent_user.username AS reply_sender_username
+     FROM messages m
+     LEFT JOIN messages parent ON parent.id = m.reply_to
+     LEFT JOIN users parent_user ON parent_user.id = parent.sender_id`
+  : 'SELECT * FROM messages'
+
+const selectMessageFullById = hasMessageReplyColumn
+  ? db.prepare(`${messageSelectBase} WHERE m.id=?`)
+  : db.prepare('SELECT * FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
-const updateMessageContentStmt = hasMessageUpdatedAtColumn
-  ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
-  : db.prepare('UPDATE messages SET content=? WHERE id=?')
+const clearMessageRepliesStmt = hasMessageReplyColumn
+  ? db.prepare('UPDATE messages SET reply_to=NULL WHERE reply_to=?')
+  : null
+const updateMessageContentStmt = (() => {
+  if (hasMessageReplyColumn && hasMessageUpdatedAtColumn) {
+    const stmt = db.prepare('UPDATE messages SET content=?, updated_at=?, reply_to=? WHERE id=?')
+    return (content, updatedAt, replyTo, id) => stmt.run(content, updatedAt, replyTo || null, id)
+  }
+  if (hasMessageReplyColumn) {
+    const stmt = db.prepare('UPDATE messages SET content=?, reply_to=? WHERE id=?')
+    return (content, _updatedAt, replyTo, id) => stmt.run(content, replyTo || null, id)
+  }
+  if (hasMessageUpdatedAtColumn) {
+    const stmt = db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
+    return (content, updatedAt, _replyTo, id) => stmt.run(content, updatedAt, id)
+  }
+  const stmt = db.prepare('UPDATE messages SET content=? WHERE id=?')
+  return (content, _updatedAt, _replyTo, id) => stmt.run(content, id)
+})()
 const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
 const insertChannelStmt = db.prepare(
   'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
@@ -449,14 +484,54 @@ const updateVoiceRoomAvatarStmt = db.prepare(
   'UPDATE voice_rooms SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?',
 )
 
-const decryptMessageRow = (row) => {
-  if (!row) return row
-  if (typeof row.content === 'undefined') return row
+const publicMessage = (row) => {
+  if (!row || typeof row.content === 'undefined') return row
   const updatedAt = row.updated_at ?? row.updatedAt ?? 0
-  return { ...row, content: decryptText(row.content), updated_at: updatedAt, updatedAt }
+  const channelId = row.channel_id ?? row.channelId ?? null
+  const senderId = row.sender_id ?? row.senderId ?? null
+  const createdAt = row.created_at ?? row.createdAt ?? Date.now()
+  const payload = {
+    ...row,
+    channel_id: row.channel_id ?? row.channelId ?? channelId,
+    channelId,
+    sender_id: senderId,
+    senderId,
+    created_at: createdAt,
+    createdAt,
+    content: decryptText(row.content),
+    updated_at: updatedAt,
+    updatedAt,
+  }
+  if (hasMessageReplyColumn) {
+    const replyId = row.reply_to ?? row.replyTo ?? null
+    if (replyId) {
+      const replyContentRaw = typeof row.reply_content === 'undefined' ? null : decryptText(row.reply_content)
+      const replySenderId = row.reply_sender_id ?? row.replySenderId ?? null
+      const replySenderUsername = row.reply_sender_username ?? row.replySenderUsername ?? null
+      const replyCreatedAt = row.reply_created_at ?? row.replyCreatedAt ?? 0
+      const replyUpdatedAt = row.reply_updated_at ?? row.replyUpdatedAt ?? 0
+      payload.replyTo = {
+        id: replyId,
+        senderId: replySenderId,
+        senderUsername: replySenderUsername,
+        content: replyContentRaw,
+        createdAt: replyCreatedAt,
+        updatedAt: replyUpdatedAt,
+      }
+    } else {
+      payload.replyTo = null
+    }
+    delete payload.reply_content
+    delete payload.reply_sender_id
+    delete payload.reply_sender_username
+    delete payload.reply_created_at
+    delete payload.reply_updated_at
+  }
+  if (typeof payload.replyTo === 'undefined') payload.replyTo = null
+  return payload
 }
 
-const decryptMessages = (rows) => rows.map(decryptMessageRow)
+const publicMessages = (rows) => rows.map(publicMessage)
 
 let defaultWs = db.prepare('SELECT id FROM workspaces LIMIT 1').get()
 if (!defaultWs) {
@@ -1702,6 +1777,7 @@ app.delete('/api/messages/:id', auth, (req, res) => {
   }
   if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
     return res.status(403).json({ error: 'forbidden' })
+  if (clearMessageRepliesStmt) clearMessageRepliesStmt.run(message.id)
   deleteMessageStmt.run(message.id)
   io.to(message.channel_id).emit('message:deleted', { id: message.id, channelId: message.channel_id })
   if (message.channel_id.startsWith('dm:')) {
@@ -1732,22 +1808,31 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
     return res.status(403).json({ error: 'forbidden' })
 
-  const updatedAtRaw = Date.now()
-  if (hasMessageUpdatedAtColumn) {
-    updateMessageContentStmt.run(encryptText(rawContent), updatedAtRaw, message.id)
-  } else {
-    updateMessageContentStmt.run(encryptText(rawContent), message.id)
+  let nextReplyId = null
+  if (hasMessageReplyColumn) {
+    const bodyHasReply = Object.prototype.hasOwnProperty.call(req.body || {}, 'replyTo')
+    if (bodyHasReply) {
+      const rawReply = req.body.replyTo
+      if (rawReply === null || rawReply === '' || typeof rawReply === 'undefined') {
+        nextReplyId = null
+      } else if (typeof rawReply === 'string') {
+        const parent = findMessageById.get(rawReply)
+        if (!parent || parent.channel_id !== message.channel_id) return res.status(400).json({ error: 'invalid_reply' })
+        nextReplyId = rawReply
+      } else {
+        return res.status(400).json({ error: 'invalid_reply' })
+      }
+    } else {
+      nextReplyId = message.reply_to ?? null
+    }
   }
-  const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
 
-  const payload = {
-    id: message.id,
-    channelId: message.channel_id,
-    senderId: message.sender_id,
-    content: rawContent,
-    createdAt: message.created_at,
-    updatedAt,
-  }
+  const updatedAtRaw = Date.now()
+  updateMessageContentStmt(encryptText(rawContent), updatedAtRaw, nextReplyId, message.id)
+
+  const fresh = selectMessageFullById.get(message.id)
+  const payload = publicMessage(fresh)
+
   io.to(message.channel_id).emit('message:updated', payload)
   if (message.channel_id.startsWith('dm:')) {
     const participants = parseDirectChannelId(message.channel_id)
@@ -1765,11 +1850,40 @@ app.patch('/api/messages/:id', auth, (req, res) => {
 })
 
 const onlineUsers = new Map()
-const listMessages = db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
+const listMessages = hasMessageReplyColumn
+  ? db.prepare(
+      `${messageSelectBase} WHERE m.channel_id=? ORDER BY m.created_at DESC LIMIT ? OFFSET ?`,
+    )
+  : db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
 
-const insertMessage = hasMessageUpdatedAtColumn
-  ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
-  : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+const insertMessage = (() => {
+  if (hasMessageReplyColumn && hasMessageUpdatedAtColumn) {
+    const stmt = db.prepare(
+      'INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at,reply_to) VALUES (?,?,?,?,?,0,?)',
+    )
+    return {
+      run: (id, channelId, senderId, content, createdAt, replyTo) => stmt.run(id, channelId, senderId, content, createdAt, replyTo || null),
+    }
+  }
+  if (hasMessageReplyColumn) {
+    const stmt = db.prepare(
+      'INSERT INTO messages (id,channel_id,sender_id,content,created_at,reply_to) VALUES (?,?,?,?,?,?)',
+    )
+    return {
+      run: (id, channelId, senderId, content, createdAt, replyTo) => stmt.run(id, channelId, senderId, content, createdAt, replyTo || null),
+    }
+  }
+  if (hasMessageUpdatedAtColumn) {
+    const stmt = db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
+    return {
+      run: (id, channelId, senderId, content, createdAt) => stmt.run(id, channelId, senderId, content, createdAt),
+    }
+  }
+  const stmt = db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+  return {
+    run: (id, channelId, senderId, content, createdAt) => stmt.run(id, channelId, senderId, content, createdAt),
+  }
+})()
 
 const voiceParticipants = new Map()
 const typingState = new Map()
@@ -2068,7 +2182,7 @@ io.on('connection', (socket) => {
       if (currentChannelId) ensureChannelJoined(currentChannelId)
       else leaveMessageRooms()
     }
-    const messages = currentChannelId ? decryptMessages(listMessages.all(currentChannelId, limit, offset)).reverse() : []
+    const messages = currentChannelId ? publicMessages(listMessages.all(currentChannelId, limit, offset)).reverse() : []
     socket.emit('init:response', { workspaces: [{ id: wsId, name: 'Home' }], channels, activeChannelId: currentChannelId, messages })
   })
 
@@ -2081,7 +2195,7 @@ io.on('connection', (socket) => {
       const normalized = normalizeDirectChannelId(channelId)
       if (!normalized) return
       ensureChannelJoined(normalized)
-      const msgs = decryptMessages(listMessages.all(normalized, 50, 0)).reverse()
+      const msgs = publicMessages(listMessages.all(normalized, 50, 0)).reverse()
       socket.emit('channel:opened', { channelId: normalized, messages: msgs })
       return
     }
@@ -2089,11 +2203,11 @@ io.on('connection', (socket) => {
     const access = resolveChannelAccess(userRecord, channelId)
     if (!access.allowed) return
     ensureChannelJoined(channelId)
-    const msgs = decryptMessages(listMessages.all(channelId, 50, 0)).reverse()
+    const msgs = publicMessages(listMessages.all(channelId, 50, 0)).reverse()
     socket.emit('channel:opened', { channelId, messages: msgs })
   })
 
-  socket.on('message:send', ({ channelId, content }) => {
+  socket.on('message:send', ({ channelId, content, replyTo }) => {
     if (!channelId || !content) return
     let targetChannel = channelId
     let directParticipants = null
@@ -2110,11 +2224,24 @@ io.on('connection', (socket) => {
       if (!access.allowed) return
       targetChannel = channelId
     }
+    let replyTargetId = null
+    if (hasMessageReplyColumn) {
+      if (replyTo === null || typeof replyTo === 'undefined' || replyTo === '') {
+        replyTargetId = null
+      } else if (typeof replyTo === 'string') {
+        const parent = findMessageById.get(replyTo)
+        if (!parent || parent.channel_id !== targetChannel) return
+        replyTargetId = replyTo
+      } else {
+        return
+      }
+    }
     const id = uuidv4()
     const now = Date.now()
     const encryptedContent = encryptText(content)
-    insertMessage.run(id, targetChannel, userId, encryptedContent, now)
-    const payload = { id, channelId: targetChannel, senderId: userId, content, createdAt: now, updatedAt: 0 }
+    insertMessage.run(id, targetChannel, userId, encryptedContent, now, replyTargetId)
+    const inserted = selectMessageFullById.get(id)
+    const payload = publicMessage(inserted)
     io.to(targetChannel).emit('message:new', payload)
     log('[MESSAGE] send', 'user=' + userId, 'channel=' + targetChannel, 'bytes=' + Buffer.byteLength(content, 'utf8'))
     if (directParticipants) {
@@ -2144,7 +2271,7 @@ io.on('connection', (socket) => {
       if (!access.allowed) return
       targetChannel = channelId
     }
-    const msgs = decryptMessages(listMessages.all(targetChannel, limit, offset)).reverse()
+    const msgs = publicMessages(listMessages.all(targetChannel, limit, offset)).reverse()
     socket.emit('messages:page', { channelId: targetChannel, messages: msgs, offset, limit })
   })
 

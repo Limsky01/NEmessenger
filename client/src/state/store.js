@@ -370,11 +370,40 @@ const enc = {
   },
 }
 
+const replyAttachmentPattern = /\[file:[^\]]+\]/g
+
+const buildReplyPreview = (content, fallback = 'Без текста') => {
+  if (typeof content !== 'string') return fallback
+  const attachments = content.match(replyAttachmentPattern) || []
+  const text = content.replace(replyAttachmentPattern, ' ').replace(/\s+/g, ' ').trim()
+  if (text) return text.length > 140 ? `${text.slice(0, 137)}...` : text
+  if (attachments.length === 1) return 'Вложение'
+  if (attachments.length > 1) return `Вложения (${attachments.length})`
+  return fallback
+}
+
 const formatMessage = (fallbackChannelId) => (raw) => {
   if (!raw) return null
   const channelId = raw.channelId ?? raw.channel_id ?? fallbackChannelId
   const senderId = raw.senderId ?? raw.sender_id ?? raw.user_id ?? null
   const createdAt = raw.createdAt ?? raw.created_at ?? Date.now()
+  const replyRaw = raw.replyTo ?? raw.reply_to ?? null
+  let replyTo = null
+  if (replyRaw?.id) {
+    const replyChannelId = replyRaw.channelId ?? replyRaw.channel_id ?? channelId
+    const encryptedReplyContent = replyRaw.content ?? replyRaw.reply_content ?? null
+    const decryptedReplyContent =
+      typeof encryptedReplyContent === 'string' ? enc.decrypt(replyChannelId, encryptedReplyContent) : ''
+    const replyFallback = encryptedReplyContent == null ? 'Сообщение недоступно' : 'Без текста'
+    const preview = buildReplyPreview(decryptedReplyContent, replyFallback)
+    replyTo = {
+      id: replyRaw.id,
+      authorId: replyRaw.senderId ?? replyRaw.sender_id ?? replyRaw.authorId ?? null,
+      author: replyRaw.senderUsername ?? replyRaw.sender_username ?? replyRaw.author ?? null,
+      preview,
+      missing: encryptedReplyContent == null,
+    }
+  }
   return {
     id: raw.id,
     channelId,
@@ -382,6 +411,7 @@ const formatMessage = (fallbackChannelId) => (raw) => {
     createdAt,
     updatedAt: raw.updatedAt ?? raw.updated_at ?? 0,
     content: enc.decrypt(channelId, raw.content),
+    replyTo,
   }
 }
 
@@ -1170,25 +1200,25 @@ const useStore = create((set, get) => ({
     socket.emit('channel:switch', { channelId })
   },
 
-  sendMessage: (content) => {
+  sendMessage: (content, replyTo = null) => {
     const socket = get().socket
     const channelId = get().activeChannelId
     if (!socket || !channelId || !content.trim()) return
     const encrypted = enc.encrypt(channelId, content.trim())
-    socket.emit('message:send', { channelId, content: encrypted })
+    socket.emit('message:send', { channelId, content: encrypted, replyTo: replyTo || null })
   },
 
-  editMessage: async (messageId, channelId, content) => {
+  editMessage: async (messageId, channelId, content, replyTo = undefined) => {
     const token = get().token
     if (!token) throw new Error('not_authenticated')
     const trimmed = typeof content === 'string' ? content.trim() : ''
     if (!trimmed) throw new Error('invalid_content')
     const encrypted = enc.encrypt(channelId, trimmed)
-    await axios.patch(
-      `${get().serverUrl}/api/messages/${messageId}`,
-      { content: encrypted },
-      { headers: buildAuthHeaders(token) },
-    )
+    const payload = { content: encrypted }
+    if (typeof replyTo !== 'undefined') payload.replyTo = replyTo
+    await axios.patch(`${get().serverUrl}/api/messages/${messageId}`, payload, {
+      headers: buildAuthHeaders(token),
+    })
   },
 
   deleteMessage: async (messageId) => {

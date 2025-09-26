@@ -583,6 +583,7 @@ export default function Chat() {
   const [deleteDialog, setDeleteDialog] = useState(null)
   const [editDialog, setEditDialog] = useState(null)
   const [imagePreview, setImagePreview] = useState(null)
+  const [replyTarget, setReplyTarget] = useState(null)
   const [uploadDialog, setUploadDialog] = useState(null)
   const [membersDialogOpen, setMembersDialogOpen] = useState(false)
   const [membersLoading, setMembersLoading] = useState(false)
@@ -736,6 +737,35 @@ export default function Chat() {
   }
 
   const nameById = (id) => userMap.get(id)?.username || 'user'
+  const summarizeMessage = useCallback((message) => {
+    if (!message) return 'Без текста'
+    const { textSegments, attachments } = extractTextAndAttachments(message.content)
+    const text = textSegments.join(' ').trim()
+    if (text) return text.length > 140 ? `${text.slice(0, 137)}...` : text
+    if (attachments.length === 1) return 'Вложение'
+    if (attachments.length > 1) return `Вложения (${attachments.length})`
+    return 'Без текста'
+  }, [])
+
+  const handleSelectReply = useCallback(
+    (message) => {
+      if (!message) return
+      setReplyTarget({
+        id: message.id,
+        authorId: message.senderId,
+        author: nameById(message.senderId),
+        preview: summarizeMessage(message),
+      })
+      textareaRef.current?.focus()
+    },
+    [nameById, summarizeMessage],
+  )
+
+  const clearReplyTarget = useCallback(() => {
+    setReplyTarget(null)
+    textareaRef.current?.focus()
+  }, [])
+
   const avatarSrcById = (id) => {
     const user = userMap.get(id)
     return user ? buildAvatarUrl?.(user) : null
@@ -749,6 +779,17 @@ export default function Chat() {
   useEffect(() => {
     uploadDialogRef.current = uploadDialog
   }, [uploadDialog])
+
+  useEffect(() => {
+    setReplyTarget(null)
+  }, [activeChannelId])
+
+  useEffect(() => {
+    if (!replyTarget) return
+    if (!messages.some((message) => message.id === replyTarget.id)) {
+      setReplyTarget(null)
+    }
+  }, [messages, replyTarget])
 
   useEffect(
     () => () => {
@@ -1008,8 +1049,9 @@ export default function Chat() {
 
   const handleSend = () => {
     if (!text.trim()) return
-    sendMessage(text)
+    sendMessage(text, replyTarget?.id || null)
     setText('')
+    clearReplyTarget()
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current)
       typingTimeoutRef.current = null
@@ -1197,6 +1239,13 @@ export default function Chat() {
   const headerSubtitle = isDirectChannel
     ? 'Приватный диалог'
     : currentChannel ? 'Общий канал' : ''
+  const replyTargetAuthorName = replyTarget?.author || (replyTarget?.authorId ? nameById(replyTarget.authorId) : null)
+  const replyTargetAuthorLabel = replyTargetAuthorName
+    ? replyTargetAuthorName.startsWith('@')
+      ? replyTargetAuthorName
+      : `@${replyTargetAuthorName}`
+    : '@user'
+  const replyTargetPreviewText = replyTarget?.preview || 'Без текста'
 
   return (
     <div className="flex-1 flex flex-col h-full relative">
@@ -1235,6 +1284,16 @@ export default function Chat() {
           const canDelete = mine || me?.role === 'admin' || canModerateChannel
           const canEdit = mine || canModerateChannel
           const edited = m.updatedAt && m.updatedAt > (m.createdAt || 0)
+          const replyInfo = m.replyTo || null
+          const replyAuthorRaw = replyInfo?.author || (replyInfo?.authorId ? nameById(replyInfo.authorId) : null)
+          const replyAuthorLabel = replyAuthorRaw
+            ? replyAuthorRaw.startsWith('@')
+              ? replyAuthorRaw
+              : `@${replyAuthorRaw}`
+            : '@user'
+          const replyPreviewText = replyInfo
+            ? replyInfo.preview || (replyInfo.missing ? 'Сообщение недоступно' : 'Без текста')
+            : ''
           return (
             <div key={m.id} className={`max-w-[72%] px-4 py-3 rounded-3xl shadow-glass ${mine ? 'ml-auto panel' : 'glass'}`}>
               <div className="flex items-center justify-between text-[11px] text-white/70 mb-2">
@@ -1246,30 +1305,43 @@ export default function Chat() {
                     {edited ? ' · изменено' : ''}
                   </span>
                 </div>
-                {(canEdit || canDelete) && (
-                  <div className="flex items-center gap-2 text-white/40">
-                    {canEdit && (
-                      <button
-                        type="button"
-                        className="hover:text-white transition"
-                        onClick={() => handleRequestEdit(m)}
-                      >
-                        <EditIcon />
-                      </button>
-                    )}
-                    {canDelete && (
-                      <button
-                        type="button"
-                        className="hover:text-red-400 transition"
-                        onClick={() => handleRequestDelete(m)}
-                      >
-                        <TrashIcon />
-                      </button>
-                    )}
-                  </div>
-                )}
+                <div className="flex items-center gap-2 text-white/40">
+                  <button
+                    type="button"
+                    className="text-xs uppercase tracking-[0.12em] hover:text-white transition"
+                    onClick={() => handleSelectReply(m)}
+                  >
+                    Ответить
+                  </button>
+                  {canEdit && (
+                    <button
+                      type="button"
+                      className="hover:text-white transition"
+                      onClick={() => handleRequestEdit(m)}
+                    >
+                      <EditIcon />
+                    </button>
+                  )}
+                  {canDelete && (
+                    <button
+                      type="button"
+                      className="hover:text-red-400 transition"
+                      onClick={() => handleRequestDelete(m)}
+                    >
+                      <TrashIcon />
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="whitespace-pre-wrap leading-relaxed break-words space-y-3">
+                {replyInfo && (
+                  <div className="px-3 py-2 rounded-2xl bg-white/5 border border-white/10">
+                    <div className="text-xs text-white/50 mb-1">Ответ {replyAuthorLabel}</div>
+                    <div className="text-sm text-white/80 whitespace-pre-wrap break-words">
+                      {replyPreviewText}
+                    </div>
+                  </div>
+                )}
                 {textSegments.filter((segment) => segment && segment.trim()).map((segment, idx) => (
                   <div key={`text-${m.id}-${idx}`}>{segment}</div>
                 ))}
@@ -1295,6 +1367,24 @@ export default function Chat() {
       )}
 
       <div className="px-6 py-4 border-t border-white/10">
+        {replyTarget && (
+          <div className="mb-3 px-4 py-3 rounded-2xl bg-white/10 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-xs text-white/60 uppercase tracking-[0.15em] mb-1">Ответ {replyTargetAuthorLabel}</div>
+              <div className="text-sm text-white/80 whitespace-pre-wrap break-words max-h-24 overflow-hidden">
+                {replyTargetPreviewText}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={clearReplyTarget}
+              className="text-white/60 hover:text-white transition"
+              title="Отменить ответ"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <div className="panel rounded-3xl px-4 py-2 flex items-center gap-3">
           <IconButton onClick={handleFilePick} title="Прикрепить файлы">
             <PaperclipIcon />
