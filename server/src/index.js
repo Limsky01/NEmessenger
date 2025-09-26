@@ -155,10 +155,15 @@ const PORT = process.env.PORT || 4000
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret'
 const UPLOAD_DIR = process.env.UPLOAD_DIR || 'uploads'
 const AVATAR_DIR = path.join(UPLOAD_DIR, 'avatars')
+const CHANNEL_AVATAR_DIR = path.join(AVATAR_DIR, 'channels')
+const VOICE_AVATAR_DIR = path.join(AVATAR_DIR, 'voice-rooms')
 
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 if (!fs.existsSync(path.join(UPLOAD_DIR, 'tmp'))) fs.mkdirSync(path.join(UPLOAD_DIR, 'tmp'), { recursive: true })
 if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true })
+if (!fs.existsSync(CHANNEL_AVATAR_DIR)) fs.mkdirSync(CHANNEL_AVATAR_DIR, { recursive: true })
+if (!fs.existsSync(VOICE_AVATAR_DIR)) fs.mkdirSync(VOICE_AVATAR_DIR, { recursive: true })
+const UPLOADS_ROOT = path.resolve(UPLOAD_DIR)
 
 const db = new Database('messenger_v4.db')
 db.pragma('journal_mode = WAL')
@@ -217,7 +222,10 @@ CREATE TABLE IF NOT EXISTS channels (
   name TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   is_private INTEGER NOT NULL DEFAULT 0,
-  created_by TEXT DEFAULT ''
+  created_by TEXT DEFAULT '',
+  avatar_url TEXT DEFAULT '',
+  avatar_updated_at INTEGER DEFAULT 0,
+  avatar_mime TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -225,7 +233,8 @@ CREATE TABLE IF NOT EXISTS messages (
   sender_id TEXT NOT NULL,
   content TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER DEFAULT 0
+  updated_at INTEGER DEFAULT 0,
+  reply_to TEXT REFERENCES messages(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS channel_members (
   channel_id TEXT NOT NULL,
@@ -246,7 +255,10 @@ CREATE TABLE IF NOT EXISTS voice_rooms (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  created_by TEXT NOT NULL
+  created_by TEXT NOT NULL,
+  avatar_url TEXT DEFAULT '',
+  avatar_updated_at INTEGER DEFAULT 0,
+  avatar_mime TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS voice_room_members (
@@ -290,9 +302,17 @@ ensureColumn('invites', 'used_at', 'INTEGER')
 ensureColumn('invites', 'revoked_at', 'INTEGER')
 ensureColumn('channels', 'is_private', 'INTEGER NOT NULL DEFAULT 0')
 ensureColumn('channels', 'created_by', 'TEXT DEFAULT ""')
+ensureColumn('channels', 'avatar_url', 'TEXT DEFAULT ""')
+ensureColumn('channels', 'avatar_updated_at', 'INTEGER DEFAULT 0')
+ensureColumn('channels', 'avatar_mime', 'TEXT DEFAULT ""')
+ensureColumn('voice_rooms', 'avatar_url', 'TEXT DEFAULT ""')
+ensureColumn('voice_rooms', 'avatar_updated_at', 'INTEGER DEFAULT 0')
+ensureColumn('voice_rooms', 'avatar_mime', 'TEXT DEFAULT ""')
 ensureColumn('messages', 'updated_at', 'INTEGER DEFAULT 0')
+ensureColumn('messages', 'reply_to', 'TEXT REFERENCES messages(id) ON DELETE SET NULL')
 
 const hasMessageUpdatedAtColumn = tableHasColumn('messages', 'updated_at')
+const hasMessageReplyColumn = tableHasColumn('messages', 'reply_to')
 
 try {
   db.prepare('ALTER TABLE users ADD COLUMN avatar_seed TEXT DEFAULT ""').run()
@@ -334,7 +354,28 @@ try {
   db.prepare('ALTER TABLE channels ADD COLUMN created_by TEXT DEFAULT ""').run()
 } catch (err) {}
 try {
+  db.prepare('ALTER TABLE channels ADD COLUMN avatar_url TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE channels ADD COLUMN avatar_updated_at INTEGER DEFAULT 0').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE channels ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE voice_rooms ADD COLUMN avatar_url TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE voice_rooms ADD COLUMN avatar_updated_at INTEGER DEFAULT 0').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE voice_rooms ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
   db.prepare('ALTER TABLE messages ADD COLUMN updated_at INTEGER DEFAULT 0').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE messages ADD COLUMN reply_to TEXT REFERENCES messages(id) ON DELETE SET NULL').run()
 } catch (err) {}
 
 
@@ -345,9 +386,11 @@ const updateAvatarInfoStmt = db.prepare('UPDATE users SET avatar_url=?, avatar_u
 const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id=?')
 const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
 const countAdminsStmt = db.prepare("SELECT COUNT(*) as count FROM users WHERE role='admin'")
-const listVoiceRoomsStmt = db.prepare('SELECT id, name, created_at, created_by FROM voice_rooms ORDER BY created_at ASC')
+const listVoiceRoomsStmt = db.prepare(
+  'SELECT id, name, created_at, created_by, avatar_url, avatar_updated_at, avatar_mime FROM voice_rooms ORDER BY created_at ASC',
+)
 const listVoiceRoomsForUserStmt = db.prepare(
-  `SELECT vr.id, vr.name, vr.created_at, vr.created_by, vrm.role AS membership_role
+  `SELECT vr.id, vr.name, vr.created_at, vr.created_by, vr.avatar_url, vr.avatar_updated_at, vr.avatar_mime, vrm.role AS membership_role
    FROM voice_rooms vr
    LEFT JOIN voice_room_members vrm ON vrm.room_id = vr.id AND vrm.user_id = ?
    WHERE vr.created_by = ? OR vrm.user_id = ?
@@ -356,7 +399,9 @@ const listVoiceRoomsForUserStmt = db.prepare(
 const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
 const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
 
-const selectVoiceRoomStmt = db.prepare('SELECT id, name, created_at, created_by FROM voice_rooms WHERE id=?')
+const selectVoiceRoomStmt = db.prepare(
+  'SELECT id, name, created_at, created_by, avatar_url, avatar_updated_at, avatar_mime FROM voice_rooms WHERE id=?',
+)
 const insertVoiceRoomMemberStmt = db.prepare(
   'INSERT OR REPLACE INTO voice_room_members (room_id, user_id, role, added_at, added_by) VALUES (?,?,?,?,?)'
 )
@@ -379,15 +424,47 @@ const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, clai
 const clearInviteClaimStmt = db.prepare("UPDATE invites SET claim_token='', claimed_at=NULL WHERE id=?")
 const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='', revoked_at=NULL WHERE id=?")
 const revokeInviteStmt = db.prepare("UPDATE invites SET revoked_at=?, claim_token='' WHERE id=?")
-const findMessageById = db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
-const selectMessageFullById = db.prepare('SELECT * FROM messages WHERE id=?')
+const findMessageById = hasMessageReplyColumn
+  ? db.prepare('SELECT id, channel_id, sender_id, reply_to FROM messages WHERE id=?')
+  : db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
+
+const messageSelectBase = hasMessageReplyColumn
+  ? `SELECT m.*, parent.sender_id AS reply_sender_id, parent.content AS reply_content, parent.created_at AS reply_created_at,
+     parent.updated_at AS reply_updated_at, parent_user.username AS reply_sender_username
+     FROM messages m
+     LEFT JOIN messages parent ON parent.id = m.reply_to
+     LEFT JOIN users parent_user ON parent_user.id = parent.sender_id`
+  : 'SELECT * FROM messages'
+
+const selectMessageFullById = hasMessageReplyColumn
+  ? db.prepare(`${messageSelectBase} WHERE m.id=?`)
+  : db.prepare('SELECT * FROM messages WHERE id=?')
 const deleteMessageStmt = db.prepare('DELETE FROM messages WHERE id=?')
-const updateMessageContentStmt = hasMessageUpdatedAtColumn
-  ? db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
-  : db.prepare('UPDATE messages SET content=? WHERE id=?')
+const clearMessageRepliesStmt = hasMessageReplyColumn
+  ? db.prepare('UPDATE messages SET reply_to=NULL WHERE reply_to=?')
+  : null
+const updateMessageContentStmt = (() => {
+  if (hasMessageReplyColumn && hasMessageUpdatedAtColumn) {
+    const stmt = db.prepare('UPDATE messages SET content=?, updated_at=?, reply_to=? WHERE id=?')
+    return (content, updatedAt, replyTo, id) => stmt.run(content, updatedAt, replyTo || null, id)
+  }
+  if (hasMessageReplyColumn) {
+    const stmt = db.prepare('UPDATE messages SET content=?, reply_to=? WHERE id=?')
+    return (content, _updatedAt, replyTo, id) => stmt.run(content, replyTo || null, id)
+  }
+  if (hasMessageUpdatedAtColumn) {
+    const stmt = db.prepare('UPDATE messages SET content=?, updated_at=? WHERE id=?')
+    return (content, updatedAt, _replyTo, id) => stmt.run(content, updatedAt, id)
+  }
+  const stmt = db.prepare('UPDATE messages SET content=? WHERE id=?')
+  return (content, _updatedAt, _replyTo, id) => stmt.run(content, id)
+})()
 const selectChannelByIdStmt = db.prepare('SELECT * FROM channels WHERE id=?')
 const insertChannelStmt = db.prepare(
   'INSERT INTO channels (id, workspace_id, name, created_at, is_private, created_by) VALUES (?,?,?,?,?,?)',
+)
+const updateChannelAvatarStmt = db.prepare(
+  'UPDATE channels SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?',
 )
 const listAllChannelsStmt = db.prepare('SELECT * FROM channels WHERE workspace_id=? ORDER BY created_at ASC')
 const listUserChannelMembershipsStmt = db.prepare('SELECT channel_id, role FROM channel_members WHERE user_id=?')
@@ -403,15 +480,58 @@ const deleteChannelStmt = db.prepare('DELETE FROM channels WHERE id=?')
 const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
 const countChannelMembersStmt = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id=?')
 const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
+const updateVoiceRoomAvatarStmt = db.prepare(
+  'UPDATE voice_rooms SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?',
+)
 
-const decryptMessageRow = (row) => {
-  if (!row) return row
-  if (typeof row.content === 'undefined') return row
+const publicMessage = (row) => {
+  if (!row || typeof row.content === 'undefined') return row
   const updatedAt = row.updated_at ?? row.updatedAt ?? 0
-  return { ...row, content: decryptText(row.content), updated_at: updatedAt, updatedAt }
+  const channelId = row.channel_id ?? row.channelId ?? null
+  const senderId = row.sender_id ?? row.senderId ?? null
+  const createdAt = row.created_at ?? row.createdAt ?? Date.now()
+  const payload = {
+    ...row,
+    channel_id: row.channel_id ?? row.channelId ?? channelId,
+    channelId,
+    sender_id: senderId,
+    senderId,
+    created_at: createdAt,
+    createdAt,
+    content: decryptText(row.content),
+    updated_at: updatedAt,
+    updatedAt,
+  }
+  if (hasMessageReplyColumn) {
+    const replyId = row.reply_to ?? row.replyTo ?? null
+    if (replyId) {
+      const replyContentRaw = typeof row.reply_content === 'undefined' ? null : decryptText(row.reply_content)
+      const replySenderId = row.reply_sender_id ?? row.replySenderId ?? null
+      const replySenderUsername = row.reply_sender_username ?? row.replySenderUsername ?? null
+      const replyCreatedAt = row.reply_created_at ?? row.replyCreatedAt ?? 0
+      const replyUpdatedAt = row.reply_updated_at ?? row.replyUpdatedAt ?? 0
+      payload.replyTo = {
+        id: replyId,
+        senderId: replySenderId,
+        senderUsername: replySenderUsername,
+        content: replyContentRaw,
+        createdAt: replyCreatedAt,
+        updatedAt: replyUpdatedAt,
+      }
+    } else {
+      payload.replyTo = null
+    }
+    delete payload.reply_content
+    delete payload.reply_sender_id
+    delete payload.reply_sender_username
+    delete payload.reply_created_at
+    delete payload.reply_updated_at
+  }
+  if (typeof payload.replyTo === 'undefined') payload.replyTo = null
+  return payload
 }
 
-const decryptMessages = (rows) => rows.map(decryptMessageRow)
+const publicMessages = (rows) => rows.map(publicMessage)
 
 let defaultWs = db.prepare('SELECT id FROM workspaces LIMIT 1').get()
 if (!defaultWs) {
@@ -468,6 +588,8 @@ const listWorkspaceMembersStmt = db.prepare('SELECT user_id FROM workspace_membe
 
 const normalizeChannelRow = (row) => {
   if (!row) return null
+  const avatarPath = row.avatar_url ?? row.avatarUrl ?? ''
+  const avatarUpdatedAt = row.avatar_updated_at ?? row.avatarUpdatedAt ?? 0
   return {
     id: row.id,
     workspaceId: row.workspace_id,
@@ -475,6 +597,8 @@ const normalizeChannelRow = (row) => {
     createdAt: row.created_at,
     isPrivate: Boolean(row.is_private),
     createdBy: row.created_by || '',
+    avatarUrl: avatarPath ? `/api/channels/${row.id}/avatar` : '',
+    avatarUpdatedAt,
   }
 }
 
@@ -485,6 +609,30 @@ const getChannelMemberCount = (channelId) => {
   } catch (err) {
     warn('[CHANNELS] count members failed', err.message)
     return 0
+  }
+}
+
+const publicChannel = (channel, extras = {}) => {
+  if (!channel) return null
+  const normalized = typeof channel.workspaceId !== 'undefined' ? channel : normalizeChannelRow(channel)
+  if (!normalized) return null
+  const memberCount =
+    typeof extras.memberCount === 'number'
+      ? extras.memberCount
+      : normalized.isPrivate
+        ? getChannelMemberCount(normalized.id)
+        : 0
+  const membershipRole = extras.membershipRole || ''
+  return {
+    id: normalized.id,
+    name: normalized.name,
+    createdAt: normalized.createdAt,
+    isPrivate: normalized.isPrivate,
+    createdBy: normalized.createdBy,
+    memberCount,
+    membershipRole,
+    avatarUrl: normalized.avatarUrl,
+    avatarUpdatedAt: normalized.avatarUpdatedAt,
   }
 }
 
@@ -499,27 +647,20 @@ const getAccessibleChannelsForUser = (user) => {
   }
   const allChannels = listAllChannelsStmt.all(defaultWs.id)
   return allChannels
-    .map(normalizeChannelRow)
-    .filter(Boolean)
-    .filter((channel) => {
-      if (!channel.isPrivate) return true
+    .map((row) => ({ row, normalized: normalizeChannelRow(row) }))
+    .filter(({ normalized }) => Boolean(normalized))
+    .filter(({ normalized }) => {
+      if (!normalized.isPrivate) return true
       if (user.role === 'admin') return true
-      if (channel.createdBy && channel.createdBy === user.id) return true
-      return memberships.has(channel.id)
+      if (normalized.createdBy && normalized.createdBy === user.id) return true
+      return memberships.has(normalized.id)
     })
-    .map((channel) => {
-      const memberCount = channel.isPrivate ? getChannelMemberCount(channel.id) : 0
-      const ownerRole = channel.createdBy && channel.createdBy === user.id ? 'owner' : ''
-      const membershipRole = ownerRole || memberships.get(channel.id) || (user.role === 'admin' && channel.isPrivate ? 'admin' : '')
-      return {
-        id: channel.id,
-        name: channel.name,
-        createdAt: channel.createdAt,
-        isPrivate: channel.isPrivate,
-        createdBy: channel.createdBy,
-        memberCount,
-        membershipRole,
-      }
+    .map(({ normalized }) => {
+      const memberCount = normalized.isPrivate ? getChannelMemberCount(normalized.id) : 0
+      const ownerRole = normalized.createdBy && normalized.createdBy === user.id ? 'owner' : ''
+      const membershipRole =
+        ownerRole || memberships.get(normalized.id) || (user.role === 'admin' && normalized.isPrivate ? 'admin' : '')
+      return publicChannel(normalized, { memberCount, membershipRole })
     })
 }
 
@@ -848,15 +989,12 @@ app.post('/api/channels', auth, (req, res) => {
   const audience = getChannelAudienceUserIds(channelRow)
   emitChannelListForUsers(audience)
   const creatorChannels = getAccessibleChannelsForUser(selectUserById.get(req.user.id)).filter((ch) => ch.id === channelId)
-  const channelPayload = creatorChannels[0] || {
-    id: channelRow.id,
-    name: channelRow.name,
-    createdAt: channelRow.created_at,
-    isPrivate: Boolean(channelRow.is_private),
-    createdBy: channelRow.created_by || req.user.id,
-    memberCount: channelRow.is_private ? getChannelMemberCount(channelRow.id) : 0,
-    membershipRole: privateFlag ? 'owner' : '',
-  }
+  const channelPayload =
+    creatorChannels[0] ||
+    publicChannel(channelRow, {
+      memberCount: channelRow.is_private ? getChannelMemberCount(channelRow.id) : 0,
+      membershipRole: privateFlag ? 'owner' : '',
+    })
   const members = privateFlag ? getChannelMembersDetailed(channelId) : []
   log('[CHANNELS] create', channelId, 'user=' + req.user.id, 'private=' + privateFlag)
   res.status(201).json({ channel: channelPayload, members })
@@ -936,6 +1074,16 @@ app.delete('/api/channels/:id', auth, (req, res) => {
   if (!isAdmin && !isOwner) {
     return res.status(403).json({ error: 'forbidden' })
   }
+  if (channel.avatar_url) {
+    const avatarPath = path.resolve(path.join(UPLOAD_DIR, channel.avatar_url))
+    if (avatarPath.startsWith(UPLOADS_ROOT) && fs.existsSync(avatarPath)) {
+      try {
+        fs.unlinkSync(avatarPath)
+      } catch (err) {
+        warn('[CHANNELS] avatar cleanup failed', err.message)
+      }
+    }
+  }
   const audience = getChannelAudienceUserIds(channel)
   const memberRows = listChannelMembersStmt.all(channel.id)
   const notifyIds = new Set(audience)
@@ -951,6 +1099,113 @@ app.delete('/api/channels/:id', auth, (req, res) => {
   emitChannelListForUsers(notifyList)
   log('[CHANNELS] delete', req.params.id, 'actor=' + req.user.id)
   res.json({ ok: true })
+})
+
+app.post('/api/channels/:id/avatar', auth, (req, res) => {
+  channelAvatarUpload.single('avatar')(req, res, (err) => {
+    if (err) {
+      warn('[CHANNELS] avatar upload failed', err?.message || err)
+      const code = err.code === 'LIMIT_FILE_SIZE' ? 'avatar_too_large' : 'invalid_avatar'
+      return res.status(400).json({ error: code })
+    }
+    if (!req.file) return res.status(400).json({ error: 'invalid_avatar' })
+
+    const viewer = selectUserById.get(req.user.id)
+    if (!viewer) return res.status(404).json({ error: 'not_found' })
+    const channel = selectChannelByIdStmt.get(req.params.id)
+    if (!channel) return res.status(404).json({ error: 'not_found' })
+    const access = resolveChannelAccess(viewer, channel.id)
+    if (!access.allowed && channel.is_private) return res.status(404).json({ error: 'not_found' })
+    const membershipRole = access.role || ''
+    const isCreator = !channel.is_private && channel.created_by && channel.created_by === viewer.id
+    const canManage = viewer.role === 'admin' || membershipRole === 'owner' || membershipRole === 'admin' || isCreator
+    if (!canManage) return res.status(403).json({ error: 'forbidden' })
+
+    const relPath = path.relative(UPLOAD_DIR, req.file.path)
+    const previousPath = channel.avatar_url ? path.join(UPLOAD_DIR, channel.avatar_url) : ''
+    updateChannelAvatarStmt.run(relPath, Date.now(), req.file.mimetype || '', channel.id)
+    if (previousPath && fs.existsSync(previousPath) && path.resolve(previousPath).startsWith(UPLOADS_ROOT)) {
+      if (path.resolve(previousPath) !== path.resolve(req.file.path)) {
+        try {
+          fs.unlinkSync(previousPath)
+        } catch (e) {
+          warn('[CHANNELS] avatar cleanup failed', e.message)
+        }
+      }
+    }
+
+    const updated = selectChannelByIdStmt.get(channel.id)
+    const audience = getChannelAudienceUserIds(updated)
+    emitChannelListForUsers(audience)
+    const updatedAccess = updated.is_private ? resolveChannelAccess(viewer, updated.id) : { allowed: true, role: '' }
+    const roleForResponse = updated.is_private
+      ? updatedAccess.role || (viewer.role === 'admin' ? 'admin' : '')
+      : viewer.role === 'admin'
+        ? 'admin'
+        : ''
+    const payload = publicChannel(updated, {
+      memberCount: updated.is_private ? getChannelMemberCount(updated.id) : 0,
+      membershipRole: roleForResponse,
+    })
+    log('[CHANNELS] avatar updated', updated.id, 'actor=' + viewer.id)
+    res.json({ channel: payload })
+  })
+})
+
+app.delete('/api/channels/:id/avatar', auth, (req, res) => {
+  const viewer = selectUserById.get(req.user.id)
+  if (!viewer) return res.status(404).json({ error: 'not_found' })
+  const channel = selectChannelByIdStmt.get(req.params.id)
+  if (!channel) return res.status(404).json({ error: 'not_found' })
+  const access = resolveChannelAccess(viewer, channel.id)
+  if (!access.allowed && channel.is_private) return res.status(404).json({ error: 'not_found' })
+  const membershipRole = access.role || ''
+  const isCreator = !channel.is_private && channel.created_by && channel.created_by === viewer.id
+  const canManage = viewer.role === 'admin' || membershipRole === 'owner' || membershipRole === 'admin' || isCreator
+  if (!canManage) return res.status(403).json({ error: 'forbidden' })
+
+  if (channel.avatar_url) {
+    const avatarPath = path.resolve(path.join(UPLOAD_DIR, channel.avatar_url))
+    if (avatarPath.startsWith(UPLOADS_ROOT) && fs.existsSync(avatarPath)) {
+      try {
+        fs.unlinkSync(avatarPath)
+      } catch (err) {
+        warn('[CHANNELS] avatar delete failed', err.message)
+      }
+    }
+  }
+  updateChannelAvatarStmt.run('', 0, '', channel.id)
+  const updated = selectChannelByIdStmt.get(channel.id)
+  emitChannelListForUsers(getChannelAudienceUserIds(updated))
+  const updatedAccess = updated.is_private ? resolveChannelAccess(viewer, updated.id) : { allowed: true, role: '' }
+  const roleForResponse = updated.is_private
+    ? updatedAccess.role || (viewer.role === 'admin' ? 'admin' : '')
+    : viewer.role === 'admin'
+      ? 'admin'
+      : ''
+  const payload = publicChannel(updated, {
+    memberCount: updated.is_private ? getChannelMemberCount(updated.id) : 0,
+    membershipRole: roleForResponse,
+  })
+  log('[CHANNELS] avatar removed', updated.id, 'actor=' + viewer.id)
+  res.json({ channel: payload })
+})
+
+app.get('/api/channels/:id/avatar', (req, res) => {
+  const channel = selectChannelByIdStmt.get(req.params.id)
+  if (!channel?.avatar_url) {
+    return res.status(404).json({ error: 'not_found' })
+  }
+  const avatarPath = path.resolve(path.join(UPLOAD_DIR, channel.avatar_url))
+  if (!avatarPath.startsWith(UPLOADS_ROOT)) return res.status(403).json({ error: 'forbidden' })
+  if (!fs.existsSync(avatarPath)) {
+    warn('[CHANNELS] avatar missing file', req.params.id)
+    return res.status(404).json({ error: 'missing_file' })
+  }
+  if (channel.avatar_mime) res.setHeader('Content-Type', channel.avatar_mime)
+  if (channel.avatar_updated_at) res.setHeader('Last-Modified', new Date(channel.avatar_updated_at).toUTCString())
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  res.sendFile(avatarPath)
 })
 
 app.get('/api/users', auth, (req, res) => {
@@ -1099,7 +1354,7 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
 
 app.get('/api/voice-rooms', auth, (req, res) => {
   const viewer = selectUserById.get(req.user.id) || req.user
-  const rooms = getVoiceRoomsForUser(viewer).map((room) => formatVoiceRoom(room, viewer))
+  const rooms = getVoiceRoomsForUser(viewer).map((room) => publicVoiceRoom(room, viewer))
   res.json({ rooms })
 })
 
@@ -1119,7 +1374,7 @@ app.post('/api/voice-rooms', auth, (req, res) => {
     insertVoiceRoomMemberStmt.run(id, userId, adminSet.has(userId) ? 'admin' : 'member', now, viewer.id)
   })
   emitVoiceRoomsUpdate()
-  res.status(201).json({ room: formatVoiceRoom({ id, name, created_at: now, created_by: viewer.id }, viewer) })
+  res.status(201).json({ room: publicVoiceRoom({ id, name, created_at: now, created_by: viewer.id }, viewer) })
 })
 
 app.delete('/api/voice-rooms/:id', auth, (req, res) => {
@@ -1135,6 +1390,16 @@ app.delete('/api/voice-rooms/:id', auth, (req, res) => {
       if (targetSocket) {
         targetSocket.emit('voice:room-closed', { roomId: room.id })
         leaveVoiceRoom(targetSocket, { silent: true })
+      }
+    }
+  }
+  if (room.avatar_url) {
+    const avatarPath = path.resolve(path.join(UPLOAD_DIR, room.avatar_url))
+    if (avatarPath.startsWith(UPLOADS_ROOT) && fs.existsSync(avatarPath)) {
+      try {
+        fs.unlinkSync(avatarPath)
+      } catch (err) {
+        warn('[VOICE] avatar cleanup failed', err.message)
       }
     }
   }
@@ -1184,7 +1449,85 @@ app.post('/api/voice-rooms/:id/members', auth, (req, res) => {
   }
 
   emitVoiceRoomsUpdate()
-  res.json({ room: formatVoiceRoom({ ...room }, viewer) })
+  res.json({ room: publicVoiceRoom({ ...room }, viewer) })
+})
+
+app.post('/api/voice-rooms/:id/avatar', auth, (req, res) => {
+  voiceAvatarUpload.single('avatar')(req, res, (err) => {
+    if (err) {
+      warn('[VOICE] avatar upload failed', err?.message || err)
+      const code = err.code === 'LIMIT_FILE_SIZE' ? 'avatar_too_large' : 'invalid_avatar'
+      return res.status(400).json({ error: code })
+    }
+    if (!req.file) return res.status(400).json({ error: 'invalid_avatar' })
+
+    const viewer = selectUserById.get(req.user.id)
+    if (!viewer) return res.status(404).json({ error: 'not_found' })
+    const room = selectVoiceRoomStmt.get(req.params.id)
+    if (!room) return res.status(404).json({ error: 'not_found' })
+    if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
+
+    const relPath = path.relative(UPLOAD_DIR, req.file.path)
+    const previousPath = room.avatar_url ? path.join(UPLOAD_DIR, room.avatar_url) : ''
+    updateVoiceRoomAvatarStmt.run(relPath, Date.now(), req.file.mimetype || '', room.id)
+    if (previousPath && fs.existsSync(previousPath) && path.resolve(previousPath).startsWith(UPLOADS_ROOT)) {
+      if (path.resolve(previousPath) !== path.resolve(req.file.path)) {
+        try {
+          fs.unlinkSync(previousPath)
+        } catch (error) {
+          warn('[VOICE] avatar cleanup failed', error.message)
+        }
+      }
+    }
+
+    const updated = selectVoiceRoomStmt.get(room.id)
+    const membership = selectVoiceRoomMemberStmt.get(room.id, viewer.id)
+    const payload = publicVoiceRoom({ ...updated, membership_role: membership?.role || '' }, viewer)
+    emitVoiceRoomsUpdate()
+    log('[VOICE] avatar updated', room.id, 'actor=' + viewer.id)
+    res.json({ room: payload })
+  })
+})
+
+app.delete('/api/voice-rooms/:id/avatar', auth, (req, res) => {
+  const viewer = selectUserById.get(req.user.id)
+  if (!viewer) return res.status(404).json({ error: 'not_found' })
+  const room = selectVoiceRoomStmt.get(req.params.id)
+  if (!room) return res.status(404).json({ error: 'not_found' })
+  if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
+
+  if (room.avatar_url) {
+    const avatarPath = path.resolve(path.join(UPLOAD_DIR, room.avatar_url))
+    if (avatarPath.startsWith(UPLOADS_ROOT) && fs.existsSync(avatarPath)) {
+      try {
+        fs.unlinkSync(avatarPath)
+      } catch (err) {
+        warn('[VOICE] avatar delete failed', err.message)
+      }
+    }
+  }
+  updateVoiceRoomAvatarStmt.run('', 0, '', room.id)
+  const updated = selectVoiceRoomStmt.get(room.id)
+  const membership = selectVoiceRoomMemberStmt.get(room.id, viewer.id)
+  const payload = publicVoiceRoom({ ...updated, membership_role: membership?.role || '' }, viewer)
+  emitVoiceRoomsUpdate()
+  log('[VOICE] avatar removed', room.id, 'actor=' + viewer.id)
+  res.json({ room: payload })
+})
+
+app.get('/api/voice-rooms/:id/avatar', (req, res) => {
+  const room = selectVoiceRoomStmt.get(req.params.id)
+  if (!room?.avatar_url) return res.status(404).json({ error: 'not_found' })
+  const avatarPath = path.resolve(path.join(UPLOAD_DIR, room.avatar_url))
+  if (!avatarPath.startsWith(UPLOADS_ROOT)) return res.status(403).json({ error: 'forbidden' })
+  if (!fs.existsSync(avatarPath)) {
+    warn('[VOICE] avatar missing file', req.params.id)
+    return res.status(404).json({ error: 'missing_file' })
+  }
+  if (room.avatar_mime) res.setHeader('Content-Type', room.avatar_mime)
+  if (room.avatar_updated_at) res.setHeader('Last-Modified', new Date(room.avatar_updated_at).toUTCString())
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  res.sendFile(avatarPath)
 })
 
 app.patch('/api/admin/users/:id/role', auth, adminOnly, (req, res) => {
@@ -1242,6 +1585,20 @@ app.delete('/api/admin/users/:id/avatar', auth, adminOnly, (req, res) => {
   res.json({ user: payload })
 })
 
+const imageFileFilter = (_req, file, cb) => {
+  if (!file?.mimetype?.startsWith('image/')) {
+    cb(new Error('invalid_avatar_type'))
+    return
+  }
+  cb(null, true)
+}
+
+const sanitizeForPath = (value, fallback = 'unknown') => {
+  if (!value || typeof value !== 'string') return fallback
+  const cleaned = value.replace(/[^a-zA-Z0-9_-]/g, '')
+  return cleaned || fallback
+}
+
 const avatarStorage = multer.diskStorage({
   destination: (req, _file, cb) => {
     const target = path.join(AVATAR_DIR, req.user.id)
@@ -1260,13 +1617,51 @@ const avatarStorage = multer.diskStorage({
 const avatarUpload = multer({
   storage: avatarStorage,
   limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    if (!file?.mimetype?.startsWith('image/')) {
-      cb(new Error('invalid_avatar_type'))
-      return
-    }
-    cb(null, true)
+  fileFilter: imageFileFilter,
+})
+
+const channelAvatarStorage = multer.diskStorage({
+  destination: (req, _file, cb) => {
+    const safeId = sanitizeForPath(req.params?.id, 'unknown')
+    const target = path.join(CHANNEL_AVATAR_DIR, safeId)
+    fs.mkdirSync(target, { recursive: true })
+    cb(null, target)
   },
+  filename: (_req, file, cb) => {
+    const ext = (path.extname(file.originalname || '') || '.png').toLowerCase()
+    const allowed = ['.png', '.jpg', '.jpeg', '.gif', '.webp']
+    const safeExt = allowed.includes(ext) ? ext : '.png'
+    const name = Date.now().toString() + safeExt
+    cb(null, name)
+  },
+})
+
+const voiceAvatarStorage = multer.diskStorage({
+  destination: (req, _file, cb) => {
+    const safeId = sanitizeForPath(req.params?.id, 'unknown')
+    const target = path.join(VOICE_AVATAR_DIR, safeId)
+    fs.mkdirSync(target, { recursive: true })
+    cb(null, target)
+  },
+  filename: (_req, file, cb) => {
+    const ext = (path.extname(file.originalname || '') || '.png').toLowerCase()
+    const allowed = ['.png', '.jpg', '.jpeg', '.gif', '.webp']
+    const safeExt = allowed.includes(ext) ? ext : '.png'
+    const name = Date.now().toString() + safeExt
+    cb(null, name)
+  },
+})
+
+const channelAvatarUpload = multer({
+  storage: channelAvatarStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: imageFileFilter,
+})
+
+const voiceAvatarUpload = multer({
+  storage: voiceAvatarStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: imageFileFilter,
 })
 
 const upload = multer({ storage: multer.memoryStorage() })
@@ -1382,6 +1777,7 @@ app.delete('/api/messages/:id', auth, (req, res) => {
   }
   if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
     return res.status(403).json({ error: 'forbidden' })
+  if (clearMessageRepliesStmt) clearMessageRepliesStmt.run(message.id)
   deleteMessageStmt.run(message.id)
   io.to(message.channel_id).emit('message:deleted', { id: message.id, channelId: message.channel_id })
   if (message.channel_id.startsWith('dm:')) {
@@ -1412,22 +1808,31 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   if (message.sender_id !== req.user.id && req.user.role !== 'admin' && !isChannelOwner)
     return res.status(403).json({ error: 'forbidden' })
 
-  const updatedAtRaw = Date.now()
-  if (hasMessageUpdatedAtColumn) {
-    updateMessageContentStmt.run(encryptText(rawContent), updatedAtRaw, message.id)
-  } else {
-    updateMessageContentStmt.run(encryptText(rawContent), message.id)
+  let nextReplyId = null
+  if (hasMessageReplyColumn) {
+    const bodyHasReply = Object.prototype.hasOwnProperty.call(req.body || {}, 'replyTo')
+    if (bodyHasReply) {
+      const rawReply = req.body.replyTo
+      if (rawReply === null || rawReply === '' || typeof rawReply === 'undefined') {
+        nextReplyId = null
+      } else if (typeof rawReply === 'string') {
+        const parent = findMessageById.get(rawReply)
+        if (!parent || parent.channel_id !== message.channel_id) return res.status(400).json({ error: 'invalid_reply' })
+        nextReplyId = rawReply
+      } else {
+        return res.status(400).json({ error: 'invalid_reply' })
+      }
+    } else {
+      nextReplyId = message.reply_to ?? null
+    }
   }
-  const updatedAt = hasMessageUpdatedAtColumn ? updatedAtRaw : 0
 
-  const payload = {
-    id: message.id,
-    channelId: message.channel_id,
-    senderId: message.sender_id,
-    content: rawContent,
-    createdAt: message.created_at,
-    updatedAt,
-  }
+  const updatedAtRaw = Date.now()
+  updateMessageContentStmt(encryptText(rawContent), updatedAtRaw, nextReplyId, message.id)
+
+  const fresh = selectMessageFullById.get(message.id)
+  const payload = publicMessage(fresh)
+
   io.to(message.channel_id).emit('message:updated', payload)
   if (message.channel_id.startsWith('dm:')) {
     const participants = parseDirectChannelId(message.channel_id)
@@ -1445,11 +1850,40 @@ app.patch('/api/messages/:id', auth, (req, res) => {
 })
 
 const onlineUsers = new Map()
-const listMessages = db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
+const listMessages = hasMessageReplyColumn
+  ? db.prepare(
+      `${messageSelectBase} WHERE m.channel_id=? ORDER BY m.created_at DESC LIMIT ? OFFSET ?`,
+    )
+  : db.prepare('SELECT * FROM messages WHERE channel_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?')
 
-const insertMessage = hasMessageUpdatedAtColumn
-  ? db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
-  : db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+const insertMessage = (() => {
+  if (hasMessageReplyColumn && hasMessageUpdatedAtColumn) {
+    const stmt = db.prepare(
+      'INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at,reply_to) VALUES (?,?,?,?,?,0,?)',
+    )
+    return {
+      run: (id, channelId, senderId, content, createdAt, replyTo) => stmt.run(id, channelId, senderId, content, createdAt, replyTo || null),
+    }
+  }
+  if (hasMessageReplyColumn) {
+    const stmt = db.prepare(
+      'INSERT INTO messages (id,channel_id,sender_id,content,created_at,reply_to) VALUES (?,?,?,?,?,?)',
+    )
+    return {
+      run: (id, channelId, senderId, content, createdAt, replyTo) => stmt.run(id, channelId, senderId, content, createdAt, replyTo || null),
+    }
+  }
+  if (hasMessageUpdatedAtColumn) {
+    const stmt = db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at,updated_at) VALUES (?,?,?,?,?,0)')
+    return {
+      run: (id, channelId, senderId, content, createdAt) => stmt.run(id, channelId, senderId, content, createdAt),
+    }
+  }
+  const stmt = db.prepare('INSERT INTO messages (id,channel_id,sender_id,content,created_at) VALUES (?,?,?,?,?)')
+  return {
+    run: (id, channelId, senderId, content, createdAt) => stmt.run(id, channelId, senderId, content, createdAt),
+  }
+})()
 
 const voiceParticipants = new Map()
 const typingState = new Map()
@@ -1471,19 +1905,49 @@ const normalizeVoiceRoomMembers = (roomId) =>
     addedAt: member.added_at,
   }))
 
-const formatVoiceRoom = (room, viewer) => {
-  const baseRole = room.membership_role || (viewer?.id && room.created_by === viewer.id ? 'owner' : '')
-  const membershipRole = viewer?.role === 'admin' && !baseRole ? 'admin' : baseRole
-  const payload = {
+const normalizeVoiceRoomRow = (room) => {
+  if (!room) return null
+  const avatarPath = room.avatar_url ?? room.avatarUrl ?? ''
+  const avatarUpdatedAt = room.avatar_updated_at ?? room.avatarUpdatedAt ?? 0
+  return {
     id: room.id,
     name: room.name,
     createdAt: room.created_at,
     createdBy: room.created_by || '',
-    participantCount: voiceParticipants.get(room.id)?.size || 0,
-    membershipRole: membershipRole || '',
+    membershipRole: room.membership_role || room.membershipRole || '',
+    participantCount: room.participant_count ?? room.participantCount ?? 0,
+    avatarUrl: avatarPath ? `/api/voice-rooms/${room.id}/avatar` : '',
+    avatarUpdatedAt,
+    members: room.members,
   }
-  if (membershipRole === 'owner' || membershipRole === 'admin') {
-    payload.members = normalizeVoiceRoomMembers(room.id)
+}
+
+const publicVoiceRoom = (room, viewer, extras = {}) => {
+  if (!room) return null
+  const normalized = room && typeof room.createdAt !== 'undefined' && typeof room.membershipRole !== 'undefined'
+    ? room
+    : normalizeVoiceRoomRow(room)
+  if (!normalized) return null
+  const baseRole = normalized.membershipRole || (viewer?.id && normalized.createdBy === viewer.id ? 'owner' : '')
+  const membershipRole = viewer?.role === 'admin' && !baseRole ? 'admin' : baseRole
+  const participantCount =
+    typeof extras.participantCount === 'number'
+      ? extras.participantCount
+      : normalized.participantCount || voiceParticipants.get(normalized.id)?.size || 0
+  const payload = {
+    id: normalized.id,
+    name: normalized.name,
+    createdAt: normalized.createdAt,
+    createdBy: normalized.createdBy,
+    participantCount,
+    membershipRole: membershipRole || '',
+    avatarUrl: normalized.avatarUrl,
+    avatarUpdatedAt: normalized.avatarUpdatedAt,
+  }
+  if (Array.isArray(normalized.members)) {
+    payload.members = normalized.members
+  } else if (membershipRole === 'owner' || membershipRole === 'admin') {
+    payload.members = normalizeVoiceRoomMembers(normalized.id)
   }
   return payload
 }
@@ -1517,7 +1981,7 @@ const emitVoiceRoomsUpdate = () => {
   for (const socket of io.sockets.sockets.values()) {
     if (!socket.user) continue
     const rooms = getVoiceRoomsForUser(socket.user)
-    socket.emit('voice:rooms:update', { rooms: rooms.map((room) => formatVoiceRoom(room, socket.user)) })
+    socket.emit('voice:rooms:update', { rooms: rooms.map((room) => publicVoiceRoom(room, socket.user)) })
   }
 }
 
@@ -1718,7 +2182,7 @@ io.on('connection', (socket) => {
       if (currentChannelId) ensureChannelJoined(currentChannelId)
       else leaveMessageRooms()
     }
-    const messages = currentChannelId ? decryptMessages(listMessages.all(currentChannelId, limit, offset)).reverse() : []
+    const messages = currentChannelId ? publicMessages(listMessages.all(currentChannelId, limit, offset)).reverse() : []
     socket.emit('init:response', { workspaces: [{ id: wsId, name: 'Home' }], channels, activeChannelId: currentChannelId, messages })
   })
 
@@ -1731,7 +2195,7 @@ io.on('connection', (socket) => {
       const normalized = normalizeDirectChannelId(channelId)
       if (!normalized) return
       ensureChannelJoined(normalized)
-      const msgs = decryptMessages(listMessages.all(normalized, 50, 0)).reverse()
+      const msgs = publicMessages(listMessages.all(normalized, 50, 0)).reverse()
       socket.emit('channel:opened', { channelId: normalized, messages: msgs })
       return
     }
@@ -1739,11 +2203,11 @@ io.on('connection', (socket) => {
     const access = resolveChannelAccess(userRecord, channelId)
     if (!access.allowed) return
     ensureChannelJoined(channelId)
-    const msgs = decryptMessages(listMessages.all(channelId, 50, 0)).reverse()
+    const msgs = publicMessages(listMessages.all(channelId, 50, 0)).reverse()
     socket.emit('channel:opened', { channelId, messages: msgs })
   })
 
-  socket.on('message:send', ({ channelId, content }) => {
+  socket.on('message:send', ({ channelId, content, replyTo }) => {
     if (!channelId || !content) return
     let targetChannel = channelId
     let directParticipants = null
@@ -1760,11 +2224,24 @@ io.on('connection', (socket) => {
       if (!access.allowed) return
       targetChannel = channelId
     }
+    let replyTargetId = null
+    if (hasMessageReplyColumn) {
+      if (replyTo === null || typeof replyTo === 'undefined' || replyTo === '') {
+        replyTargetId = null
+      } else if (typeof replyTo === 'string') {
+        const parent = findMessageById.get(replyTo)
+        if (!parent || parent.channel_id !== targetChannel) return
+        replyTargetId = replyTo
+      } else {
+        return
+      }
+    }
     const id = uuidv4()
     const now = Date.now()
     const encryptedContent = encryptText(content)
-    insertMessage.run(id, targetChannel, userId, encryptedContent, now)
-    const payload = { id, channelId: targetChannel, senderId: userId, content, createdAt: now, updatedAt: 0 }
+    insertMessage.run(id, targetChannel, userId, encryptedContent, now, replyTargetId)
+    const inserted = selectMessageFullById.get(id)
+    const payload = publicMessage(inserted)
     io.to(targetChannel).emit('message:new', payload)
     log('[MESSAGE] send', 'user=' + userId, 'channel=' + targetChannel, 'bytes=' + Buffer.byteLength(content, 'utf8'))
     if (directParticipants) {
@@ -1794,7 +2271,7 @@ io.on('connection', (socket) => {
       if (!access.allowed) return
       targetChannel = channelId
     }
-    const msgs = decryptMessages(listMessages.all(targetChannel, limit, offset)).reverse()
+    const msgs = publicMessages(listMessages.all(targetChannel, limit, offset)).reverse()
     socket.emit('messages:page', { channelId: targetChannel, messages: msgs, offset, limit })
   })
 

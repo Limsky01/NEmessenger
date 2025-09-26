@@ -100,6 +100,20 @@ const loadStoredDevice = (key) => {
   }
 }
 
+const loadStoredVolume = () => {
+  try {
+    const raw = localStorage.getItem('audioVolume')
+    if (!raw) return 1
+    const value = parseFloat(raw)
+    if (Number.isFinite(value)) {
+      return Math.min(Math.max(value, 0), 1)
+    }
+  } catch (err) {
+    console.warn('audio volume restore failed', err)
+  }
+  return 1
+}
+
 const teardownVoicePeer = (socketId, set) => {
   const pc = voicePeerConnections.get(socketId)
   if (pc) {
@@ -273,6 +287,36 @@ const normalizeChannel = (raw) => {
     createdBy: raw.createdBy ?? raw.created_by ?? '',
     memberCount: raw.memberCount ?? raw.member_count ?? 0,
     membershipRole: raw.membershipRole ?? raw.membership_role ?? '',
+    avatarUrl: raw.avatarUrl ?? raw.avatar_url ?? '',
+    avatarUpdatedAt: raw.avatarUpdatedAt ?? raw.avatar_updated_at ?? 0,
+  }
+}
+
+const normalizeVoiceMember = (raw) => {
+  if (!raw) return null
+  return {
+    userId: raw.userId ?? raw.user_id ?? '',
+    username: raw.username ?? '',
+    role: raw.role ?? 'member',
+    addedAt: raw.addedAt ?? raw.added_at ?? 0,
+  }
+}
+
+const normalizeVoiceRoom = (raw) => {
+  if (!raw) return null
+  const members = Array.isArray(raw.members)
+    ? raw.members.map(normalizeVoiceMember).filter(Boolean)
+    : undefined
+  return {
+    id: raw.id,
+    name: raw.name ?? 'Voice room',
+    createdAt: raw.createdAt ?? raw.created_at ?? 0,
+    createdBy: raw.createdBy ?? raw.created_by ?? '',
+    participantCount: raw.participantCount ?? raw.participant_count ?? 0,
+    membershipRole: raw.membershipRole ?? raw.membership_role ?? '',
+    avatarUrl: raw.avatarUrl ?? raw.avatar_url ?? '',
+    avatarUpdatedAt: raw.avatarUpdatedAt ?? raw.avatar_updated_at ?? 0,
+    members,
   }
 }
 
@@ -326,11 +370,40 @@ const enc = {
   },
 }
 
+const replyAttachmentPattern = /\[file:[^\]]+\]/g
+
+const buildReplyPreview = (content, fallback = 'Без текста') => {
+  if (typeof content !== 'string') return fallback
+  const attachments = content.match(replyAttachmentPattern) || []
+  const text = content.replace(replyAttachmentPattern, ' ').replace(/\s+/g, ' ').trim()
+  if (text) return text.length > 140 ? `${text.slice(0, 137)}...` : text
+  if (attachments.length === 1) return 'Вложение'
+  if (attachments.length > 1) return `Вложения (${attachments.length})`
+  return fallback
+}
+
 const formatMessage = (fallbackChannelId) => (raw) => {
   if (!raw) return null
   const channelId = raw.channelId ?? raw.channel_id ?? fallbackChannelId
   const senderId = raw.senderId ?? raw.sender_id ?? raw.user_id ?? null
   const createdAt = raw.createdAt ?? raw.created_at ?? Date.now()
+  const replyRaw = raw.replyTo ?? raw.reply_to ?? null
+  let replyTo = null
+  if (replyRaw?.id) {
+    const replyChannelId = replyRaw.channelId ?? replyRaw.channel_id ?? channelId
+    const encryptedReplyContent = replyRaw.content ?? replyRaw.reply_content ?? null
+    const decryptedReplyContent =
+      typeof encryptedReplyContent === 'string' ? enc.decrypt(replyChannelId, encryptedReplyContent) : ''
+    const replyFallback = encryptedReplyContent == null ? 'Сообщение недоступно' : 'Без текста'
+    const preview = buildReplyPreview(decryptedReplyContent, replyFallback)
+    replyTo = {
+      id: replyRaw.id,
+      authorId: replyRaw.senderId ?? replyRaw.sender_id ?? replyRaw.authorId ?? null,
+      author: replyRaw.senderUsername ?? replyRaw.sender_username ?? replyRaw.author ?? null,
+      preview,
+      missing: encryptedReplyContent == null,
+    }
+  }
   return {
     id: raw.id,
     channelId,
@@ -338,6 +411,7 @@ const formatMessage = (fallbackChannelId) => (raw) => {
     createdAt,
     updatedAt: raw.updatedAt ?? raw.updated_at ?? 0,
     content: enc.decrypt(channelId, raw.content),
+    replyTo,
   }
 }
 
@@ -371,6 +445,7 @@ const useStore = create((set, get) => ({
   audioDevices: { inputs: [], outputs: [] },
   audioInputDeviceId: loadStoredDevice('audioInputDeviceId'),
   audioOutputDeviceId: loadStoredDevice('audioOutputDeviceId'),
+  audioVolume: loadStoredVolume(),
   voiceRooms: [],
   voiceParticipants: {},
   voiceRemoteStreams: {},
@@ -418,6 +493,32 @@ const useStore = create((set, get) => ({
       return null
     }
   },
+  buildChannelAvatarUrl: (channel) => {
+    if (!channel?.avatarUrl) return null
+    try {
+      const server = get().serverUrl
+      const base = server.endsWith('/') ? server : `${server}/`
+      const url = new URL(channel.avatarUrl, base)
+      if (channel.avatarUpdatedAt) url.searchParams.set('v', channel.avatarUpdatedAt)
+      return url.toString()
+    } catch (err) {
+      console.error('channel avatar url build failed', err)
+      return null
+    }
+  },
+  buildVoiceRoomAvatarUrl: (room) => {
+    if (!room?.avatarUrl) return null
+    try {
+      const server = get().serverUrl
+      const base = server.endsWith('/') ? server : `${server}/`
+      const url = new URL(room.avatarUrl, base)
+      if (room.avatarUpdatedAt) url.searchParams.set('v', room.avatarUpdatedAt)
+      return url.toString()
+    } catch (err) {
+      console.error('voice avatar url build failed', err)
+      return null
+    }
+  },
   refreshAudioDevices: async () => {
     if (!navigator?.mediaDevices?.enumerateDevices) return
     try {
@@ -449,6 +550,15 @@ const useStore = create((set, get) => ({
       }
       set({ audioOutputDeviceId: deviceId || null })
     }
+  },
+  setAudioVolume: (value) => {
+    const next = Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 1
+    try {
+      localStorage.setItem('audioVolume', String(next))
+    } catch (err) {
+      console.warn('audio volume save failed', err)
+    }
+    set({ audioVolume: next })
   },
   joinVoiceRoom: async (roomId) => {
     const socket = get().socket
@@ -502,9 +612,11 @@ const useStore = create((set, get) => ({
       payload,
       { headers: buildAuthHeaders(token) },
     )
-    if (data?.room) {
-      set((state) => ({ voiceRooms: [...state.voiceRooms.filter((room) => room.id !== data.room.id), data.room] }))
+    const room = normalizeVoiceRoom(data?.room)
+    if (room) {
+      set((state) => ({ voiceRooms: [...state.voiceRooms.filter((entry) => entry.id !== room.id), room] }))
     }
+    return room
   },
   updateVoiceRoomMembers: async (roomId, { upserts = [], remove = [] } = {}) => {
     const token = get().token
@@ -514,13 +626,15 @@ const useStore = create((set, get) => ({
       { upserts, remove },
       { headers: buildAuthHeaders(token) },
     )
-    if (data?.room) {
+    const room = normalizeVoiceRoom(data?.room)
+    if (room) {
       set((state) => ({
-        voiceRooms: state.voiceRooms.some((room) => room.id === roomId)
-          ? state.voiceRooms.map((room) => (room.id === roomId ? { ...room, ...data.room } : room))
-          : [...state.voiceRooms, data.room],
+        voiceRooms: state.voiceRooms.some((entry) => entry.id === roomId)
+          ? state.voiceRooms.map((entry) => (entry.id === roomId ? { ...entry, ...room } : entry))
+          : [...state.voiceRooms, room],
       }))
     }
+    return room
   },
   deleteVoiceRoom: async (roomId) => {
     const token = get().token
@@ -531,6 +645,42 @@ const useStore = create((set, get) => ({
       voiceParticipants: { ...state.voiceParticipants, [roomId]: [] },
     }))
     if (get().activeVoiceRoomId === roomId) get().leaveVoiceRoom(false)
+  },
+  uploadVoiceRoomAvatar: async (roomId, file) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!roomId || !file) throw new Error('invalid_payload')
+    const form = new FormData()
+    form.append('avatar', file)
+    const { data } = await axios.post(`${get().serverUrl}/api/voice-rooms/${roomId}/avatar`, form, {
+      headers: buildAuthHeaders(token),
+    })
+    const room = normalizeVoiceRoom(data?.room)
+    if (room) {
+      set((state) => ({
+        voiceRooms: state.voiceRooms.some((entry) => entry.id === room.id)
+          ? state.voiceRooms.map((entry) => (entry.id === room.id ? { ...entry, ...room } : entry))
+          : [...state.voiceRooms, room],
+      }))
+    }
+    return room
+  },
+  deleteVoiceRoomAvatar: async (roomId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!roomId) throw new Error('invalid_room')
+    const { data } = await axios.delete(`${get().serverUrl}/api/voice-rooms/${roomId}/avatar`, {
+      headers: buildAuthHeaders(token),
+    })
+    const room = normalizeVoiceRoom(data?.room)
+    if (room) {
+      set((state) => ({
+        voiceRooms: state.voiceRooms.some((entry) => entry.id === room.id)
+          ? state.voiceRooms.map((entry) => (entry.id === room.id ? { ...entry, ...room } : entry))
+          : [...state.voiceRooms, room],
+      }))
+    }
+    return room
   },
 
   cancelReconnectCountdown: () => {
@@ -680,7 +830,7 @@ const useStore = create((set, get) => ({
       }
       try {
         const { data: voiceData } = await axios.get(`${server}/api/voice-rooms`, { headers: buildAuthHeaders(get().token) })
-        set({ voiceRooms: (voiceData.rooms || []).map((room) => ({ ...room })) })
+        set({ voiceRooms: (voiceData.rooms || []).map(normalizeVoiceRoom).filter(Boolean) })
       } catch (err) {
         console.error('voice rooms fetch failed', err)
       }
@@ -904,7 +1054,7 @@ const useStore = create((set, get) => ({
 
     socket.on('presence:update', ({ onlineUserIds }) => set({ onlineUserIds }))
     socket.on('voice:rooms:update', ({ rooms }) => {
-      if (Array.isArray(rooms)) set({ voiceRooms: rooms.map((room) => ({ ...room })) })
+      if (Array.isArray(rooms)) set({ voiceRooms: rooms.map(normalizeVoiceRoom).filter(Boolean) })
     })
     socket.on('voice:state', ({ roomId, participants }) => {
       if (!roomId) return
@@ -1050,25 +1200,25 @@ const useStore = create((set, get) => ({
     socket.emit('channel:switch', { channelId })
   },
 
-  sendMessage: (content) => {
+  sendMessage: (content, replyTo = null) => {
     const socket = get().socket
     const channelId = get().activeChannelId
     if (!socket || !channelId || !content.trim()) return
     const encrypted = enc.encrypt(channelId, content.trim())
-    socket.emit('message:send', { channelId, content: encrypted })
+    socket.emit('message:send', { channelId, content: encrypted, replyTo: replyTo || null })
   },
 
-  editMessage: async (messageId, channelId, content) => {
+  editMessage: async (messageId, channelId, content, replyTo = undefined) => {
     const token = get().token
     if (!token) throw new Error('not_authenticated')
     const trimmed = typeof content === 'string' ? content.trim() : ''
     if (!trimmed) throw new Error('invalid_content')
     const encrypted = enc.encrypt(channelId, trimmed)
-    await axios.patch(
-      `${get().serverUrl}/api/messages/${messageId}`,
-      { content: encrypted },
-      { headers: buildAuthHeaders(token) },
-    )
+    const payload = { content: encrypted }
+    if (typeof replyTo !== 'undefined') payload.replyTo = replyTo
+    await axios.patch(`${get().serverUrl}/api/messages/${messageId}`, payload, {
+      headers: buildAuthHeaders(token),
+    })
   },
 
   deleteMessage: async (messageId) => {
@@ -1119,6 +1269,42 @@ const useStore = create((set, get) => ({
       : []
     if (channel && members.length) {
       set((state) => ({ channelMembers: { ...state.channelMembers, [channel.id]: members } }))
+    }
+    return channel
+  },
+  uploadChannelAvatar: async (channelId, file) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!channelId || !file) throw new Error('invalid_payload')
+    const form = new FormData()
+    form.append('avatar', file)
+    const { data } = await axios.post(`${get().serverUrl}/api/channels/${channelId}/avatar`, form, {
+      headers: buildAuthHeaders(token),
+    })
+    const channel = normalizeChannel(data?.channel)
+    if (channel) {
+      set((state) => ({
+        channels: state.channels.some((entry) => entry.id === channel.id)
+          ? state.channels.map((entry) => (entry.id === channel.id ? { ...entry, ...channel } : entry))
+          : [...state.channels, channel],
+      }))
+    }
+    return channel
+  },
+  deleteChannelAvatar: async (channelId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!channelId) throw new Error('invalid_channel')
+    const { data } = await axios.delete(`${get().serverUrl}/api/channels/${channelId}/avatar`, {
+      headers: buildAuthHeaders(token),
+    })
+    const channel = normalizeChannel(data?.channel)
+    if (channel) {
+      set((state) => ({
+        channels: state.channels.some((entry) => entry.id === channel.id)
+          ? state.channels.map((entry) => (entry.id === channel.id ? { ...entry, ...channel } : entry))
+          : [...state.channels, channel],
+      }))
     }
     return channel
   },

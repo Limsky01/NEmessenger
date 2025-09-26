@@ -224,11 +224,14 @@ const guessFileDescriptor = (file) => {
 function AudioAttachment({ token, openFile }) {
   const { fileName, inlineUrl } = useAttachmentMeta(token)
   const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const audioVolume = useStore((s) => s.audioVolume)
+  const setAudioVolume = useStore((s) => s.setAudioVolume)
   const audioRef = useRef(null)
   const [duration, setDuration] = useState(0)
   const [currentTime, setCurrentTime] = useState(0)
   const [loading, setLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
+  const [volume, setVolume] = useState(typeof audioVolume === 'number' ? audioVolume : 1)
 
   useEffect(() => {
     const element = audioRef.current
@@ -293,6 +296,19 @@ function AudioAttachment({ token, openFile }) {
     }
   }, [inlineUrl, audioOutputDeviceId])
 
+  useEffect(() => {
+    if (typeof audioVolume === 'number' && !Number.isNaN(audioVolume)) {
+      setVolume((prev) => (prev === audioVolume ? prev : audioVolume))
+    }
+  }, [audioVolume])
+
+  useEffect(() => {
+    const element = audioRef.current
+    if (!element) return
+    const next = Number.isFinite(volume) ? Math.min(Math.max(volume, 0), 1) : 1
+    element.volume = next
+  }, [volume])
+
   useEffect(
     () => () => {
       const element = audioRef.current
@@ -320,6 +336,18 @@ function AudioAttachment({ token, openFile }) {
     if (Number.isFinite(value)) {
       element.currentTime = Math.max(0, Math.min(value, element.duration || value))
     }
+  }
+
+  const handleVolumeChange = (event) => {
+    const value = Number(event.target.value)
+    if (!Number.isFinite(value)) return
+    const clamped = Math.min(Math.max(value, 0), 1)
+    setVolume(clamped)
+    if (typeof setAudioVolume === 'function') {
+      setAudioVolume(clamped)
+    }
+    const element = audioRef.current
+    if (element) element.volume = clamped
   }
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0
@@ -367,6 +395,20 @@ function AudioAttachment({ token, openFile }) {
           </div>
           {loading && inlineUrl && <div className="text-[11px] text-white/40">Буферизация...</div>}
           {!inlineUrl && <div className="text-[11px] text-white/40">Загрузка аудио...</div>}
+          <div className="flex items-center gap-2 text-xs text-white/60">
+            <span className="whitespace-nowrap">Громкость:</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={Number.isFinite(volume) ? volume : 1}
+              onChange={handleVolumeChange}
+              className="flex-1"
+              aria-label="Громкость аудио"
+            />
+            <span className="tabular-nums text-white/50">{Math.round((Number.isFinite(volume) ? volume : 1) * 100)}%</span>
+          </div>
         </div>
       </div>
       <audio ref={audioRef} preload="metadata" className="hidden" />
@@ -546,6 +588,7 @@ export default function Chat() {
   const [deleteDialog, setDeleteDialog] = useState(null)
   const [editDialog, setEditDialog] = useState(null)
   const [imagePreview, setImagePreview] = useState(null)
+  const [replyTarget, setReplyTarget] = useState(null)
   const [uploadDialog, setUploadDialog] = useState(null)
   const [membersDialogOpen, setMembersDialogOpen] = useState(false)
   const [membersLoading, setMembersLoading] = useState(false)
@@ -699,6 +742,35 @@ export default function Chat() {
   }
 
   const nameById = (id) => userMap.get(id)?.username || 'user'
+  const summarizeMessage = useCallback((message) => {
+    if (!message) return 'Без текста'
+    const { textSegments, attachments } = extractTextAndAttachments(message.content)
+    const text = textSegments.join(' ').trim()
+    if (text) return text.length > 140 ? `${text.slice(0, 137)}...` : text
+    if (attachments.length === 1) return 'Вложение'
+    if (attachments.length > 1) return `Вложения (${attachments.length})`
+    return 'Без текста'
+  }, [])
+
+  const handleSelectReply = useCallback(
+    (message) => {
+      if (!message) return
+      setReplyTarget({
+        id: message.id,
+        authorId: message.senderId,
+        author: nameById(message.senderId),
+        preview: summarizeMessage(message),
+      })
+      textareaRef.current?.focus()
+    },
+    [nameById, summarizeMessage],
+  )
+
+  const clearReplyTarget = useCallback(() => {
+    setReplyTarget(null)
+    textareaRef.current?.focus()
+  }, [])
+
   const avatarSrcById = (id) => {
     const user = userMap.get(id)
     return user ? buildAvatarUrl?.(user) : null
@@ -712,6 +784,17 @@ export default function Chat() {
   useEffect(() => {
     uploadDialogRef.current = uploadDialog
   }, [uploadDialog])
+
+  useEffect(() => {
+    setReplyTarget(null)
+  }, [activeChannelId])
+
+  useEffect(() => {
+    if (!replyTarget) return
+    if (!messages.some((message) => message.id === replyTarget.id)) {
+      setReplyTarget(null)
+    }
+  }, [messages, replyTarget])
 
   useEffect(
     () => () => {
@@ -818,6 +901,31 @@ export default function Chat() {
     })
   }
 
+  const sendUploadedAttachments = (uploadedFiles, comment = '') => {
+    if (!uploadedFiles.length) return
+    const tokens = uploadedFiles.map((file) => `[file:${file.id}:${file.name}]`)
+    const trimmedComment = comment?.trim()
+    const blocks = []
+    if (trimmedComment) blocks.push(trimmedComment)
+    blocks.push(tokens.join('\n'))
+    const message = blocks.filter(Boolean).join('\n')
+    if (!message) return
+    sendMessage(message)
+    setText('')
+    if (textareaRef.current) {
+      textareaRef.current.value = ''
+    }
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current)
+      typingTimeoutRef.current = null
+    }
+    if (selfTypingRef.current) {
+      emitTypingState(false)
+      selfTypingRef.current = false
+      setSelfTyping(false)
+    }
+  }
+
   const uploadAttachments = async (filesToUpload, comment = '') => {
     if (!filesToUpload.length) return null
     const attachments = []
@@ -831,15 +939,7 @@ export default function Chat() {
         if (uploaded) attachments.push(uploaded)
       }
       if (attachments.length) {
-        const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
-        const blocks = []
-        if (comment) blocks.push(comment)
-        blocks.push(tokens.join('\n'))
-        const addition = blocks.filter(Boolean).join('\n')
-        const currentValue = textareaRef.current ? textareaRef.current.value : text
-        const nextValue = currentValue ? `${currentValue}\n${addition}` : addition
-        handleTextChange(nextValue)
-        return nextValue
+        sendUploadedAttachments(attachments, comment)
       }
     } catch (err) {
       console.error(err)
@@ -902,8 +1002,7 @@ export default function Chat() {
         localStorage.removeItem('uploadOptions')
       }
       await uploadAttachments(processed, dialog.options.comment.trim())
-      cleanupUploadDialog(dialog)
-      setUploadDialog(null)
+      closeUploadDialog()
     } catch (err) {
       console.error(err)
       setUploadDialog((state) => (state ? { ...state, loading: false, error: 'Не удалось загрузить файлы' } : state))
@@ -959,6 +1058,7 @@ export default function Chat() {
     if (!value.trim()) return
     sendMessage(value)
     setText('')
+    clearReplyTarget()
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current)
       typingTimeoutRef.current = null
@@ -1167,6 +1267,13 @@ export default function Chat() {
   const headerSubtitle = isDirectChannel
     ? 'Приватный диалог'
     : currentChannel ? 'Общий канал' : ''
+  const replyTargetAuthorName = replyTarget?.author || (replyTarget?.authorId ? nameById(replyTarget.authorId) : null)
+  const replyTargetAuthorLabel = replyTargetAuthorName
+    ? replyTargetAuthorName.startsWith('@')
+      ? replyTargetAuthorName
+      : `@${replyTargetAuthorName}`
+    : '@user'
+  const replyTargetPreviewText = replyTarget?.preview || 'Без текста'
 
   const uploadDialogItems = uploadDialog?.items || []
   const uploadDialogImageItems = uploadDialogItems.filter((item) => isFileLikelyImage(item.file))
@@ -1210,6 +1317,16 @@ export default function Chat() {
           const canDelete = mine || me?.role === 'admin' || canModerateChannel
           const canEdit = mine || canModerateChannel
           const edited = m.updatedAt && m.updatedAt > (m.createdAt || 0)
+          const replyInfo = m.replyTo || null
+          const replyAuthorRaw = replyInfo?.author || (replyInfo?.authorId ? nameById(replyInfo.authorId) : null)
+          const replyAuthorLabel = replyAuthorRaw
+            ? replyAuthorRaw.startsWith('@')
+              ? replyAuthorRaw
+              : `@${replyAuthorRaw}`
+            : '@user'
+          const replyPreviewText = replyInfo
+            ? replyInfo.preview || (replyInfo.missing ? 'Сообщение недоступно' : 'Без текста')
+            : ''
           return (
             <div key={m.id} className={`max-w-[72%] px-4 py-3 rounded-3xl shadow-glass ${mine ? 'ml-auto panel' : 'glass'}`}>
               <div className="flex items-center justify-between text-[11px] text-white/70 mb-2">
@@ -1221,30 +1338,43 @@ export default function Chat() {
                     {edited ? ' · изменено' : ''}
                   </span>
                 </div>
-                {(canEdit || canDelete) && (
-                  <div className="flex items-center gap-2 text-white/40">
-                    {canEdit && (
-                      <button
-                        type="button"
-                        className="hover:text-white transition"
-                        onClick={() => handleRequestEdit(m)}
-                      >
-                        <EditIcon />
-                      </button>
-                    )}
-                    {canDelete && (
-                      <button
-                        type="button"
-                        className="hover:text-red-400 transition"
-                        onClick={() => handleRequestDelete(m)}
-                      >
-                        <TrashIcon />
-                      </button>
-                    )}
-                  </div>
-                )}
+                <div className="flex items-center gap-2 text-white/40">
+                  <button
+                    type="button"
+                    className="text-xs uppercase tracking-[0.12em] hover:text-white transition"
+                    onClick={() => handleSelectReply(m)}
+                  >
+                    Ответить
+                  </button>
+                  {canEdit && (
+                    <button
+                      type="button"
+                      className="hover:text-white transition"
+                      onClick={() => handleRequestEdit(m)}
+                    >
+                      <EditIcon />
+                    </button>
+                  )}
+                  {canDelete && (
+                    <button
+                      type="button"
+                      className="hover:text-red-400 transition"
+                      onClick={() => handleRequestDelete(m)}
+                    >
+                      <TrashIcon />
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="whitespace-pre-wrap leading-relaxed break-words space-y-3">
+                {replyInfo && (
+                  <div className="px-3 py-2 rounded-2xl bg-white/5 border border-white/10">
+                    <div className="text-xs text-white/50 mb-1">Ответ {replyAuthorLabel}</div>
+                    <div className="text-sm text-white/80 whitespace-pre-wrap break-words">
+                      {replyPreviewText}
+                    </div>
+                  </div>
+                )}
                 {textSegments.filter((segment) => segment && segment.trim()).map((segment, idx) => (
                   <div key={`text-${m.id}-${idx}`}>{segment}</div>
                 ))}
@@ -1270,6 +1400,24 @@ export default function Chat() {
       )}
 
       <div className="px-6 py-4 border-t border-white/10">
+        {replyTarget && (
+          <div className="mb-3 px-4 py-3 rounded-2xl bg-white/10 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-xs text-white/60 uppercase tracking-[0.15em] mb-1">Ответ {replyTargetAuthorLabel}</div>
+              <div className="text-sm text-white/80 whitespace-pre-wrap break-words max-h-24 overflow-hidden">
+                {replyTargetPreviewText}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={clearReplyTarget}
+              className="text-white/60 hover:text-white transition"
+              title="Отменить ответ"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <div className="panel rounded-3xl px-4 py-2 flex items-center gap-3">
           <IconButton onClick={handleFilePick} title="Прикрепить файлы">
             <PaperclipIcon />
