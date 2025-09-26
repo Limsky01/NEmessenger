@@ -88,11 +88,18 @@ const parseAttachmentToken = (token) => {
   const parts = token.split(':')
   const id = parts.shift()
   if (!id) return null
-  const name = parts.join(':') || `file-${id}`
-  return { id, name }
+  let name = parts.join(':') || `file-${id}`
+  let mode
+  if (name.endsWith('|document')) {
+    name = name.slice(0, -'|document'.length)
+    mode = 'file'
+  }
+  if (!name) name = `file-${id}`
+  return { id, name, mode }
 }
 
 const isTokenLikelyImage = (token) => {
+  if (!token || token.mode === 'file') return false
   const name = token?.name || ''
   const mime = token?.mime || ''
   const byMime = typeof mime === 'string' && mime.startsWith('image/')
@@ -167,10 +174,10 @@ const useAttachmentMeta = (token) => {
     ensureFileMeta(token.id).catch((err) => console.error('file meta load failed', err))
   }, [token?.id, meta, ensureFileMeta])
 
-  const resolved = meta || token
+  const resolved = meta ? { ...token, ...meta } : token
   const fileName = resolved?.name || token?.name || 'файл'
   const mime = (resolved?.mime || '').toLowerCase()
-  const isImage = isTokenLikelyImage({ name: fileName, mime })
+  const isImage = isTokenLikelyImage({ ...resolved, name: fileName, mime })
   const isAudio = mime.startsWith('audio/') || /\.(mp3|wav|ogg)$/i.test(fileName)
   const inlineUrl = token?.id ? buildFileUrl?.(token.id, { inline: true }) : null
   return { fileName, mime, isImage, isAudio, inlineUrl }
@@ -891,6 +898,14 @@ export default function Chat() {
     })
   }
 
+  const updateUploadItemMode = (id, mode) => {
+    setUploadDialog((state) => {
+      if (!state) return state
+      const nextItems = state.items.map((item) => (item.id === id ? { ...item, mode } : item))
+      return { ...state, items: nextItems }
+    })
+  }
+
   const removePendingFile = (id) => {
     setUploadDialog((state) => {
       if (!state) return state
@@ -900,46 +915,34 @@ export default function Chat() {
       return { ...state, items: nextItems }
     })
   }
+  const uploadAttachments = async (itemsToUpload, comment = '') => {
+    if (!itemsToUpload.length) return
 
-  const sendUploadedAttachments = (uploadedFiles, comment = '') => {
-    if (!uploadedFiles.length) return
-    const tokens = uploadedFiles.map((file) => `[file:${file.id}:${file.name}]`)
-    const trimmedComment = comment?.trim()
-    const blocks = []
-    if (trimmedComment) blocks.push(trimmedComment)
-    blocks.push(tokens.join('\n'))
-    const message = blocks.filter(Boolean).join('\n')
-    if (!message) return
-    sendMessage(message)
-    setText('')
-    if (textareaRef.current) {
-      textareaRef.current.value = ''
-    }
-    if (typingTimeoutRef.current) {
-      clearTimeout(typingTimeoutRef.current)
-      typingTimeoutRef.current = null
-    }
-    if (selfTypingRef.current) {
-      emitTypingState(false)
-      selfTypingRef.current = false
-      setSelfTyping(false)
-    }
-  }
-
-  const uploadAttachments = async (filesToUpload, comment = '') => {
-    if (!filesToUpload.length) return null
     const attachments = []
     try {
-      for (let index = 0; index < filesToUpload.length; index += 1) {
-        const file = filesToUpload[index]
-        setUploadState({ current: index + 1, total: filesToUpload.length, progress: 0 })
+      for (let index = 0; index < itemsToUpload.length; index += 1) {
+        const entry = itemsToUpload[index]
+        const file = entry.file
+        const entryMode = entry.mode || (file.type?.startsWith('image/') ? 'photo' : 'file')
+        setUploadState({ current: index + 1, total: itemsToUpload.length, progress: 0 })
         const uploaded = await uploadFile(file, (progress) => {
           setUploadState((state) => (state ? { ...state, progress } : state))
         })
-        if (uploaded) attachments.push(uploaded)
+        if (uploaded) attachments.push({ file: uploaded, mode: entryMode })
       }
       if (attachments.length) {
-        sendUploadedAttachments(attachments, comment)
+        const tokens = attachments.map(({ file, mode }) => {
+          const suffix = mode === 'file' ? '|document' : ''
+          return `[file:${file.id}:${file.name}${suffix}]`
+        })
+        const blocks = []
+        if (comment) blocks.push(comment)
+        blocks.push(tokens.join('\n'))
+        const addition = blocks.filter(Boolean).join('\n')
+        const currentValue = textareaRef.current ? textareaRef.current.value : text
+        const nextValue = currentValue ? `${currentValue}\n${addition}` : addition
+        handleTextChange(nextValue)
+
       }
     } catch (err) {
       console.error(err)
@@ -984,11 +987,12 @@ export default function Chat() {
     try {
       const processed = []
       for (const item of dialog.items) {
+        const baseMode = item.mode || (item.file.type?.startsWith('image/') ? 'photo' : 'file')
         let file = item.file
-        if (dialog.options.compress && file.type?.startsWith('image/')) {
+        if (baseMode === 'photo' && dialog.options.compress && file.type?.startsWith('image/')) {
           file = await compressImageFile(file)
         }
-        processed.push(file)
+        processed.push({ file, mode: baseMode })
       }
       if (dialog.options.remember) {
         localStorage.setItem(
@@ -1111,7 +1115,9 @@ export default function Chat() {
           ? crypto.randomUUID()
           : `${Date.now()}-${index}`,
       file,
-      preview: isFileLikelyImage(file) ? URL.createObjectURL(file) : null,
+      preview: file.type?.startsWith('image/') ? URL.createObjectURL(file) : null,
+      mode: file.type?.startsWith('image/') ? 'photo' : 'file',
+
     }))
     setUploadDialog((state) => {
       if (state) {
@@ -1752,51 +1758,18 @@ export default function Chat() {
                           </div>
                         </div>
                       </div>
-                    )
-                  })}
-                </div>
-              )}
-              {uploadDialogOtherItems.length > 0 && (
-                <div className="glass rounded-3xl p-4 space-y-4">
-                  <div className="text-xs uppercase tracking-[0.3em] text-white/50">Файлы без предпросмотра</div>
-                  <div className="space-y-2">
-                    {uploadDialogOtherItems.map((item, index) => {
-                      const descriptor = guessFileDescriptor(item.file)
-                      const glyph = guessFileGlyph(item.file)
-                      const sizeLabel = formatFileSize(item.file.size)
-                      const orderLabel = String(uploadDialogImageItems.length + index + 1).padStart(2, '0')
-                      return (
-                        <div
-                          key={item.id}
-                          className="flex items-center justify-between gap-3 rounded-2xl bg-white/5 px-4 py-3"
-                        >
-                          <div className="flex items-center gap-3 min-w-0">
-                            <div className="w-10 h-10 rounded-2xl bg-white/10 flex items-center justify-center text-lg">
-                              {glyph}
-                            </div>
-                            <div className="min-w-0">
-                              <div className="text-sm text-white/90 truncate" title={item.file.name}>
-                                {item.file.name}
-                              </div>
-                              <div className="text-xs text-white/50">
-                                {descriptor} · {sizeLabel}
-                              </div>
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-3">
-                            <div className="text-[11px] uppercase tracking-[0.3em] text-white/40">{orderLabel}</div>
-                            <button
-                              type="button"
-                              className="text-white/50 hover:text-red-300 transition"
-                              onClick={() => removePendingFile(item.id)}
-                              disabled={uploadDialog.loading}
-                            >
-                              ✕
-                            </button>
-                          </div>
-                        </div>
-                      )
-                    })}
+                    </div>
+                    {isImage && (
+                      <label className="flex items-center gap-2 text-xs text-white/70">
+                        <input
+                          type="checkbox"
+                          checked={item.mode === 'file'}
+                          onChange={(e) => updateUploadItemMode(item.id, e.target.checked ? 'file' : 'photo')}
+                          disabled={uploadDialog.loading}
+                        />
+                        Отправить как файл
+                      </label>
+                    )}
                   </div>
                 </div>
               )}
