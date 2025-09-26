@@ -9,6 +9,10 @@ const storageKeyForChannel = (cid) => `chkey:${cid}`
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
 const voicePeerConnections = new Map()
 const speakingMonitors = new Map()
+const RECONNECT_DELAYS = [5000, 10000, 20000]
+
+let reconnectTimeoutId = null
+let reconnectCountdownIntervalId = null
 
 const ensureAudioContext = () => {
   if (typeof window === 'undefined') return null
@@ -346,6 +350,12 @@ const useStore = create((set, get) => ({
   users: [],
   view: 'chat',
   socket: null,
+  connectionStatus: 'idle',
+  reconnectAttempt: 0,
+  retryAt: null,
+  retryDelay: null,
+  retrySecondsRemaining: null,
+  connectionError: null,
   workspaces: [],
   channels: [],
   activeChannelId: null,
@@ -523,14 +533,140 @@ const useStore = create((set, get) => ({
     if (get().activeVoiceRoomId === roomId) get().leaveVoiceRoom(false)
   },
 
+  cancelReconnectCountdown: () => {
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    if (reconnectCountdownIntervalId) {
+      clearInterval(reconnectCountdownIntervalId)
+      reconnectCountdownIntervalId = null
+    }
+    set((state) => {
+      if (state.retryDelay === null && state.retryAt === null && state.retrySecondsRemaining === null) return state
+      return { retryDelay: null, retryAt: null, retrySecondsRemaining: null }
+    })
+  },
+  beginReconnectCountdown: (delay, message) => {
+    if (!delay) return
+    get().cancelReconnectCountdown()
+    const targetAt = Date.now() + delay
+    set({
+      connectionStatus: 'retrying',
+      retryDelay: delay,
+      retryAt: targetAt,
+      retrySecondsRemaining: Math.ceil(delay / 1000),
+      connectionError: message || null,
+    })
+    reconnectCountdownIntervalId = setInterval(() => {
+      const remainingMs = targetAt - Date.now()
+      const seconds = Math.max(0, Math.ceil(remainingMs / 1000))
+      set((state) => {
+        if (state.connectionStatus !== 'retrying') return state
+        if (state.retrySecondsRemaining === seconds) return state
+        return { retrySecondsRemaining: seconds }
+      })
+      if (seconds <= 0) {
+        clearInterval(reconnectCountdownIntervalId)
+        reconnectCountdownIntervalId = null
+      }
+    }, 250)
+    reconnectTimeoutId = setTimeout(() => {
+      reconnectTimeoutId = null
+      if (reconnectCountdownIntervalId) {
+        clearInterval(reconnectCountdownIntervalId)
+        reconnectCountdownIntervalId = null
+      }
+      if (!get().token) {
+        set({ connectionStatus: 'idle' })
+        return
+      }
+      set((state) => ({
+        retryDelay: null,
+        retryAt: null,
+        retrySecondsRemaining: null,
+        connectionStatus: 'connecting',
+        connectionError: state.connectionError,
+      }))
+      get().connect()
+    }, delay)
+  },
+  triggerReconnectNow: () => {
+    if (!get().token) return
+    const existing = get().socket
+    if (existing) {
+      if (typeof existing.removeAllListeners === 'function') existing.removeAllListeners()
+      if (existing.io?.off) existing.io.off('close')
+      existing.disconnect()
+    }
+    get().cancelReconnectCountdown()
+    set({ reconnectAttempt: 0, connectionStatus: 'connecting', connectionError: null })
+    get().connect()
+  },
   connect: async () => {
     const token = get().token
     if (!token) return
     const server = get().serverUrl
-    const socket = io(server, { auth: { token } })
+    get().cancelReconnectCountdown()
+    const existingSocket = get().socket
+    if (existingSocket) {
+      if (typeof existingSocket.removeAllListeners === 'function') existingSocket.removeAllListeners()
+      if (existingSocket.io?.off) existingSocket.io.off('close')
+      existingSocket.disconnect()
+    }
+    set({ connectionStatus: 'connecting', connectionError: null })
+    const socket = io(server, { auth: { token }, reconnection: false })
     set({ socket })
+    const manager = socket.io
+    let handleCloseRef = null
+
+    const scheduleReconnect = (error) => {
+      if (!get().token) return
+      const message = typeof error === 'string' ? error : error?.message || null
+      if (manager?.off && handleCloseRef) manager.off('close', handleCloseRef)
+      if (reconnectTimeoutId) {
+        if (message) {
+          set((state) => {
+            if (state.connectionError === message) return state
+            return { connectionError: message }
+          })
+        }
+        return
+      }
+      const nextAttempt = get().reconnectAttempt + 1
+      const delay = RECONNECT_DELAYS[nextAttempt - 1]
+      set((state) => {
+        const patch = { reconnectAttempt: nextAttempt, connectionError: message || null }
+        if (state.socket === socket) patch.socket = null
+        return patch
+      })
+      if (delay) {
+        get().beginReconnectCountdown(delay, message)
+      } else {
+        set((state) => {
+          const patch = {
+            connectionStatus: 'awaiting_manual',
+            retryDelay: null,
+            retryAt: null,
+            retrySecondsRemaining: null,
+          }
+          if (message) patch.connectionError = message
+          if (state.socket === socket) patch.socket = null
+          return patch
+        })
+      }
+    }
+
+    const handleClose = (reason) => {
+      scheduleReconnect(reason)
+    }
+    handleCloseRef = handleClose
+
+    if (manager?.on) manager.on('close', handleClose)
 
     socket.on('connect', async () => {
+      get().cancelReconnectCountdown()
+      set({ connectionStatus: 'connected', reconnectAttempt: 0, connectionError: null })
       socket.emit('init:request', {})
       try {
         const { data } = await axios.get(`${server}/api/users`, { headers: buildAuthHeaders(get().token) })
@@ -549,6 +685,10 @@ const useStore = create((set, get) => ({
         console.error('voice rooms fetch failed', err)
       }
       get().refreshAudioDevices()
+    })
+
+    socket.on('connect_error', (err) => {
+      scheduleReconnect(err)
     })
 
     socket.on('init:response', ({ workspaces, channels, activeChannelId, messages }) => {
@@ -865,7 +1005,7 @@ const useStore = create((set, get) => ({
       }
     })
     socket.on('voice:error', ({ error }) => set({ voiceStatus: error || 'error' }))
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
       const stream = get().voiceStream
       if (stream) stream.getTracks().forEach((track) => track.stop())
       voicePeerConnections.forEach((_, id) => teardownVoicePeer(id, set))
@@ -880,6 +1020,8 @@ const useStore = create((set, get) => ({
         voiceSelfSocketId: null,
         voiceStatus: 'disconnected',
       })
+      if (reason === 'io client disconnect') return
+      scheduleReconnect(reason)
     })
   },
 
