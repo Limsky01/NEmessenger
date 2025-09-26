@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import Titlebar from './Titlebar.jsx'
 import Sidebar from './Sidebar.jsx'
 import Chat from './Chat.jsx'
@@ -6,7 +6,7 @@ import Login from './Login.jsx'
 import Profile from './Profile.jsx'
 import AdminPanel from './AdminPanel.jsx'
 import useStore from '../state/store.js'
-import { motion, AnimatePresence } from 'framer-motion'
+import SplashScreen from './SplashScreen.jsx'
 
 function VoiceAudioLayer() {
   const remoteStreams = useStore((s) => s.voiceRemoteStreams)
@@ -59,32 +59,46 @@ export default function App() {
   const token = useStore((s) => s.token)
   const connect = useStore((s) => s.connect)
   const view = useStore((s) => s.view)
+  const socketConnected = useStore((s) => s.socket?.connected ?? false)
   const [showSplash, setShowSplash] = useState(true)
+  const [minimumVisible, setMinimumVisible] = useState(false)
 
   useEffect(() => {
     if (token) connect()
   }, [token, connect])
 
   useEffect(() => {
-    const t = setTimeout(() => setShowSplash(false), 600)
-    return () => clearTimeout(t)
-  }, [])
+    if (!showSplash) return undefined
+    setMinimumVisible(false)
+    const timeout = setTimeout(() => setMinimumVisible(true), 900)
+    return () => clearTimeout(timeout)
+  }, [showSplash])
+
+  useEffect(() => {
+    if (!showSplash || !minimumVisible) return
+    if (!token) {
+      setShowSplash(false)
+      return
+    }
+    if (socketConnected) {
+      const delay = setTimeout(() => setShowSplash(false), 250)
+      return () => clearTimeout(delay)
+    }
+  }, [minimumVisible, showSplash, token, socketConnected])
+
+  const splashSubheading = useMemo(() => {
+    if (!token) return 'Подготовка формы входа…'
+    if (!socketConnected) return 'Подключаемся к серверу и загружаем рабочие пространства…'
+    return 'Почти готово!'
+  }, [token, socketConnected])
 
   return (
     <div className="h-full w-full app-bg font-mc">
-      <AnimatePresence>
-        {showSplash && (
-          <motion.div
-            className="absolute inset-0 flex items-center justify-center"
-            initial={{ opacity: 0, scale: 0.98 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.4 }}
-          >
-            <div className="glass rounded-3xl px-8 py-6 text-xl tracking-wider">Загрузка…</div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <SplashScreen
+        showSplash={showSplash}
+        heading={token ? 'Секунду…' : 'Добро пожаловать'}
+        subheading={splashSubheading}
+      />
 
       <div className="h-full w-full overflow-hidden relative">
         <Titlebar />
