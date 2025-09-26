@@ -76,6 +76,11 @@ export default function Sidebar() {
   const [showUsers, setShowUsers] = useState(true)
   const [showVoice, setShowVoice] = useState(true)
 
+  const editingCount =
+    editingRoom?.participantCount ??
+    (editingRoom ? voiceParticipantsCount(editingRoom.id) : undefined)
+  const editingActive = editingRoom ? activeVoiceRoomId === editingRoom.id : false
+
   const toggleSelection = (userId) => {
     setSelectedIds((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
   }
@@ -626,8 +631,8 @@ export default function Sidebar() {
 
                     <span className="text-[11px] text-white/40">Создатель</span>
 
-                    <div className="text-xs text-white/50">В голосе: {count}</div>
-                    {active && voiceStatus && (
+                    <div className="text-xs text-white/50">В голосе: {editingCount ?? 0}</div>
+                    {editingActive && voiceStatus && (
                       <div className="text-[11px] text-white/40">
                         {voiceStatus === 'connecting'
                           ? 'Подключение...'
