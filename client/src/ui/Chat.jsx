@@ -813,6 +813,31 @@ export default function Chat() {
     })
   }
 
+  const sendUploadedAttachments = (uploadedFiles, comment = '') => {
+    if (!uploadedFiles.length) return
+    const tokens = uploadedFiles.map((file) => `[file:${file.id}:${file.name}]`)
+    const trimmedComment = comment?.trim()
+    const blocks = []
+    if (trimmedComment) blocks.push(trimmedComment)
+    blocks.push(tokens.join('\n'))
+    const message = blocks.filter(Boolean).join('\n')
+    if (!message) return
+    sendMessage(message)
+    setText('')
+    if (textareaRef.current) {
+      textareaRef.current.value = ''
+    }
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current)
+      typingTimeoutRef.current = null
+    }
+    if (selfTypingRef.current) {
+      emitTypingState(false)
+      selfTypingRef.current = false
+      setSelfTyping(false)
+    }
+  }
+
   const uploadAttachments = async (filesToUpload, comment = '') => {
     if (!filesToUpload.length) return
     const attachments = []
@@ -826,14 +851,7 @@ export default function Chat() {
         if (uploaded) attachments.push(uploaded)
       }
       if (attachments.length) {
-        const tokens = attachments.map((file) => `[file:${file.id}:${file.name}]`)
-        const blocks = []
-        if (comment) blocks.push(comment)
-        blocks.push(tokens.join('\n'))
-        const addition = blocks.filter(Boolean).join('\n')
-        const currentValue = textareaRef.current ? textareaRef.current.value : text
-        const nextValue = currentValue ? `${currentValue}\n${addition}` : addition
-        handleTextChange(nextValue)
+        sendUploadedAttachments(attachments, comment)
       }
     } catch (err) {
       console.error(err)
@@ -895,8 +913,7 @@ export default function Chat() {
         localStorage.removeItem('uploadOptions')
       }
       await uploadAttachments(processed, dialog.options.comment.trim())
-      cleanupUploadDialog(dialog)
-      setUploadDialog(null)
+      closeUploadDialog()
     } catch (err) {
       console.error(err)
       setUploadDialog((state) => (state ? { ...state, loading: false, error: 'Не удалось загрузить файлы' } : state))
