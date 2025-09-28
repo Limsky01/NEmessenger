@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, Notification } from 'electron'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
@@ -61,6 +61,22 @@ const registerIpcHandlers = () => {
     win.once('unmaximize', reposition)
     win.unmaximize()
   })
+
+  // Global notification IPC handler used by renderer via preload
+  ipcMain.on('notify', (_event, { title, body }) => {
+    console.log('[main] notify ipc received:', { title, body })
+    try {
+      if (BrowserWindow.getAllWindows().some((w) => w.isFocused())) {
+        console.log('[main] windows focused — skipping system notification')
+        return
+      }
+      const note = new Notification({ title, body })
+      note.show()
+      console.log('[main] system notification shown')
+    } catch (err) {
+      console.error('[main] notify handler error', err)
+    }
+  })
 }
 
 function createWindow() {
@@ -80,7 +96,7 @@ function createWindow() {
     webPreferences: {
       contextIsolation: true,
       sandbox: false,
-      preload: path.join(__dirname, 'preload.js'),
+  preload: path.join(__dirname, 'preload.cjs'),
     },
   })
 

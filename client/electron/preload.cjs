@@ -12,4 +12,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('window:state', handler)
     return () => ipcRenderer.removeListener('window:state', handler)
   },
+  sendNotification: (title, body) => {
+    ipcRenderer.send('notify', { title, body });
+  }
+  ,
+  testNotify: (title = 'Test', body = 'Test body') => {
+    ipcRenderer.send('notify', { title, body });
+  }
 })

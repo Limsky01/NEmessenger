@@ -1,5 +1,5 @@
 import { autoUpdater } from 'electron-updater'
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, Notification } = require("electron");
 const path = require("path");
 
 let win;
@@ -19,7 +19,7 @@ function createWindow() {
         webPreferences: {
             contextIsolation: true,
             sandbox: false,
-            preload: path.join(__dirname, "preload.js")
+        preload: path.join(__dirname, "preload.cjs")
         }
     });
 
@@ -36,6 +36,21 @@ function createWindow() {
         else win.maximize();
     });
     ipcMain.on("window:close", () => win.close());
+
+    ipcMain.on('notify', (_, { title, body }) => {
+        console.log('[main] notify ipc received:', { title, body });
+        try {
+            if (BrowserWindow.getAllWindows().some(w => w.isFocused())) {
+                console.log('[main] windows focused — skipping system notification');
+                return;
+            }
+            const note = new Notification({ title, body });
+            note.show();
+            console.log('[main] system notification shown');
+        } catch (err) {
+            console.error('[main] notify handler error', err);
+        }
+    });
 }
 
 app.whenReady().then(() => {

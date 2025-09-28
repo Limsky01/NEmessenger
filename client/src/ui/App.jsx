@@ -55,7 +55,7 @@ function VoiceAudioLayer() {
   )
 }
 
-export default function App() {
+function AppInner() {
   const token = useStore((s) => s.token)
   const connect = useStore((s) => s.connect)
   const view = useStore((s) => s.view)
@@ -162,6 +162,11 @@ export default function App() {
       <VoiceAudioLayer />
     </div>
   )
+}
+
+export default function App() {
+  // DIAGNOSTICS: notifications are global only
+  return <AppInner />
 }
 
 

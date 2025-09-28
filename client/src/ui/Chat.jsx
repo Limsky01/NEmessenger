@@ -683,9 +683,12 @@ export default function Chat() {
   }, [activeChannelId])
 
   useEffect(() => {
-    setSelectedNewMembers((current) =>
-      current.filter((userId) => availableMemberCandidates.some((candidate) => candidate.id === userId)),
-    )
+    setSelectedNewMembers((current) => {
+      const next = current.filter((userId) => availableMemberCandidates.some((candidate) => candidate.id === userId))
+      // don't update state if nothing changed (avoid infinite loops when availableMemberCandidates has unstable identity)
+      if (next.length === current.length && next.every((v, i) => v === current[i])) return current
+      return next
+    })
   }, [availableMemberCandidates])
 
   useEffect(() => {
@@ -1061,7 +1064,7 @@ export default function Chat() {
   const handleSend = (override) => {
     const value = typeof override === 'string' ? override : text
     if (!value.trim()) return
-    sendMessage(value)
+    sendMessage(value, replyTarget?.id || null)
     setText('')
     clearReplyTarget()
     if (typingTimeoutRef.current) {

@@ -3,6 +3,7 @@ import { io } from 'socket.io-client'
 import axios from 'axios'
 import nacl from 'tweetnacl'
 import * as u8 from 'tweetnacl-util'
+import { showNewMessageNotification } from '../utils/notifications'
 
 const encoder = new TextEncoder()
 const storageKeyForChannel = (cid) => `chkey:${cid}`
@@ -902,6 +903,11 @@ const useStore = create((set, get) => ({
       const normalized = formatMessage(payload.channelId)(payload)
       if (!normalized) return
       set((state) => {
+        if (normalized.senderId !== state.user?.id) {
+            const author = state.users.find(u => u.id === normalized.senderId)?.username || 'Неизвестный';
+            showNewMessageNotification(author, normalized.content);
+        }
+
         const arr = state.messages[payload.channelId] || []
         const isActive = state.activeChannelId === payload.channelId
         const nextUnread = isActive ? 0 : (state.unread[payload.channelId] || 0) + 1
@@ -1083,7 +1089,7 @@ const useStore = create((set, get) => ({
         },
       }))
       if (get().activeVoiceRoomId !== roomId) return
-      await setupVoicePeer({ socket, roomId, participant, initiator: false, get, set })
+      await setupVoicePeer({ socket, roomId, participant, initiator: true, get, set })
     })
     socket.on('voice:user-left', ({ roomId, socketId }) => {
       if (!roomId || !socketId) return
@@ -1130,7 +1136,7 @@ const useStore = create((set, get) => ({
         }
       }
     })
-    socket.on('voice:joined', ({ roomId, participant }) => {
+    socket.on('voice:joined', async ({ roomId, participant }) => {
       if (!roomId) return
       set((state) => {
         const list = state.voiceParticipants[roomId] || []
@@ -1143,7 +1149,17 @@ const useStore = create((set, get) => ({
           voiceParticipants: { ...state.voiceParticipants, [roomId]: nextList },
         }
       })
-      const localStream = get().voiceStream
+      let localStream = get().voiceStream
+      if (!localStream) {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+          set({ voiceStream: localStream })
+        } catch (err) {
+          set({ voiceStatus: 'mic_denied' })
+          console.error('Не удалось получить доступ к микрофону', err)
+          return
+        }
+      }
       if (participant?.socketId && localStream) {
         startSpeakingMonitor(participant.socketId, localStream, set)
       }
