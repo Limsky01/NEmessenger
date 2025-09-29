@@ -1,9 +1,19 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import useStore, { buildDirectChannelId } from '../state/store.js'
 import AvatarImage from './AvatarImage.jsx'
 
 function StatusDot({ online }) {
   return <span className={`w-2 h-2 rounded-full ${online ? 'bg-emerald-400' : 'bg-white/30'}`} />
+}
+
+const DEFAULT_SIDEBAR_WIDTH = 320
+const MIN_SIDEBAR_WIDTH = 260
+const MAX_SIDEBAR_WIDTH = 480
+const SIDEBAR_WIDTH_STORAGE_KEY = 'nemessenger.sidebarWidth'
+
+function clampSidebarWidth(value) {
+  if (!Number.isFinite(value)) return DEFAULT_SIDEBAR_WIDTH
+  return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(value)))
 }
 
 export default function Sidebar() {
@@ -63,6 +73,104 @@ export default function Sidebar() {
     if (!normalizedSearch) return voiceRooms
     return voiceRooms.filter((room) => room.name.toLowerCase().includes(normalizedSearch))
   }, [voiceRooms, normalizedSearch])
+
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH)
+  const [isResizing, setIsResizing] = useState(false)
+  const [sidebarWidthLoaded, setSidebarWidthLoaded] = useState(false)
+  const resizeStateRef = useRef({ startX: 0, width: DEFAULT_SIDEBAR_WIDTH })
+
+  const sidebarStyle = useMemo(
+    () => ({
+      width: sidebarWidth,
+      minWidth: MIN_SIDEBAR_WIDTH,
+      maxWidth: MAX_SIDEBAR_WIDTH,
+      flexBasis: sidebarWidth,
+    }),
+    [sidebarWidth]
+  )
+
+  const handleResizePointerDown = (event) => {
+    if (event.button !== 0 && event.pointerType !== 'touch') return
+    event.preventDefault()
+    event.stopPropagation()
+    if (!Number.isFinite(event.clientX)) return
+    resizeStateRef.current = { startX: event.clientX, width: sidebarWidth }
+    setIsResizing(true)
+  }
+
+  const handleResizeDoubleClick = () => {
+    setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)
+  }
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const stored = Number.parseInt(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY), 10)
+      if (!Number.isNaN(stored)) {
+        setSidebarWidth(clampSidebarWidth(stored))
+      }
+    } catch (err) {
+      console.warn('sidebar width restore failed', err)
+    }
+    setSidebarWidthLoaded(true)
+  }, [])
+
+  useEffect(() => {
+    if (!sidebarWidthLoaded || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth))
+    } catch (err) {
+      console.warn('sidebar width persist failed', err)
+    }
+  }, [sidebarWidth, sidebarWidthLoaded])
+
+  useEffect(() => {
+    if (isResizing) return
+    resizeStateRef.current.width = sidebarWidth
+  }, [sidebarWidth, isResizing])
+
+  useEffect(() => {
+    if (!isResizing || typeof window === 'undefined') return undefined
+
+    const handlePointerMove = (event) => {
+      if (!Number.isFinite(event.clientX)) return
+      if (event.buttons === 0 && event.pointerType !== 'touch') {
+        setIsResizing(false)
+        return
+      }
+      const nextWidth = clampSidebarWidth(
+        resizeStateRef.current.width + (event.clientX - resizeStateRef.current.startX)
+      )
+      setSidebarWidth((current) => (current === nextWidth ? current : nextWidth))
+    }
+
+    const stopResize = () => {
+      setIsResizing(false)
+    }
+
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', stopResize)
+    window.addEventListener('pointercancel', stopResize)
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', stopResize)
+      window.removeEventListener('pointercancel', stopResize)
+    }
+  }, [isResizing])
+
+  useEffect(() => {
+    if (!isResizing || typeof document === 'undefined') return undefined
+    const { style } = document.body
+    const previousUserSelect = style.userSelect
+    const previousCursor = style.cursor
+    style.userSelect = 'none'
+    style.cursor = 'ew-resize'
+    return () => {
+      style.userSelect = previousUserSelect
+      style.cursor = previousCursor
+    }
+  }, [isResizing])
 
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [channelName, setChannelName] = useState('')
@@ -285,7 +393,7 @@ export default function Sidebar() {
   }
 
   return (
-    <div className="w-[320px] border-r border-white/10 h-full flex flex-col bg-white/5 backdrop-blur-md">
+    <div className="relative group flex-shrink-0 border-r border-white/10 h-full flex flex-col bg-white/5 backdrop-blur-md" style={sidebarStyle}>
       <div className="p-4 panel sticky top-0 space-y-3 z-10">
         <div className="flex items-center justify-between gap-2">
           <div>
@@ -909,6 +1017,22 @@ export default function Sidebar() {
           </div>
         </div>
       )}
+      <div
+        role="separator"
+        aria-label="Изменить ширину боковой панели"
+        aria-orientation="vertical"
+        aria-valuenow={Math.round(sidebarWidth)}
+        aria-valuemin={MIN_SIDEBAR_WIDTH}
+        aria-valuemax={MAX_SIDEBAR_WIDTH}
+        tabIndex={-1}
+        onPointerDown={handleResizePointerDown}
+        onDoubleClick={handleResizeDoubleClick}
+        className="absolute top-0 -right-1 z-30 h-full w-3 cursor-ew-resize touch-none"
+      >
+        <div
+          className={`mx-auto h-full w-[2px] rounded-full bg-white/40 transition-opacity duration-200 ${isResizing ? 'opacity-80' : 'opacity-0 group-hover:opacity-60'}`}
+        />
+      </div>
     </div>
   )
 }

@@ -21,8 +21,18 @@ async function ensureBrowserPermission() {
   }
 }
 
-export async function showNewMessageNotification(author, content) {
+const recentShown = new Set()
+const RECENT_TTL = 30 * 1000 // 30s
+
+function markShown(id) {
+  if (!id) return
+  recentShown.add(id)
+  setTimeout(() => recentShown.delete(id), RECENT_TTL)
+}
+
+export async function showNewMessageNotification(author, content, messageId = null) {
   try {
+    if (messageId && recentShown.has(messageId)) return false
     const title = `Новое сообщение от ${author}`
     const body = typeof content === 'string' ? (content.length > 120 ? `${content.slice(0, 117)}...` : content) : ''
 
@@ -37,7 +47,14 @@ export async function showNewMessageNotification(author, content) {
       try {
         // sendNotification is synchronous fire-and-forget; no need to await
         if (window.electronAPI && typeof window.electronAPI.sendNotification === 'function') {
-          window.electronAPI.sendNotification(title, body)
+          // include messageId so main can ack or handle click navigation
+          try {
+            window.electronAPI.sendNotification(title, body, { messageId })
+          } catch (e) {
+            // older preload signature
+            window.electronAPI.sendNotification(title, body)
+          }
+          markShown(messageId)
           return true
         }
       } catch (err) {

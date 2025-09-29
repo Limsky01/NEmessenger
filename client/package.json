@@ -1,6 +1,6 @@
 {
     "name": "NE-client",
-    "version": "0.10.1",
+    "version": "0.10.3",
     "private": true,
     "main": "electron/main.js",
     "type": "module",

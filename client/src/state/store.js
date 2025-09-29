@@ -10,6 +10,129 @@ const storageKeyForChannel = (cid) => `chkey:${cid}`
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
 const voicePeerConnections = new Map()
 const speakingMonitors = new Map()
+// Buffer ICE candidates per peer until remoteDescription is applied
+const pendingIceCandidates = new Map()
+const APPEARANCE_STORAGE_KEY = 'nemessenger:appearance'
+const DEFAULT_APPEARANCE = Object.freeze({
+  backgroundMode: 'gradient',
+  gradient: { angle: 135, colors: ['#11131f', '#090a0f', '#141b2d'] },
+  backgroundImage: { dataUrl: '', brightness: 0.4, blur: 18, vignette: 0.35 },
+  solidColor: '#0b0d13',
+  accent: '#8ec5ff',
+  glassOpacity: 0.12,
+  panelOpacity: 0.18,
+  noiseStrength: 0.12,
+})
+
+const clamp = (value, min, max) => {
+  if (!Number.isFinite(value)) return min
+  if (value < min) return min
+  if (value > max) return max
+  return value
+}
+
+const cloneAppearance = (value = DEFAULT_APPEARANCE) => ({
+  backgroundMode: value.backgroundMode,
+  gradient: {
+    angle: value.gradient?.angle ?? DEFAULT_APPEARANCE.gradient.angle,
+    colors: Array.isArray(value.gradient?.colors) ? [...value.gradient.colors] : [...DEFAULT_APPEARANCE.gradient.colors],
+  },
+  backgroundImage: {
+    dataUrl: value.backgroundImage?.dataUrl ?? '',
+    brightness: value.backgroundImage?.brightness ?? DEFAULT_APPEARANCE.backgroundImage.brightness,
+    blur: value.backgroundImage?.blur ?? DEFAULT_APPEARANCE.backgroundImage.blur,
+    vignette: value.backgroundImage?.vignette ?? DEFAULT_APPEARANCE.backgroundImage.vignette,
+  },
+  solidColor: value.solidColor,
+  accent: value.accent,
+  glassOpacity: value.glassOpacity,
+  panelOpacity: value.panelOpacity,
+  noiseStrength: value.noiseStrength,
+})
+
+const normalizeAppearance = (value = DEFAULT_APPEARANCE) => {
+  const base = cloneAppearance(value)
+  const backgroundMode = base.backgroundMode === 'image' || base.backgroundMode === 'solid' ? base.backgroundMode : 'gradient'
+  const colors = Array.isArray(base.gradient.colors) && base.gradient.colors.length
+    ? base.gradient.colors.filter((color) => typeof color === 'string' && color.trim()).slice(0, 4)
+    : [...DEFAULT_APPEARANCE.gradient.colors]
+  const angle = clamp(base.gradient.angle ?? DEFAULT_APPEARANCE.gradient.angle, 0, 360)
+  const backgroundImage = {
+    dataUrl: typeof base.backgroundImage.dataUrl === 'string' ? base.backgroundImage.dataUrl : '',
+    brightness: clamp(base.backgroundImage.brightness ?? DEFAULT_APPEARANCE.backgroundImage.brightness, 0, 1),
+    blur: clamp(base.backgroundImage.blur ?? DEFAULT_APPEARANCE.backgroundImage.blur, 0, 40),
+    vignette: clamp(base.backgroundImage.vignette ?? DEFAULT_APPEARANCE.backgroundImage.vignette, 0, 1),
+  }
+  const solidColor = typeof base.solidColor === 'string' && base.solidColor.trim().length
+    ? base.solidColor.trim()
+    : DEFAULT_APPEARANCE.solidColor
+  const accent = typeof base.accent === 'string' && base.accent.trim().length ? base.accent.trim() : DEFAULT_APPEARANCE.accent
+  const glassOpacity = clamp(base.glassOpacity ?? DEFAULT_APPEARANCE.glassOpacity, 0.02, 0.5)
+  const panelOpacity = clamp(base.panelOpacity ?? DEFAULT_APPEARANCE.panelOpacity, 0.05, 0.65)
+  const noiseStrength = clamp(base.noiseStrength ?? DEFAULT_APPEARANCE.noiseStrength, 0, 0.4)
+  return {
+    backgroundMode,
+    gradient: { angle, colors },
+    backgroundImage,
+    solidColor,
+    accent,
+    glassOpacity,
+    panelOpacity,
+    noiseStrength,
+  }
+}
+
+const loadAppearance = () => {
+  if (typeof window === 'undefined') return normalizeAppearance(DEFAULT_APPEARANCE)
+  try {
+    const raw = window.localStorage.getItem(APPEARANCE_STORAGE_KEY)
+    if (!raw) return normalizeAppearance(DEFAULT_APPEARANCE)
+    const parsed = JSON.parse(raw)
+    return normalizeAppearance(parsed)
+  } catch (err) {
+    console.warn('appearance restore failed', err)
+    return normalizeAppearance(DEFAULT_APPEARANCE)
+  }
+}
+
+const persistAppearance = (appearance) => {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify(appearance))
+  } catch (err) {
+    console.warn('appearance persist failed', err)
+  }
+}
+
+const buildNoiseTexture = (() => {
+  let cache = null
+  return () => {
+    if (typeof document === 'undefined') return null
+    if (cache) return cache
+    try {
+      const canvas = document.createElement('canvas')
+      canvas.width = 160
+      canvas.height = 160
+      const ctx = canvas.getContext('2d', { willReadFrequently: false })
+      if (!ctx) return null
+      const imageData = ctx.createImageData(canvas.width, canvas.height)
+      for (let i = 0; i < imageData.data.length; i += 4) {
+        const shade = Math.random() * 255
+        imageData.data[i] = shade
+        imageData.data[i + 1] = shade
+        imageData.data[i + 2] = shade
+        imageData.data[i + 3] = 255
+      }
+      ctx.putImageData(imageData, 0, 0)
+      cache = canvas.toDataURL('image/png')
+      return cache
+    } catch (err) {
+      console.warn('noise texture build failed', err)
+      return null
+    }
+  }
+})()
+
 const RECONNECT_DELAYS = [5000, 10000, 20000]
 
 let reconnectTimeoutId = null
@@ -169,14 +292,21 @@ const setupVoicePeer = async ({ socket, roomId, participant, initiator, get, set
   }
 
   pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      socket.emit('voice:signal', { targetId: participant.socketId, data: { candidate: event.candidate } })
+    try {
+      if (event.candidate) {
+        // diagnostic log
+        try { if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] sending candidate', { to: participant.socketId }) } catch(e){}
+        socket.emit('voice:signal', { targetId: participant.socketId, data: { candidate: event.candidate } })
+      }
+    } catch (e) {
+      console.error('onicecandidate handler error', e)
     }
   }
 
   pc.ontrack = (event) => {
     const [remoteStream] = event.streams
     if (!remoteStream) return
+    try { if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] ontrack', { from: participant.socketId }) } catch(e){}
     set((state) => ({
       voiceRemoteStreams: {
         ...state.voiceRemoteStreams,
@@ -192,11 +322,16 @@ const setupVoicePeer = async ({ socket, roomId, participant, initiator, get, set
 
   pc.onconnectionstatechange = () => {
     const state = pc.connectionState
-    set((current) => ({
-      voicePeerStates: { ...current.voicePeerStates, [participant.socketId]: state },
-    }))
-    if (state === 'failed' || state === 'disconnected' || state === 'closed') {
-      teardownVoicePeer(participant.socketId, set)
+    try {
+      set((current) => ({
+        voicePeerStates: { ...current.voicePeerStates, [participant.socketId]: state },
+      }))
+      if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] connection state change', { peer: participant.socketId, state })
+      if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+        teardownVoicePeer(participant.socketId, set)
+      }
+    } catch (e) {
+      console.error('onconnectionstatechange handler error', e)
     }
   }
 
@@ -204,10 +339,28 @@ const setupVoicePeer = async ({ socket, roomId, participant, initiator, get, set
     try {
       const offer = await pc.createOffer()
       await pc.setLocalDescription(offer)
+      try { if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] created offer', { to: participant.socketId, sdpType: offer.type, sdpLen: offer.sdp?.length }) } catch(e){}
       socket.emit('voice:signal', { targetId: participant.socketId, data: { sdp: pc.localDescription } })
     } catch (err) {
       console.error('offer create failed', err)
     }
+  }
+
+  // drain any pending candidates for this peer (if any)
+  try {
+    const pend = pendingIceCandidates.get(participant.socketId)
+    if (pend && pend.length) {
+      for (const cand of pend) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(cand))
+        } catch (e) {
+          console.warn('drain candidate failed', e)
+        }
+      }
+      pendingIceCandidates.delete(participant.socketId)
+    }
+  } catch (e) {
+    console.warn('failed draining pending candidates', e)
   }
 
   return pc
@@ -457,6 +610,8 @@ const useStore = create((set, get) => ({
   voiceStream: null,
   voiceSelfSocketId: null,
   invites: [],
+  appearance: loadAppearance(),
+  appearanceNoise: null,
 
   setAuth: (token, user) => set((state) => {
     const normalized = normalizeUser(user)
@@ -478,6 +633,25 @@ const useStore = create((set, get) => ({
   openAdmin: () => {
     if (get().user?.role !== 'admin') return
     set({ view: 'admin' })
+  },
+  setAppearance: (patch) => {
+    set((state) => {
+      const previous = state.appearance ? cloneAppearance(state.appearance) : normalizeAppearance(DEFAULT_APPEARANCE)
+      const candidate = typeof patch === 'function' ? patch(previous) ?? previous : { ...previous, ...patch }
+      const normalized = normalizeAppearance(candidate)
+      persistAppearance(normalized)
+      return { appearance: normalized }
+    })
+  },
+  resetAppearance: () => {
+    const normalized = normalizeAppearance(DEFAULT_APPEARANCE)
+    persistAppearance(normalized)
+    set({ appearance: normalized })
+  },
+  ensureAppearanceNoise: () => {
+    const noise = buildNoiseTexture()
+    if (noise) set({ appearanceNoise: noise })
+    return noise
   },
   setChannelKey: (cid, keyStr) => enc.setKeyForChannel(cid, keyStr),
   getChannelKey: (cid) => enc.getKeyForChannel(cid),
@@ -905,7 +1079,7 @@ const useStore = create((set, get) => ({
       set((state) => {
         if (normalized.senderId !== state.user?.id) {
             const author = state.users.find(u => u.id === normalized.senderId)?.username || 'Неизвестный';
-            showNewMessageNotification(author, normalized.content);
+            showNewMessageNotification(author, normalized.content, normalized.id);
         }
 
         const arr = state.messages[payload.channelId] || []
@@ -1119,6 +1293,22 @@ const useStore = create((set, get) => ({
       if (data.sdp) {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
+          // after remote description set, drain any buffered ICE candidates
+          try {
+            const pend = pendingIceCandidates.get(from)
+            if (pend && pend.length) {
+              for (const cand of pend) {
+                try {
+                  await pc.addIceCandidate(new RTCIceCandidate(cand))
+                } catch (e) {
+                  console.error('candidate add failed during drain', e)
+                }
+              }
+              pendingIceCandidates.delete(from)
+            }
+          } catch (e) {
+            console.error('drain after setRemoteDescription failed', e)
+          }
           if (data.sdp.type === 'offer') {
             const answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
@@ -1129,11 +1319,20 @@ const useStore = create((set, get) => ({
         }
       }
       if (data.candidate) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate))
-        } catch (err) {
-          console.error('candidate add failed', err)
-        }
+          try {
+            // If remoteDescription is not yet set, buffer the candidate
+            const remoteDesc = pc.remoteDescription
+            if (!remoteDesc || !remoteDesc.type) {
+              const list = pendingIceCandidates.get(from) || []
+              list.push(data.candidate)
+              pendingIceCandidates.set(from, list)
+              if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] buffering candidate until remoteDescription', { from })
+            } else {
+              await pc.addIceCandidate(new RTCIceCandidate(data.candidate))
+            }
+          } catch (err) {
+            console.error('candidate add failed', err)
+          }
       }
     })
     socket.on('voice:joined', async ({ roomId, participant }) => {

@@ -63,18 +63,32 @@ const registerIpcHandlers = () => {
   })
 
   // Global notification IPC handler used by renderer via preload
-  ipcMain.on('notify', (_event, { title, body }) => {
-    console.log('[main] notify ipc received:', { title, body })
+  ipcMain.on('notify', (_event, { title, body, meta }) => {
+    console.log('[main] notify ipc received:', { title, body, meta })
     try {
-      if (BrowserWindow.getAllWindows().some((w) => w.isFocused())) {
+      const focused = BrowserWindow.getAllWindows().some((w) => w.isFocused())
+      if (focused) {
         console.log('[main] windows focused — skipping system notification')
+        // ack back to renderer that we received the notify but chose not to show
+        try { _event.sender && _event.sender.send('notify:ack', { shown: false, reason: 'focused', meta }) } catch (e) {}
         return
       }
       const note = new Notification({ title, body })
       note.show()
+      // acknowledge to renderer
+      try { _event.sender && _event.sender.send('notify:ack', { shown: true, meta }) } catch (e) {}
       console.log('[main] system notification shown')
+      // focus app on click and notify renderer
+      note.on('click', () => {
+        try {
+          const fromWin = BrowserWindow.fromWebContents(_event.sender) || BrowserWindow.getAllWindows()[0]
+          if (fromWin) fromWin.focus()
+        } catch (e) {}
+        try { _event.sender && _event.sender.send('notify:click', { meta }) } catch (e) {}
+      })
     } catch (err) {
       console.error('[main] notify handler error', err)
+      try { _event.sender && _event.sender.send('notify:ack', { shown: false, error: String(err) }) } catch (e) {}
     }
   })
 }

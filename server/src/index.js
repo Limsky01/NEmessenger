@@ -2047,6 +2047,7 @@ const leaveVoiceRoom = (socket, { silent } = {}) => {
       userId: socket.user.id,
       username: socket.user.username,
     })
+    try { console.log('[voice] user left', { user: socket.user.id, socket: socket.id, roomId }) } catch (e) {}
   }
   broadcastVoiceState(roomId)
 }
@@ -2119,6 +2120,8 @@ io.on('connection', (socket) => {
     socket.emit('voice:participants', { roomId, participants: initialState })
     socket.emit('voice:joined', { roomId, participant })
     socket.to(`voice:${roomId}`).emit('voice:user-joined', { roomId, participant })
+    // diagnostic
+    try { console.log('[voice] user joined', { user: socket.user.id, socket: socket.id, roomId }) } catch (e) {}
     broadcastVoiceState(roomId)
   }
 
