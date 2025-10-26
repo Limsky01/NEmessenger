@@ -2,6 +2,8 @@ import React, { useEffect, useState } from 'react'
 import axios from 'axios'
 import useStore from '../state/store.js'
 
+const REMEMBER_LOGIN_STORAGE_KEY = 'nemessenger:remember-login'
+
 const formatDateTime = (timestamp) => {
   if (!timestamp) return ''
   try {
@@ -23,6 +25,17 @@ export default function Login() {
   const [processing, setProcessing] = useState(false)
   const [avatarFile, setAvatarFile] = useState(null)
   const [avatarPreview, setAvatarPreview] = useState(null)
+  const [rememberLogin, setRememberLogin] = useState(() => {
+    if (typeof window === 'undefined') return true
+    try {
+      const value = window.localStorage.getItem(REMEMBER_LOGIN_STORAGE_KEY)
+      if (value === 'false') return false
+      if (value === 'true') return true
+      return true
+    } catch (err) {
+      return true
+    }
+  })
   const setAuth = useStore((s) => s.setAuth)
   const server = useStore((s) => s.serverUrl)
 
@@ -33,6 +46,15 @@ export default function Login() {
   useEffect(() => {
     setStatus(null)
   }, [mode])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(REMEMBER_LOGIN_STORAGE_KEY, rememberLogin ? 'true' : 'false')
+    } catch (err) {
+      // ignore storage failures
+    }
+  }, [rememberLogin])
 
   const resetAvatar = () => {
     if (avatarPreview) URL.revokeObjectURL(avatarPreview)
@@ -62,7 +84,7 @@ export default function Login() {
     setProcessing(true)
     try {
       const { data } = await axios.post(server + '/api/login', { username, password })
-      setAuth(data.token, data.user)
+      setAuth(data.token, data.user, { persist: rememberLogin })
     } catch (err) {
       console.error(err)
       const error = err?.response?.data?.error
@@ -163,7 +185,7 @@ export default function Login() {
         inviteClaimToken: inviteInfo.claimToken,
       }
       const { data } = await axios.post(server + '/api/register', payload)
-      setAuth(data.token, data.user)
+      setAuth(data.token, data.user, { persist: rememberLogin })
       if (avatarFile) {
         try {
           const form = new FormData()
@@ -172,7 +194,7 @@ export default function Login() {
           const endpoint = server.endsWith('/') ? server + 'api/profile/avatar' : server + '/api/profile/avatar'
           const avatarResponse = await axios.post(endpoint, form, { headers })
           if (avatarResponse?.data?.user) {
-            setAuth(data.token, avatarResponse.data.user)
+            setAuth(data.token, avatarResponse.data.user, { persist: rememberLogin })
           }
         } catch (avatarErr) {
           console.error(avatarErr)
@@ -226,6 +248,15 @@ export default function Login() {
         className="w-full bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
         autoComplete="current-password"
       />
+      <label className="flex items-center gap-2 text-sm text-white/70 select-none">
+        <input
+          type="checkbox"
+          className="w-4 h-4 accent-emerald-400 rounded"
+          checked={rememberLogin}
+          onChange={(e) => setRememberLogin(e.target.checked)}
+        />
+        <span>Запомнить вход</span>
+      </label>
       {status && <div className="text-sm text-red-400 text-center">{status}</div>}
       <button
         className="w-full bg-white/20 hover:bg-white/30 rounded-2xl py-3 transition disabled:opacity-60"
@@ -318,6 +349,15 @@ export default function Login() {
           className="w-full bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
           autoComplete="new-password"
         />
+        <label className="flex items-center gap-2 text-sm text-white/70 select-none">
+          <input
+            type="checkbox"
+            className="w-4 h-4 accent-emerald-400 rounded"
+            checked={rememberLogin}
+            onChange={(e) => setRememberLogin(e.target.checked)}
+          />
+          <span>Запомнить вход</span>
+        </label>
         <div className="bg-white/5 border border-white/15 rounded-2xl px-4 py-4 text-sm text-white/70 space-y-3">
           <div className="text-white/80 text-sm">Выберите аватар (необязательно)</div>
           <div className="flex flex-col gap-3">

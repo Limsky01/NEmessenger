@@ -4,6 +4,7 @@ import axios from 'axios'
 import nacl from 'tweetnacl'
 import * as u8 from 'tweetnacl-util'
 import { showNewMessageNotification } from '../utils/notifications'
+import { playVoiceJoinSound } from '../utils/sounds'
 
 const encoder = new TextEncoder()
 const storageKeyForChannel = (cid) => `chkey:${cid}`
@@ -13,6 +14,7 @@ const speakingMonitors = new Map()
 // Buffer ICE candidates per peer until remoteDescription is applied
 const pendingIceCandidates = new Map()
 const APPEARANCE_STORAGE_KEY = 'nemessenger:appearance'
+const AUTH_STORAGE_KEY = 'nemessenger:auth'
 const DEFAULT_APPEARANCE = Object.freeze({
   backgroundMode: 'gradient',
   gradient: { angle: 135, colors: ['#11131f', '#090a0f', '#141b2d'] },
@@ -404,6 +406,34 @@ const normalizeUser = (raw) => {
   }
 }
 
+const loadStoredAuth = () => {
+  if (typeof window === 'undefined') return { token: null, user: null }
+  try {
+    const raw = window.localStorage.getItem(AUTH_STORAGE_KEY)
+    if (!raw) return { token: null, user: null }
+    const parsed = JSON.parse(raw)
+    const token = typeof parsed.token === 'string' && parsed.token.length ? parsed.token : null
+    if (!token) return { token: null, user: null }
+    return { token, user: normalizeUser(parsed.user) }
+  } catch (err) {
+    console.warn('auth restore failed', err)
+    return { token: null, user: null }
+  }
+}
+
+const persistAuth = (token, user) => {
+  if (typeof window === 'undefined') return
+  try {
+    if (token && user) {
+      window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ token, user }))
+    } else {
+      window.localStorage.removeItem(AUTH_STORAGE_KEY)
+    }
+  } catch (err) {
+    console.warn('auth persist failed', err)
+  }
+}
+
 const normalizeFileMeta = (raw) => {
   if (!raw) return null
   const name = raw.name ?? raw.originalName ?? raw.original_name ?? raw.filename ?? 'file'
@@ -571,10 +601,12 @@ const formatMessage = (fallbackChannelId) => (raw) => {
 
 const buildAuthHeaders = (token) => ({ Authorization: `Bearer ${token}` })
 
+const initialAuth = loadStoredAuth()
+
 const useStore = create((set, get) => ({
   serverUrl: import.meta.env.VITE_LGM_SERVER || 'http://localhost:4000',
-  token: null,
-  user: null,
+  token: initialAuth.token,
+  user: initialAuth.user,
   users: [],
   view: 'chat',
   socket: null,
@@ -613,26 +645,84 @@ const useStore = create((set, get) => ({
   appearance: loadAppearance(),
   appearanceNoise: null,
 
-  setAuth: (token, user) => set((state) => {
+  setAuth: (token, user, options = {}) => {
     const normalized = normalizeUser(user)
-    let list = state.users
-    if (normalized) {
-      const exists = list.some((u) => u.id === normalized.id)
-      list = exists ? list.map((u) => (u.id === normalized.id ? normalized : u)) : [...list, normalized]
-    }
-    return {
-      token,
-      user: normalized,
-      users: list,
-      view: 'chat',
-    }
-  }),
+    const shouldPersist = options.persist ?? true
+    if (token && normalized && shouldPersist) persistAuth(token, normalized)
+    else if (!token || !shouldPersist) persistAuth(null, null)
+    set((state) => {
+      let list = state.users
+      if (normalized) {
+        const exists = list.some((u) => u.id === normalized.id)
+        list = exists ? list.map((u) => (u.id === normalized.id ? normalized : u)) : [...list, normalized]
+      }
+      return {
+        token,
+        user: normalized,
+        users: list,
+        view: 'chat',
+      }
+    })
+  },
   setView: (view) => set({ view }),
   openProfile: () => set({ view: 'profile' }),
   openChat: () => set({ view: 'chat' }),
   openAdmin: () => {
     if (get().user?.role !== 'admin') return
     set({ view: 'admin' })
+  },
+  logout: () => {
+    persistAuth(null, null)
+    const socket = get().socket
+    if (socket) {
+      if (typeof socket.removeAllListeners === 'function') socket.removeAllListeners()
+      if (socket.io?.off) socket.io.off('close')
+      socket.disconnect()
+    }
+    try {
+      get().leaveVoiceRoom(false)
+    } catch (err) {
+      console.warn('leaveVoiceRoom on logout failed', err)
+    }
+    try {
+      get().cancelReconnectCountdown()
+    } catch (err) {
+      console.warn('cancel reconnect on logout failed', err)
+    }
+    set({
+      token: null,
+      user: null,
+      view: 'chat',
+      socket: null,
+      connectionStatus: 'idle',
+      reconnectAttempt: 0,
+      retryAt: null,
+      retryDelay: null,
+      retrySecondsRemaining: null,
+      connectionError: null,
+      workspaces: [],
+      channels: [],
+      activeChannelId: null,
+      messages: {},
+      unread: {},
+      onlineUserIds: [],
+      historyLoading: {},
+      historyComplete: {},
+      directPeers: {},
+      files: {},
+      channelMembers: {},
+      typing: {},
+      voiceRooms: [],
+      voiceParticipants: {},
+      voiceRemoteStreams: {},
+      voicePeerStates: {},
+      voiceSpeaking: {},
+      activeVoiceRoomId: null,
+      voiceStatus: null,
+      voiceStream: null,
+      voiceSelfSocketId: null,
+      invites: [],
+    })
   },
   setAppearance: (patch) => {
     set((state) => {
@@ -1077,9 +1167,22 @@ const useStore = create((set, get) => ({
       const normalized = formatMessage(payload.channelId)(payload)
       if (!normalized) return
       set((state) => {
+        const isDirectChannel = payload.channelId?.startsWith('dm:')
+        const peerId = isDirectChannel ? peerFromDirectChannel(payload.channelId, state.user?.id) : null
+        const peerUser = peerId ? state.users.find((u) => u.id === peerId) : null
+        const channelEntry = !isDirectChannel ? state.channels.find((entry) => entry.id === payload.channelId) : null
         if (normalized.senderId !== state.user?.id) {
-            const author = state.users.find(u => u.id === normalized.senderId)?.username || 'Неизвестный';
-            showNewMessageNotification(author, normalized.content, normalized.id);
+          const author = state.users.find((u) => u.id === normalized.senderId)?.username || 'Неизвестный'
+          const hasContent = typeof normalized.content === 'string' && normalized.content.trim()
+          const channelLabel = channelEntry?.name || (peerUser ? `@${peerUser.username}` : isDirectChannel ? 'Личные сообщения' : null)
+          showNewMessageNotification({
+            author,
+            content: hasContent ? normalized.content : 'Новое сообщение',
+            messageId: normalized.id,
+            channelId: payload.channelId,
+            channelName: channelLabel,
+            direct: Boolean(isDirectChannel),
+          })
         }
 
         const arr = state.messages[payload.channelId] || []
@@ -1096,9 +1199,8 @@ const useStore = create((set, get) => ({
           unread: { ...state.unread, [payload.channelId]: nextUnread },
           typing,
         }
-        if (payload.channelId?.startsWith('dm:')) {
-          const peerId = peerFromDirectChannel(payload.channelId, state.user?.id)
-          if (peerId) result.directPeers = { ...state.directPeers, [payload.channelId]: peerId }
+        if (isDirectChannel && peerId) {
+          result.directPeers = { ...state.directPeers, [payload.channelId]: peerId }
         }
         return result
       })
@@ -1337,6 +1439,7 @@ const useStore = create((set, get) => ({
     })
     socket.on('voice:joined', async ({ roomId, participant }) => {
       if (!roomId) return
+      const alreadyConnected = get().voiceStatus === 'connected'
       set((state) => {
         const list = state.voiceParticipants[roomId] || []
         const exists = participant ? list.some((p) => p.socketId === participant.socketId) : false
@@ -1348,6 +1451,13 @@ const useStore = create((set, get) => ({
           voiceParticipants: { ...state.voiceParticipants, [roomId]: nextList },
         }
       })
+      if (!alreadyConnected) {
+        try {
+          playVoiceJoinSound()
+        } catch (err) {
+          console.warn('voice join sound failed', err)
+        }
+      }
       let localStream = get().voiceStream
       if (!localStream) {
         try {

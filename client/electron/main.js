@@ -7,6 +7,57 @@ const __dirname = path.dirname(__filename)
 
 let win = null
 
+const isAutostartSupported = () => {
+  if (process.platform !== 'darwin' && process.platform !== 'win32') return false
+  return typeof app.getLoginItemSettings === 'function' && typeof app.setLoginItemSettings === 'function'
+}
+
+const getAutostartEnabled = () => {
+  if (!isAutostartSupported()) return false
+  try {
+    const settings = app.getLoginItemSettings()
+    return Boolean(settings?.openAtLogin)
+  } catch (err) {
+    console.warn('[main] getLoginItemSettings failed', err)
+    return false
+  }
+}
+
+const setAutostartEnabled = (enabled) => {
+  if (!isAutostartSupported()) return false
+  try {
+    const options = { openAtLogin: Boolean(enabled) }
+    if (process.platform === 'win32') {
+      options.path = process.execPath
+      options.args = []
+    }
+    app.setLoginItemSettings(options)
+    return getAutostartEnabled()
+  } catch (err) {
+    console.warn('[main] setLoginItemSettings failed', err)
+    throw err
+  }
+}
+
+const normalizeNotificationPayload = (raw) => {
+  if (raw && typeof raw === 'object') {
+    return {
+      title: typeof raw.title === 'string' && raw.title.length ? raw.title : 'NE Messenger',
+      body: typeof raw.body === 'string' ? raw.body : '',
+      subtitle: typeof raw.subtitle === 'string' && raw.subtitle.trim().length ? raw.subtitle : '',
+      silent: Boolean(raw.silent),
+      meta: raw.meta && typeof raw.meta === 'object' ? raw.meta : {},
+    }
+  }
+  return {
+    title: typeof raw === 'string' && raw.length ? raw : 'NE Messenger',
+    body: '',
+    subtitle: '',
+    silent: false,
+    meta: {},
+  }
+}
+
 const getWindowState = () => ({
   maximized: win?.isMaximized() ?? false,
   fullscreen: win?.isFullScreen() ?? false,
@@ -23,6 +74,9 @@ const registerIpcHandlers = () => {
   ipcMain.removeAllListeners('window:toggle-maximize')
   ipcMain.removeAllListeners('window:close')
   ipcMain.removeAllListeners('window:drag-start')
+  ipcMain.removeHandler('autostart:get')
+  ipcMain.removeHandler('autostart:set')
+  ipcMain.removeHandler('autostart:is-supported')
 
   ipcMain.handle('window:get-state', () => getWindowState())
 
@@ -62,23 +116,29 @@ const registerIpcHandlers = () => {
     win.unmaximize()
   })
 
+  ipcMain.handle('autostart:is-supported', () => isAutostartSupported())
+  ipcMain.handle('autostart:get', () => getAutostartEnabled())
+  ipcMain.handle('autostart:set', (_event, enabled) => setAutostartEnabled(Boolean(enabled)))
+
   // Global notification IPC handler used by renderer via preload
-  ipcMain.on('notify', (_event, { title, body, meta }) => {
-    console.log('[main] notify ipc received:', { title, body, meta })
+  ipcMain.on('notify', (_event, rawPayload) => {
+    const payload = normalizeNotificationPayload(rawPayload)
+    const { title, body, subtitle, silent, meta } = payload
+    console.log('[main] notify ipc received:', payload)
     try {
       const focused = BrowserWindow.getAllWindows().some((w) => w.isFocused())
       if (focused) {
-        console.log('[main] windows focused — skipping system notification')
-        // ack back to renderer that we received the notify but chose not to show
+        console.log('[main] windows focused - skipping system notification')
         try { _event.sender && _event.sender.send('notify:ack', { shown: false, reason: 'focused', meta }) } catch (e) {}
         return
       }
-      const note = new Notification({ title, body })
+      const noteOptions = { title, body }
+      if (subtitle) noteOptions.subtitle = subtitle
+      if (silent) noteOptions.silent = true
+      const note = new Notification(noteOptions)
       note.show()
-      // acknowledge to renderer
       try { _event.sender && _event.sender.send('notify:ack', { shown: true, meta }) } catch (e) {}
       console.log('[main] system notification shown')
-      // focus app on click and notify renderer
       note.on('click', () => {
         try {
           const fromWin = BrowserWindow.fromWebContents(_event.sender) || BrowserWindow.getAllWindows()[0]
@@ -88,7 +148,7 @@ const registerIpcHandlers = () => {
       })
     } catch (err) {
       console.error('[main] notify handler error', err)
-      try { _event.sender && _event.sender.send('notify:ack', { shown: false, error: String(err) }) } catch (e) {}
+      try { _event.sender && _event.sender.send('notify:ack', { shown: false, error: String(err), meta }) } catch (e) {}
     }
   })
 }

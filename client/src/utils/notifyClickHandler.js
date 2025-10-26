@@ -18,9 +18,14 @@ export default function initNotifyClickHandler() {
     window.electronAPI.onNotifyClick(({ meta } = {}) => {
       try {
         const state = useStore.getState()
+        const switchChannel = typeof state.switchChannel === 'function' ? state.switchChannel : null
+        if (meta?.channelId && switchChannel) {
+          switchChannel(meta.channelId)
+          return
+        }
         const found = findMessageById(state, meta?.messageId)
-        if (found) {
-          useStore.getState().switchChannel(found.channelId)
+        if (found && switchChannel) {
+          switchChannel(found.channelId)
         }
       } catch (e) {
         // ignore

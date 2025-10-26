@@ -577,6 +577,7 @@ export default function Chat() {
   const users = useStore((s) => s.users)
   const me = useStore((s) => s.user)
   const uploadFile = useStore((s) => s.uploadFile)
+  const fileMap = useStore((s) => s.files)
   const directPeers = useStore((s) => s.directPeers)
   const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
   const buildFileUrl = useStore((s) => s.buildFileUrl)
@@ -919,10 +920,10 @@ export default function Chat() {
     })
   }
   const uploadAttachments = async (itemsToUpload, comment = '') => {
-    if (!itemsToUpload.length) return
+    if (!itemsToUpload.length) return null
 
     const attachments = []
-    let result = null
+    let payload = null
     try {
       for (let index = 0; index < itemsToUpload.length; index += 1) {
         const entry = itemsToUpload[index]
@@ -940,21 +941,22 @@ export default function Chat() {
           return `[file:${file.id}:${file.name}${suffix}]`
         })
         const blocks = []
-        if (comment) blocks.push(comment)
+        const trimmedComment = comment.trim()
+        if (trimmedComment.length) blocks.push(trimmedComment)
         blocks.push(tokens.join('\n'))
-        const addition = blocks.filter(Boolean).join('\n')
-        const currentValue = textareaRef.current ? textareaRef.current.value : text
-        const nextValue = currentValue ? `${currentValue}\n${addition}` : addition
-        handleTextChange(nextValue)
-        result = nextValue
+        payload = blocks.filter(Boolean).join('\n')
+        if (payload.trim()) {
+          sendMessage(payload, replyTarget?.id || null)
+          clearReplyTarget()
+        }
       }
     } catch (err) {
       console.error(err)
-      alert('Не удалось загрузить файлы')
+      alert('�� 㤠���� ����㧨�� 䠩��')
     } finally {
       setUploadState(null)
     }
-    return result
+    return payload
   }
 
   const openFile = async (id, name) => {
@@ -991,9 +993,9 @@ export default function Chat() {
     try {
       const processed = []
       for (const item of dialog.items) {
-        const baseMode = item.mode || (item.file.type?.startsWith('image/') ? 'photo' : 'file')
+        const baseMode = item.mode || (isFileLikelyImage(item.file) ? 'photo' : 'file')
         let file = item.file
-        if (baseMode === 'photo' && dialog.options.compress && file.type?.startsWith('image/')) {
+        if (baseMode === 'photo' && dialog.options.compress && isFileLikelyImage(file)) {
           file = await compressImageFile(file)
         }
         processed.push({ file, mode: baseMode })
@@ -1078,13 +1080,6 @@ export default function Chat() {
     }
   }
 
-  const sendUploadedAttachments = async (filesToUpload, comment = '') => {
-    const payload = await uploadAttachments(filesToUpload, comment)
-    if (typeof payload === 'string') {
-      handleSend(payload)
-    }
-  }
-
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
@@ -1096,23 +1091,9 @@ export default function Chat() {
     fileInputRef.current?.click()
   }
 
-  const handleFileChange = async (ev) => {
+  const handleFileChange = (ev) => {
     const files = Array.from(ev.target.files || [])
     if (!files.length) return
-    const hasImages = files.some((file) => isFileLikelyImage(file))
-    const dialogOpen = Boolean(uploadDialogRef.current)
-    if (!hasImages && !dialogOpen) {
-      try {
-        if (text.trim()) {
-          await uploadAttachments(files)
-        } else {
-          await sendUploadedAttachments(files)
-        }
-      } finally {
-        if (ev.target) ev.target.value = ''
-      }
-      return
-    }
     const items = files.map((file, index) => ({
       id:
         typeof crypto !== 'undefined' && crypto.randomUUID
@@ -1120,7 +1101,7 @@ export default function Chat() {
           : `${Date.now()}-${index}`,
       file,
       preview: file.type?.startsWith('image/') ? URL.createObjectURL(file) : null,
-      mode: file.type?.startsWith('image/') ? 'photo' : 'file',
+      mode: isFileLikelyImage(file) ? 'photo' : 'file',
 
     }))
     setUploadDialog((state) => {
@@ -1321,8 +1302,12 @@ export default function Chat() {
           const mine = m.senderId === me?.id
           const author = userMap.get(m.senderId)
           const { textSegments, attachments } = extractTextAndAttachments(m.content)
-          const imageTokens = attachments.map((token) => ({ ...token, ...useStore.getState().files[token.id] })).filter(isTokenLikelyImage)
-          const fileTokens = attachments.filter((token) => !isTokenLikelyImage(token))
+          const augmentedTokens = attachments.map((token) => ({
+            ...token,
+            ...(fileMap?.[token.id] || {}),
+          }))
+          const imageTokens = augmentedTokens.filter(isTokenLikelyImage)
+          const fileTokens = augmentedTokens.filter((token) => !isTokenLikelyImage(token))
           const avatarSrc = avatarSrcById(m.senderId)
           const canDelete = mine || me?.role === 'admin' || canModerateChannel
           const canEdit = mine || canModerateChannel
@@ -1778,6 +1763,48 @@ export default function Chat() {
                   })}
                 </div>
               )}
+              {uploadDialogOtherItems.length > 0 && (
+                <div className="space-y-3">
+                  <div className="text-xs uppercase tracking-[0.35em] text-white/40">Документы</div>
+                  <div className="space-y-3">
+                    {uploadDialogOtherItems.map((item, index) => {
+                      const descriptor = guessFileDescriptor(item.file)
+                      const glyph = guessFileGlyph(item.file)
+                      const sizeLabel = formatFileSize(item.file.size)
+                      return (
+                        <div key={item.id} className="glass rounded-3xl p-4 flex items-center justify-between gap-4">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="w-12 h-12 rounded-2xl bg-white/10 flex items-center justify-center text-2xl text-white/70">
+                              {glyph}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="text-sm text-white/90 truncate" title={item.file.name}>
+                                {item.file.name}
+                              </div>
+                              <div className="text-xs text-white/50">
+                                {descriptor}
+                                {' · '}
+                                {sizeLabel}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 text-xs text-white/60">
+                            <span className="opacity-60">#{String(index + 1).padStart(2, '0')}</span>
+                            <button
+                              type="button"
+                              className="text-white/50 hover:text-red-300 transition"
+                              onClick={() => removePendingFile(item.id)}
+                              disabled={uploadDialog.loading}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
               {uploadDialogItems.length === 0 && (
                 <div className="text-sm text-white/50">Файлы не выбраны</div>
               )}
@@ -1927,5 +1954,6 @@ export default function Chat() {
     </div>
   )
 }
+
 
 

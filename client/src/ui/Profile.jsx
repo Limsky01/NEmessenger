@@ -17,6 +17,7 @@ export default function Profile() {
   const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
   const setAudioDevice = useStore((s) => s.setAudioDevice)
   const refreshAudioDevices = useStore((s) => s.refreshAudioDevices)
+  const logout = useStore((s) => s.logout)
 
   const roleLabel = user?.role === 'admin' ? 'Администратор' : 'Пользователь'
   const fileInputRef = useRef(null)
@@ -34,6 +35,10 @@ export default function Profile() {
   const [copiedInviteId, setCopiedInviteId] = useState(null)
   const inviteStatusTimerRef = useRef(null)
   const inviteCopyTimerRef = useRef(null)
+  const [autostartSupported, setAutostartSupported] = useState(false)
+  const [autostartEnabled, setAutostartEnabled] = useState(false)
+  const [autostartStatus, setAutostartStatus] = useState(null)
+  const [autostartLoading, setAutostartLoading] = useState(false)
 
   useEffect(() => () => {
     if (avatarPreview) URL.revokeObjectURL(avatarPreview)
@@ -55,6 +60,34 @@ export default function Profile() {
     },
     [],
   )
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI) return
+    let mounted = true
+    const loadAutostart = async () => {
+      try {
+        const supported = await window.electronAPI.isAutostartSupported?.()
+        if (mounted) setAutostartSupported(supported !== false)
+        if (!supported) return
+        const enabled = await window.electronAPI.getAutostartStatus?.()
+        if (mounted) setAutostartEnabled(Boolean(enabled))
+      } catch (err) {
+        if (mounted) {
+          setAutostartStatus({ type: 'error', message: 'Не удалось получить состояние автозапуска' })
+        }
+      }
+    }
+    loadAutostart()
+    return () => {
+      mounted = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!autostartStatus) return undefined
+    const timer = setTimeout(() => setAutostartStatus(null), 4000)
+    return () => clearTimeout(timer)
+  }, [autostartStatus])
 
   const handleAvatarSelect = (event) => {
     const file = event.target.files?.[0]
@@ -106,6 +139,29 @@ export default function Profile() {
     setAvatarFile(null)
     setAvatarStatus(null)
     if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  const handleToggleAutostart = async () => {
+    if (typeof window === 'undefined' || !autostartSupported) return
+    const api = window.electronAPI
+    if (!api || typeof api.setAutostartStatus !== 'function') return
+    setAutostartLoading(true)
+    setAutostartStatus(null)
+    try {
+      const next = !autostartEnabled
+      const result = await api.setAutostartStatus(next)
+      const applied = Boolean(result)
+      setAutostartEnabled(applied)
+      setAutostartStatus({
+        type: 'success',
+        message: applied ? 'Автозапуск включен' : 'Автозапуск выключен',
+      })
+    } catch (err) {
+      console.error(err)
+      setAutostartStatus({ type: 'error', message: 'Не удалось изменить автозапуск' })
+    } finally {
+      setAutostartLoading(false)
+    }
   }
 
   const inviteStatusLabels = {
@@ -533,6 +589,54 @@ export default function Profile() {
           <p className="text-xs text-white/50">
             Совет: если устройства не отображаются или названы по умолчанию, разрешите доступ к микрофону в браузере и нажмите «Обновить устройства».
           </p>
+        </div>
+      </section>
+
+      <section className="panel rounded-3xl px-6 py-5 space-y-4">
+        <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Приложение</div>
+        <div className="space-y-4 text-sm text-white/80">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="text-sm text-white/80">Автозапуск</div>
+              <div className="text-xs text-white/50">
+                {autostartSupported
+                  ? 'Запускайте NE Messenger вместе с системой.'
+                  : 'Функция доступна в десктопном приложении.'}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleToggleAutostart}
+              disabled={!autostartSupported || autostartLoading}
+              className={`relative inline-flex h-7 w-14 items-center rounded-full border border-white/15 px-1 transition-all duration-200 ${
+                autostartEnabled ? 'bg-emerald-400/90 shadow-[0_0_12px_rgba(16,185,129,0.45)]' : 'bg-white/10'
+              } ${(!autostartSupported || autostartLoading) ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer hover:bg-white/15'}`}
+            >
+              <span
+                className={`h-5 w-5 rounded-full bg-white shadow transition-transform duration-200 ease-out ${
+                  autostartEnabled ? 'translate-x-7' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </div>
+          {autostartStatus && (
+            <div className={autostartStatus.type === 'error' ? 'text-xs text-red-300' : 'text-xs text-emerald-300'}>
+              {autostartStatus.message}
+            </div>
+          )}
+        </div>
+        <div className="border-t border-white/10 pt-4 space-y-3">
+          <div className="text-white/60 text-xs uppercase tracking-[0.25em]">Сессия</div>
+          <p className="text-xs text-white/50">
+            Завершите текущий вход, чтобы авторизоваться под другой учетной записью или сбросить сохраненный токен.
+          </p>
+          <button
+            type="button"
+            onClick={logout}
+            className="px-4 py-2 rounded-2xl bg-red-500/80 hover:bg-red-500 text-white transition"
+          >
+            Выйти из аккаунта
+          </button>
         </div>
       </section>
     </div>

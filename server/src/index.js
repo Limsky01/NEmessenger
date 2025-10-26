@@ -11,6 +11,7 @@ import fs from 'fs'
 import path from 'path'
 import multer from 'multer'
 import crypto from 'crypto'
+import mime from 'mime-types'
 
 const app = express()
 const server = http.createServer(app)
@@ -1688,7 +1689,7 @@ app.post('/api/upload/chunk', auth, upload.single('chunk'), (req, res) => {
 })
 
 app.post('/api/upload/complete', auth, (req, res) => {
-  const { uploadId, filename, mime } = req.body || {}
+  const { uploadId, filename, mime: rawMime } = req.body || {}
   if (!uploadId || !filename) return res.status(400).json({ error: 'bad_request' })
   const tmpDir = path.join(UPLOAD_DIR, 'tmp', uploadId)
   if (!fs.existsSync(tmpDir)) return res.status(400).json({ error: 'no_session' })
@@ -1699,6 +1700,9 @@ app.post('/api/upload/complete', auth, (req, res) => {
   if (!chunks.length) return res.status(400).json({ error: 'no_chunks' })
 
   const safeName = filename.replace(/[^a-zA-Z0-9_.-]/g, '_')
+  const providedMime = typeof rawMime === 'string' ? rawMime.trim() : ''
+  const guessedMime = mime.lookup(filename) || mime.lookup(safeName) || ''
+  const finalMime = providedMime || guessedMime || 'application/octet-stream'
   const finalId = uuidv4()
   const finalPath = path.join(UPLOAD_DIR, `${finalId}_${safeName}`)
   const { cipher, iv } = createFileCipher()
@@ -1733,9 +1737,9 @@ app.post('/api/upload/complete', auth, (req, res) => {
   }
 
   db.prepare('INSERT INTO files (id,uploader_id,original_name,mime,size,path,created_at,iv,auth_tag) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run(finalId, req.user.id, filename, mime || '', plaintextSize, finalPath, Date.now(), iv.toString('base64'), authTagBase64)
+    .run(finalId, req.user.id, filename, finalMime, plaintextSize, finalPath, Date.now(), iv.toString('base64'), authTagBase64)
   log('[UPLOAD] complete', 'user=' + req.user.id, 'upload=' + uploadId, 'file=' + finalId, 'name=' + filename, 'size=' + plaintextSize)
-  res.json({ file: { id: finalId, name: filename, mime: mime || '', size: plaintextSize } })
+  res.json({ file: { id: finalId, name: filename, mime: finalMime, size: plaintextSize } })
 })
 
 app.get('/api/files/:id/meta', auth, (req, res) => {
