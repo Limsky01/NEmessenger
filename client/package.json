@@ -43,7 +43,20 @@
             "assets/**",
             "package.json"
         ],
+        "extraResources": [
+            {
+                "from": "../server",
+                "to": "server",
+                "filter": [
+                    "**/*"
+                ]
+            }
+        ],
         "asar": true,
+        "asarUnpack": [
+            "server/node_modules/**/build/Release/*.node",
+            "server/node_modules/**/*.node"
+        ],
         "win": {
             "target": [
                 "nsis"

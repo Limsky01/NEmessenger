@@ -12,6 +12,26 @@ import path from 'path'
 import multer from 'multer'
 import crypto from 'crypto'
 import mime from 'mime-types'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+const resolveDataRoot = () => {
+  const candidate = process.env.NE_MESSENGER_DATA_ROOT
+  if (candidate && typeof candidate === 'string' && candidate.trim().length) {
+    return path.resolve(candidate)
+  }
+  return path.resolve(__dirname, '..')
+}
+
+const DATA_ROOT = resolveDataRoot()
+
+const resolveDataPath = (maybePath, fallback) => {
+  const base = typeof maybePath === 'string' && maybePath.trim().length ? maybePath.trim() : fallback
+  if (!base) return DATA_ROOT
+  return path.isAbsolute(base) ? base : path.join(DATA_ROOT, base)
+}
 
 const app = express()
 const server = http.createServer(app)
@@ -154,19 +174,24 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 4000
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret'
-const UPLOAD_DIR = process.env.UPLOAD_DIR || 'uploads'
+const DB_PATH = resolveDataPath(process.env.DB_FILE, 'messenger_v4.db')
+const DB_DIR = path.dirname(DB_PATH)
+if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true })
+
+const UPLOAD_DIR = resolveDataPath(process.env.UPLOAD_DIR, 'uploads')
 const AVATAR_DIR = path.join(UPLOAD_DIR, 'avatars')
 const CHANNEL_AVATAR_DIR = path.join(AVATAR_DIR, 'channels')
 const VOICE_AVATAR_DIR = path.join(AVATAR_DIR, 'voice-rooms')
 
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
-if (!fs.existsSync(path.join(UPLOAD_DIR, 'tmp'))) fs.mkdirSync(path.join(UPLOAD_DIR, 'tmp'), { recursive: true })
+const TEMP_DIR = path.join(UPLOAD_DIR, 'tmp')
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true })
 if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true })
 if (!fs.existsSync(CHANNEL_AVATAR_DIR)) fs.mkdirSync(CHANNEL_AVATAR_DIR, { recursive: true })
 if (!fs.existsSync(VOICE_AVATAR_DIR)) fs.mkdirSync(VOICE_AVATAR_DIR, { recursive: true })
 const UPLOADS_ROOT = path.resolve(UPLOAD_DIR)
 
-const db = new Database('messenger_v4.db')
+const db = new Database(DB_PATH)
 db.pragma('journal_mode = WAL')
 
 const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -2338,7 +2363,77 @@ process.on('unhandledRejection', (reason) => {
   logError('Unhandled rejection', reason)
 })
 
-server.listen(PORT, () => log('Server listening on', PORT))
+let listenPromise = null
+
+export const stopMessengerServer = () => {
+  if (listenPromise) {
+    return listenPromise
+      .then(() => stopMessengerServer())
+      .catch((err) => {
+        logError('Server stop failed during startup', err)
+        throw err
+      })
+  }
+  try {
+    io.close()
+  } catch (err) {
+    logError('Socket close failed', err)
+  }
+  if (!server.listening) {
+    return Promise.resolve()
+  }
+  return new Promise((resolve, reject) => {
+    server.close((err) => {
+      if (err) {
+        logError('Server close failed', err)
+        reject(err)
+      } else {
+        resolve()
+      }
+    })
+  })
+}
+
+export const startMessengerServer = (options = {}) => {
+  if (server.listening) {
+    const address = server.address()
+    const resolvedPort = typeof address === 'object' && address?.port ? address.port : Number(PORT) || 0
+    const resolvedHost = typeof address === 'object' && address?.address ? address.address : '127.0.0.1'
+    return Promise.resolve({ port: resolvedPort, host: resolvedHost, httpServer: server, io, close: stopMessengerServer })
+  }
+  if (listenPromise) return listenPromise
+  const host = typeof options.host === 'string' && options.host.trim().length ? options.host.trim() : '127.0.0.1'
+  const requestedPort = Number(options.port ?? PORT)
+  const port = Number.isFinite(requestedPort) ? requestedPort : Number(PORT) || 0
+  listenPromise = new Promise((resolve, reject) => {
+    const handleError = (err) => {
+      server.off('error', handleError)
+      listenPromise = null
+      logError('Server failed to start', err)
+      reject(err)
+    }
+    server.once('error', handleError)
+    server.listen(port, host, () => {
+      server.off('error', handleError)
+      const address = server.address()
+      const resolvedPort = typeof address === 'object' && address?.port ? address.port : port
+      const resolvedHost = typeof address === 'object' && address?.address ? address.address : host
+      log('Server listening on', `${resolvedHost}:${resolvedPort}`)
+      const result = { port: resolvedPort, host: resolvedHost, httpServer: server, io, close: stopMessengerServer }
+      listenPromise = null
+      resolve(result)
+    })
+  })
+  return listenPromise
+}
+
+const entryPath = process.argv[1] ? path.resolve(process.argv[1]) : null
+if (entryPath && entryPath === __filename) {
+  startMessengerServer().catch((err) => {
+    logError('Failed to start server', err)
+    process.exit(1)
+  })
+}
 
 
 

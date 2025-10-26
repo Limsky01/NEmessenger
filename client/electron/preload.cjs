@@ -47,5 +47,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   getAutostartStatus: () => ipcRenderer.invoke('autostart:get').catch(() => false),
   setAutostartStatus: (enabled) => ipcRenderer.invoke('autostart:set', Boolean(enabled)),
-  isAutostartSupported: () => ipcRenderer.invoke('autostart:is-supported').catch(() => false)
+  isAutostartSupported: () => ipcRenderer.invoke('autostart:is-supported').catch(() => false),
+  getBackendUrl: () => ipcRenderer.invoke('backend:get-url').catch(() => null),
+  onBackendReady: (cb) => {
+    if (typeof cb !== 'function') return () => {}
+    const handler = (_event, url) => cb(url)
+    ipcRenderer.on('backend:ready', handler)
+    return () => ipcRenderer.removeListener('backend:ready', handler)
+  },
 })

@@ -1,11 +1,168 @@
 import { app, BrowserWindow, ipcMain, Notification } from 'electron'
 import path from 'path'
-import { fileURLToPath } from 'url'
+import fs from 'fs'
+import crypto from 'crypto'
+import { fileURLToPath, pathToFileURL } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 let win = null
+let backendInfo = null
+let backendModule = null
+let backendStartPromise = null
+let backendStopPromise = null
+let backendUrl = null
+
+const DEFAULT_BACKEND_HOST = '127.0.0.1'
+const DEFAULT_BACKEND_PORT = 48080
+
+const resolveServerRoot = () => {
+  if (app?.isPackaged) {
+    return path.join(process.resourcesPath, 'server')
+  }
+  return path.resolve(__dirname, '..', '..', 'server')
+}
+
+const loadEnvFile = (filePath) => {
+  const env = {}
+  try {
+    if (!fs.existsSync(filePath)) return env
+    const raw = fs.readFileSync(filePath, 'utf8')
+    raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#'))
+      .forEach((line) => {
+        const eqIndex = line.indexOf('=')
+        if (eqIndex <= 0) return
+        const key = line.slice(0, eqIndex).trim()
+        const value = line.slice(eqIndex + 1).trim()
+        if (key) env[key] = value
+      })
+  } catch (err) {
+    console.warn('[main] failed to load env file', filePath, err)
+  }
+  return env
+}
+
+const readPersistedBackendConfig = (filePath) => {
+  try {
+    if (!fs.existsSync(filePath)) return {}
+    const raw = fs.readFileSync(filePath, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object') return parsed
+  } catch (err) {
+    console.warn('[main] failed to read backend config', err)
+  }
+  return {}
+}
+
+const writePersistedBackendConfig = (filePath, config) => {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf8')
+  } catch (err) {
+    console.warn('[main] failed to persist backend config', err)
+  }
+}
+
+const notifyBackendReady = (url) => {
+  if (!url) return
+  backendUrl = url
+  BrowserWindow.getAllWindows().forEach((window) => {
+    try {
+      window.webContents.send('backend:ready', url)
+    } catch (err) {
+      console.warn('[main] failed to notify backend ready', err)
+    }
+  })
+}
+
+const ensureBackend = async () => {
+  if (backendInfo) return backendInfo
+  if (backendStartPromise) return backendStartPromise
+
+  backendStartPromise = (async () => {
+    const serverRoot = resolveServerRoot()
+    const envFromFile = loadEnvFile(path.join(serverRoot, '.env'))
+    const dataRoot = path.join(app.getPath('userData'), 'backend')
+    fs.mkdirSync(dataRoot, { recursive: true })
+
+    const bundledDbPath = path.join(serverRoot, 'messenger_v4.db')
+    const targetDbPath = path.join(dataRoot, 'messenger_v4.db')
+    try {
+      if (!fs.existsSync(targetDbPath) && fs.existsSync(bundledDbPath)) {
+        fs.copyFileSync(bundledDbPath, targetDbPath)
+      }
+    } catch (err) {
+      console.warn('[main] failed to prepare bundled database', err)
+    }
+
+    const persistedConfigPath = path.join(dataRoot, 'config.json')
+    const persisted = readPersistedBackendConfig(persistedConfigPath)
+
+    const host = process.env.NE_BACKEND_HOST || persisted.host || envFromFile.HOST || DEFAULT_BACKEND_HOST
+    const port = Number(process.env.NE_BACKEND_PORT || persisted.port || envFromFile.PORT || DEFAULT_BACKEND_PORT)
+
+    const encryptionKey =
+      process.env.ENCRYPTION_KEY || persisted.encryptionKey || envFromFile.ENCRYPTION_KEY || crypto.randomBytes(32).toString('base64')
+    const jwtSecret = process.env.JWT_SECRET || persisted.jwtSecret || envFromFile.JWT_SECRET || crypto.randomBytes(32).toString('base64')
+
+    const uploadsDir = path.join(dataRoot, 'uploads')
+    fs.mkdirSync(uploadsDir, { recursive: true })
+
+    process.env.NE_MESSENGER_DATA_ROOT = dataRoot
+    process.env.PORT = String(port)
+    process.env.JWT_SECRET = jwtSecret
+    process.env.ENCRYPTION_KEY = encryptionKey
+    process.env.UPLOAD_DIR = uploadsDir
+
+    const moduleUrl = pathToFileURL(path.join(serverRoot, 'src/index.js')).href
+    const mod = await import(moduleUrl)
+    if (typeof mod.startMessengerServer !== 'function') {
+      throw new Error('startMessengerServer export not found')
+    }
+    backendModule = mod
+    const result = await mod.startMessengerServer({ host, port })
+    const resolvedPort = result?.port ?? port
+    const resolvedHost = result?.host ?? host
+    backendInfo = { ...result, port: resolvedPort, host: resolvedHost }
+    const baseUrl = `http://${resolvedHost}:${resolvedPort}`
+    backendInfo.url = baseUrl
+    writePersistedBackendConfig(persistedConfigPath, {
+      host: resolvedHost,
+      port: resolvedPort,
+      encryptionKey,
+      jwtSecret,
+    })
+    notifyBackendReady(baseUrl)
+    return backendInfo
+  })()
+
+  try {
+    return await backendStartPromise
+  } finally {
+    backendStartPromise = null
+  }
+}
+
+const stopBackend = async () => {
+  if (backendStopPromise) return backendStopPromise
+  if (!backendModule?.stopMessengerServer) return Promise.resolve(null)
+  backendStopPromise = backendModule
+    .stopMessengerServer()
+    .catch((err) => {
+      console.warn('[main] failed to stop backend', err)
+    })
+    .finally(() => {
+      backendStopPromise = null
+      backendInfo = null
+      backendModule = null
+      backendUrl = null
+    })
+  return backendStopPromise
+}
 
 const isAutostartSupported = () => {
   if (process.platform !== 'darwin' && process.platform !== 'win32') return false
@@ -77,6 +234,7 @@ const registerIpcHandlers = () => {
   ipcMain.removeHandler('autostart:get')
   ipcMain.removeHandler('autostart:set')
   ipcMain.removeHandler('autostart:is-supported')
+  ipcMain.removeHandler('backend:get-url')
 
   ipcMain.handle('window:get-state', () => getWindowState())
 
@@ -119,6 +277,15 @@ const registerIpcHandlers = () => {
   ipcMain.handle('autostart:is-supported', () => isAutostartSupported())
   ipcMain.handle('autostart:get', () => getAutostartEnabled())
   ipcMain.handle('autostart:set', (_event, enabled) => setAutostartEnabled(Boolean(enabled)))
+  ipcMain.handle('backend:get-url', async () => {
+    try {
+      const info = await ensureBackend()
+      return info?.url ?? backendUrl ?? null
+    } catch (err) {
+      console.error('[main] backend:get-url failed', err)
+      return backendUrl ?? null
+    }
+  })
 
   // Global notification IPC handler used by renderer via preload
   ipcMain.on('notify', (_event, rawPayload) => {
@@ -170,7 +337,7 @@ function createWindow() {
     webPreferences: {
       contextIsolation: true,
       sandbox: false,
-  preload: path.join(__dirname, 'preload.cjs'),
+      preload: path.join(__dirname, 'preload.cjs'),
     },
   })
 
@@ -179,6 +346,29 @@ function createWindow() {
   else win.loadFile(path.join(__dirname, '../renderer/index.html'))
 
   registerIpcHandlers()
+
+  if (backendUrl) {
+    win.webContents.once('did-finish-load', () => {
+      try {
+        win?.webContents.send('backend:ready', backendUrl)
+      } catch (err) {
+        console.warn('[main] failed to deliver backend url to renderer', err)
+      }
+    })
+  }
+
+  ensureBackend()
+    .then((info) => {
+      if (!info?.url) return
+      try {
+        win?.webContents.send('backend:ready', info.url)
+      } catch (err) {
+        console.warn('[main] failed to send backend url after init', err)
+      }
+    })
+    .catch((err) => {
+      console.error('[main] ensureBackend during window init failed', err)
+    })
 
   win.on('maximize', sendWindowState)
   win.on('unmaximize', sendWindowState)
@@ -189,13 +379,22 @@ function createWindow() {
   })
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  try {
+    await ensureBackend()
+  } catch (err) {
+    console.error('[main] failed to start backend', err)
+  }
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow()
     }
   })
+})
+
+app.on('before-quit', () => {
+  stopBackend()
 })
 
 app.on('window-all-closed', () => {

@@ -26,6 +26,8 @@ const DEFAULT_APPEARANCE = Object.freeze({
   noiseStrength: 0.12,
 })
 
+const DEFAULT_SERVER_URL = import.meta.env.VITE_LGM_SERVER || 'http://127.0.0.1:48080'
+
 const clamp = (value, min, max) => {
   if (!Number.isFinite(value)) return min
   if (value < min) return min
@@ -603,8 +605,36 @@ const buildAuthHeaders = (token) => ({ Authorization: `Bearer ${token}` })
 
 const initialAuth = loadStoredAuth()
 
+const integrateElectronBackend = (set, get) => {
+  if (typeof window === 'undefined') return
+  const api = window.electronAPI
+  if (!api) return
+  const applyUrl = (url) => {
+    if (!url || typeof url !== 'string') return
+    const normalized = url.trim()
+    if (!normalized.length) return
+    let shouldReconnect = false
+    set((state) => {
+      if (state.serverUrl === normalized) return state
+      if (state.token) shouldReconnect = true
+      return { serverUrl: normalized }
+    })
+    if (shouldReconnect) {
+      try {
+        get().connect()
+      } catch (err) {
+        console.warn('connect after backend url update failed', err)
+      }
+    }
+  }
+  api.getBackendUrl?.().then(applyUrl).catch((err) => console.warn('backend url resolve failed', err))
+  if (typeof api.onBackendReady === 'function') {
+    api.onBackendReady((url) => applyUrl(url))
+  }
+}
+
 const useStore = create((set, get) => ({
-  serverUrl: import.meta.env.VITE_LGM_SERVER || 'http://localhost:4000',
+  serverUrl: DEFAULT_SERVER_URL,
   token: initialAuth.token,
   user: initialAuth.user,
   users: [],
@@ -1993,5 +2023,10 @@ const useStore = create((set, get) => ({
     return normalized
   },
 }))
+
+if (typeof window !== 'undefined') {
+  const scheduleBackendIntegration = typeof queueMicrotask === 'function' ? queueMicrotask : (cb) => setTimeout(cb, 0)
+  scheduleBackendIntegration(() => integrateElectronBackend(useStore.setState, useStore.getState))
+}
 
 export default useStore
