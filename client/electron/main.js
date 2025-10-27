@@ -1,11 +1,92 @@
-import { app, BrowserWindow, ipcMain, Notification } from 'electron'
+import { app, BrowserWindow, ipcMain, Notification, Tray, Menu, nativeImage } from 'electron'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import fs from 'fs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 let win = null
+let tray = null
+let forceQuit = false
+
+const resolveFirstExistingPath = (candidates = []) => {
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'string') continue
+    try {
+      if (fs.existsSync(candidate)) return candidate
+    } catch (e) {}
+  }
+  return null
+}
+
+const loadTrayIcon = () => {
+  const iconPath = resolveFirstExistingPath([
+    path.join(__dirname, 'assets', 'tray.png'),
+    path.join(__dirname, '../assets', 'tray.png'),
+    path.join(process.resourcesPath || '', 'assets', 'tray.png'),
+  ])
+  if (iconPath) {
+    const image = nativeImage.createFromPath(iconPath)
+    if (!image.isEmpty()) {
+      if (process.platform === 'darwin') image.setTemplateImage(true)
+      return image
+    }
+  }
+  const fallback = nativeImage.createFromDataURL(
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAQAAABWESUoAAAAN0lEQVR42u3OMQ0AIBDAwAriAfx/nZkMNCaVWmBkT6UTzp0bPzHwOImg0JBoNCRaDwkGg0JFY4/1ZAAqJJ5qjj/zfAAAAAElFTkSuQmCC'
+  )
+  if (process.platform === 'darwin') fallback.setTemplateImage(true)
+  return fallback
+}
+
+const showWindow = () => {
+  if (!win) return
+  win.setSkipTaskbar(false)
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+  if (process.platform === 'darwin' && app.dock) app.dock.show()
+}
+
+const hideWindowToTray = () => {
+  if (!win) return
+  if (!tray) createTray()
+  win.hide()
+  win.setSkipTaskbar(true)
+  if (process.platform === 'darwin' && app.dock) app.dock.hide()
+}
+
+const createTray = () => {
+  if (tray) return tray
+  const trayIcon = loadTrayIcon()
+  tray = new Tray(trayIcon)
+  tray.setToolTip('NE Messenger')
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: 'Open',
+      click: () => showWindow(),
+    },
+    {
+      type: 'separator',
+    },
+    {
+      label: 'Quit',
+      click: () => {
+        forceQuit = true
+        if (tray) {
+          tray.destroy()
+          tray = null
+        }
+        app.quit()
+      },
+    },
+  ])
+  tray.setContextMenu(contextMenu)
+  tray.on('click', () => showWindow())
+  tray.on('double-click', () => showWindow())
+  return tray
+}
 
 const isAutostartSupported = () => {
   if (process.platform !== 'darwin' && process.platform !== 'win32') return false
@@ -97,7 +178,8 @@ const registerIpcHandlers = () => {
   })
 
   ipcMain.on('window:close', () => {
-    win?.close()
+    if (!win) return
+    hideWindowToTray()
   })
 
   ipcMain.on('window:drag-start', (_event, coords = {}) => {
@@ -170,7 +252,7 @@ function createWindow() {
     webPreferences: {
       contextIsolation: true,
       sandbox: false,
-  preload: path.join(__dirname, 'preload.cjs'),
+      preload: path.join(__dirname, 'preload.cjs'),
     },
   })
 
@@ -184,13 +266,27 @@ function createWindow() {
   win.on('unmaximize', sendWindowState)
   win.on('enter-full-screen', sendWindowState)
   win.on('leave-full-screen', sendWindowState)
-  win.on('close', () => {
+  win.on('minimize', (event) => {
+    event.preventDefault()
+    hideWindowToTray()
+  })
+  win.on('close', (event) => {
+    if (!forceQuit) {
+      event.preventDefault()
+      hideWindowToTray()
+      return
+    }
+    if (tray) {
+      tray.destroy()
+      tray = null
+    }
     win = null
   })
 }
 
 app.whenReady().then(() => {
   createWindow()
+  createTray()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow()
@@ -200,5 +296,13 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', () => {
+  forceQuit = true
+  if (tray) {
+    tray.destroy()
+    tray = null
+  }
 })
 

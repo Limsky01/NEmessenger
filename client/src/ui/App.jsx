@@ -5,6 +5,7 @@ import Chat from './Chat.jsx'
 import Login from './Login.jsx'
 import Profile from './Profile.jsx'
 import AdminPanel from './AdminPanel.jsx'
+import Settings from './Settings.jsx'
 import useStore from '../state/store.js'
 import SplashScreen from './SplashScreen.jsx'
 
@@ -153,7 +154,13 @@ function AppInner() {
         {token ? (
           <div className="flex h-[calc(100%-48px)]">
             <Sidebar />
-            {view === 'profile' ? <Profile /> : view === 'admin' ? <AdminPanel /> : <Chat />}
+            {view === 'profile'
+              ? <Profile />
+              : view === 'admin'
+              ? <AdminPanel />
+              : view === 'settings'
+              ? <Settings />
+              : <Chat />}
           </div>
         ) : (
           <Login />

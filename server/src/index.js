@@ -12,6 +12,7 @@ import path from 'path'
 import multer from 'multer'
 import crypto from 'crypto'
 import mime from 'mime-types'
+import { AccessToken } from 'livekit-server-sdk'
 
 const app = express()
 const server = http.createServer(app)
@@ -139,6 +140,14 @@ const pipeFileToResponse = (file, res) => {
   stream.pipe(decipher).pipe(res)
 }
 
+const resolveFileMime = (file) => {
+  if (!file) return 'application/octet-stream'
+  const stored = typeof file.mime === 'string' ? file.mime.trim() : ''
+  if (stored) return stored
+  const guessed = mime.lookup(file.original_name || '') || mime.lookup(file.path || '') || ''
+  return guessed || 'application/octet-stream'
+}
+
 app.use(cors({ origin: origins, credentials: true }))
 app.use(express.json({ limit: '5mb' }))
 
@@ -158,6 +167,14 @@ const UPLOAD_DIR = process.env.UPLOAD_DIR || 'uploads'
 const AVATAR_DIR = path.join(UPLOAD_DIR, 'avatars')
 const CHANNEL_AVATAR_DIR = path.join(AVATAR_DIR, 'channels')
 const VOICE_AVATAR_DIR = path.join(AVATAR_DIR, 'voice-rooms')
+const LIVEKIT_URL = (process.env.LIVEKIT_URL || '').trim()
+const LIVEKIT_API_KEY = (process.env.LIVEKIT_API_KEY || '').trim()
+const LIVEKIT_API_SECRET = (process.env.LIVEKIT_API_SECRET || '').trim()
+const LIVEKIT_ENABLED = Boolean(LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET)
+
+if (!LIVEKIT_ENABLED) {
+  warn('[VOICE] LiveKit configuration missing. Voice SFU is disabled.')
+}
 
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 if (!fs.existsSync(path.join(UPLOAD_DIR, 'tmp'))) fs.mkdirSync(path.join(UPLOAD_DIR, 'tmp'), { recursive: true })
@@ -1892,6 +1909,32 @@ const insertMessage = (() => {
 const voiceParticipants = new Map()
 const typingState = new Map()
 
+const buildLivekitSession = async (roomId, user) => {
+  if (!LIVEKIT_ENABLED) return null
+  if (!roomId || !user?.id) return null
+  try {
+    const identity = String(user.id)
+    const displayName = (user.username || identity || '').slice(0, 128)
+    const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+      identity,
+      name: displayName,
+    })
+    token.addGrant({
+      roomJoin: true,
+      room: roomId,
+      canPublish: true,
+      canPublishSources: ['microphone'],
+      canSubscribe: true,
+      canPublishData: true,
+    })
+    const jwt = await token.toJwt()
+    return { url: LIVEKIT_URL, token: jwt }
+  } catch (err) {
+    warn('[VOICE] livekit token failed', err?.message || err)
+    return null
+  }
+}
+
 const getVoiceRoomState = (roomId) => {
   const participants = voiceParticipants.get(roomId) || new Map()
   return Array.from(participants.values()).map((entry) => ({
@@ -2094,8 +2137,13 @@ io.on('connection', (socket) => {
     }
   }
 
-  const joinVoiceRoom = (roomId) => {
+  const joinVoiceRoom = async (roomId) => {
     if (!roomId) return
+    if (!LIVEKIT_ENABLED) {
+      warn('[VOICE] join rejected, LiveKit disabled', 'user=' + socket.user.id, 'room=' + roomId)
+      socket.emit('voice:error', { error: 'voice_unconfigured' })
+      return
+    }
     const room = selectVoiceRoomStmt.get(roomId)
     if (!room) {
       socket.emit('voice:error', { error: 'not_found' })
@@ -2105,7 +2153,23 @@ io.on('connection', (socket) => {
       socket.emit('voice:error', { error: 'forbidden' })
       return
     }
-    if (socket.voiceRoomId === roomId) return
+    const livekitSession = await buildLivekitSession(roomId, socket.user)
+    if (!livekitSession) {
+      socket.emit('voice:error', { error: 'livekit_failed' })
+      return
+    }
+    if (socket.voiceRoomId === roomId) {
+      const participants = getVoiceRoomState(roomId)
+      socket.emit('voice:participants', { roomId, participants })
+      const selfParticipant =
+        voiceParticipants.get(roomId)?.get(socket.id) || {
+          socketId: socket.id,
+          userId: socket.user.id,
+          username: socket.user.username,
+        }
+      socket.emit('voice:joined', { roomId, participant: selfParticipant, livekit: livekitSession })
+      return
+    }
     if (socket.voiceRoomId) leaveVoiceRoom(socket)
     let participants = voiceParticipants.get(roomId)
     if (!participants) {
@@ -2122,7 +2186,7 @@ io.on('connection', (socket) => {
     }
     participants.set(socket.id, participant)
     socket.emit('voice:participants', { roomId, participants: initialState })
-    socket.emit('voice:joined', { roomId, participant })
+    socket.emit('voice:joined', { roomId, participant, livekit: livekitSession })
     socket.to(`voice:${roomId}`).emit('voice:user-joined', { roomId, participant })
     // diagnostic
     try { console.log('[voice] user joined', { user: socket.user.id, socket: socket.id, roomId }) } catch (e) {}
@@ -2322,14 +2386,14 @@ io.on('connection', (socket) => {
     log('[SOCKET] disconnected', 'user=' + userId, 'socket=' + socket.id)
   })
 
-  socket.on('voice:join', ({ roomId }) => joinVoiceRoom(roomId))
+  socket.on('voice:join', ({ roomId }) =>
+    joinVoiceRoom(roomId).catch((err) => {
+      warn('[VOICE] join failed', err?.message || err)
+      socket.emit('voice:error', { error: 'internal_error' })
+    }),
+  )
   socket.on('voice:leave', () => leaveVoiceRoom(socket))
-  socket.on('voice:signal', ({ targetId, data }) => {
-    if (!targetId || !data) return
-    const targetSocket = io.sockets.sockets.get(targetId)
-    if (!targetSocket) return
-    targetSocket.emit('voice:signal', { from: socket.id, data })
-  })
+  socket.on('voice:signal', () => {})
 
   emitChannelListForUser(userId)
 })

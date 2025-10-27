@@ -277,3 +277,24 @@ body {
     margin-top: .5rem;
     box-shadow: 0 0 24px rgba(129, 140, 248, .45);
 }
+
+.settings-select {
+    background-color: rgba(255, 255, 255, .08);
+    color: rgba(241, 245, 249, .95);
+}
+
+.settings-select:focus {
+    background-color: rgba(255, 255, 255, .12);
+    color: rgba(255, 255, 255, 1);
+}
+
+.settings-select option {
+    background-color: #151a24;
+    color: #f8fafc;
+}
+
+.settings-select option:checked,
+.settings-select option:hover {
+    background-color: #1f2937;
+    color: #f8fafc;
+}

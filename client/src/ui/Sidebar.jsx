@@ -25,6 +25,7 @@ export default function Sidebar() {
   const me = useStore((s) => s.user)
   const onlineUserIds = useStore((s) => s.onlineUserIds)
   const openProfile = useStore((s) => s.openProfile)
+  const openSettings = useStore((s) => s.openSettings)
   const openAdmin = useStore((s) => s.openAdmin)
   const view = useStore((s) => s.view)
   const openDirectChat = useStore((s) => s.openDirectChat)
@@ -48,6 +49,11 @@ export default function Sidebar() {
   const voiceSpeaking = useStore((s) => s.voiceSpeaking)
   const voiceSelfSocketId = useStore((s) => s.voiceSelfSocketId)
   const updateVoiceRoomMembers = useStore((s) => s.updateVoiceRoomMembers)
+
+  const navButtonClass = (active) =>
+    `w-9 h-9 flex items-center justify-center rounded-xl transition button-press ${
+      active ? 'bg-white/25 text-white' : 'bg-white/10 text-white/70 hover:bg-white/20 hover:text-white'
+    }`
 
   const [searchTerm, setSearchTerm] = useState('')
 
@@ -401,21 +407,37 @@ export default function Sidebar() {
             <div className="text-[11px] text-white/40">ID: {me?.id}</div>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={openSettings}
+              className={navButtonClass(view === 'settings')}
+              aria-label="Настройки"
+              title="Настройки"
+            >
+              <span aria-hidden>&#9881;</span>
+              <span className="sr-only">Настройки</span>
+            </button>
             {me?.role === 'admin' && (
               <button
                 type="button"
                 onClick={openAdmin}
-                className={`px-3 py-1.5 text-xs rounded-xl transition button-press ${view === 'admin' ? 'bg-white/25 text-white' : 'bg-white/10 hover:bg-white/20'}`}
+                className={navButtonClass(view === 'admin')}
+                aria-label="Админ"
+                title="Админ"
               >
-                Админ
+                <span aria-hidden>&#128296;</span>
+                <span className="sr-only">Админ</span>
               </button>
             )}
             <button
               type="button"
               onClick={openProfile}
-              className={`px-3 py-1.5 text-xs rounded-xl transition button-press ${view === 'profile' ? 'bg-white/25 text-white' : 'bg-white/10 hover:bg-white/20'}`}
+              className={navButtonClass(view === 'profile')}
+              aria-label="Профиль"
+              title="Профиль"
             >
-              Профиль
+              <span aria-hidden>&#128100;</span>
+              <span className="sr-only">Профиль</span>
             </button>
           </div>
         </div>

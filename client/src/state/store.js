@@ -3,16 +3,16 @@ import { io } from 'socket.io-client'
 import axios from 'axios'
 import nacl from 'tweetnacl'
 import * as u8 from 'tweetnacl-util'
+import { Room, RoomEvent, Track, createLocalAudioTrack } from 'livekit-client'
 import { showNewMessageNotification } from '../utils/notifications'
 import { playVoiceJoinSound } from '../utils/sounds'
 
 const encoder = new TextEncoder()
 const storageKeyForChannel = (cid) => `chkey:${cid}`
-const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }]
-const voicePeerConnections = new Map()
-const speakingMonitors = new Map()
-// Buffer ICE candidates per peer until remoteDescription is applied
-const pendingIceCandidates = new Map()
+let livekitRoom = null
+let livekitLocalTrack = null
+const livekitRemoteTracks = new Map()
+const livekitIdentityToSocket = new Map()
 const APPEARANCE_STORAGE_KEY = 'nemessenger:appearance'
 const AUTH_STORAGE_KEY = 'nemessenger:auth'
 const DEFAULT_APPEARANCE = Object.freeze({
@@ -140,83 +140,6 @@ const RECONNECT_DELAYS = [5000, 10000, 20000]
 let reconnectTimeoutId = null
 let reconnectCountdownIntervalId = null
 
-const ensureAudioContext = () => {
-  if (typeof window === 'undefined') return null
-  const AudioCtx = window.AudioContext || window.webkitAudioContext
-  if (!AudioCtx) return null
-  if (!ensureAudioContext.ctx) {
-    try {
-      ensureAudioContext.ctx = new AudioCtx()
-    } catch (err) {
-      console.warn('audio context init failed', err)
-      return null
-    }
-  }
-  if (ensureAudioContext.ctx?.state === 'suspended') {
-    ensureAudioContext.ctx.resume().catch(() => {})
-  }
-  return ensureAudioContext.ctx
-}
-
-const stopSpeakingMonitor = (id, set) => {
-  if (!id) return
-  const session = speakingMonitors.get(id)
-  if (session) {
-    clearInterval(session.interval)
-    try {
-      session.source.disconnect()
-    } catch (err) {
-      console.warn('speaking monitor disconnect failed', err)
-    }
-    speakingMonitors.delete(id)
-  }
-  if (!set) return
-  set((state) => {
-    if (!state.voiceSpeaking || typeof state.voiceSpeaking !== 'object') return state
-    if (typeof state.voiceSpeaking[id] === 'undefined') return state
-    const next = { ...state.voiceSpeaking }
-    delete next[id]
-    return { voiceSpeaking: next }
-  })
-}
-
-const startSpeakingMonitor = (id, stream, set) => {
-  if (!id || !stream) return
-  const context = ensureAudioContext()
-  if (!context) return
-  stopSpeakingMonitor(id)
-  let source
-  try {
-    source = context.createMediaStreamSource(stream)
-  } catch (err) {
-    console.warn('media source init failed', err)
-    return
-  }
-  const analyser = context.createAnalyser()
-  analyser.smoothingTimeConstant = 0.8
-  analyser.fftSize = 512
-  source.connect(analyser)
-  const buffer = new Uint8Array(analyser.frequencyBinCount)
-  let lastState = false
-  const interval = setInterval(() => {
-    try {
-      analyser.getByteFrequencyData(buffer)
-      const avg = buffer.reduce((acc, value) => acc + value, 0) / buffer.length
-      const speaking = avg > 45
-      if (speaking !== lastState) {
-        lastState = speaking
-        set((state) => ({
-          voiceSpeaking: { ...state.voiceSpeaking, [id]: speaking },
-        }))
-      }
-    } catch (err) {
-      console.warn('speaking monitor update failed', err)
-    }
-  }, 160)
-  speakingMonitors.set(id, { analyser, source, interval })
-}
-ensureAudioContext.ctx = null
-
 const loadStoredDevice = (key) => {
   try {
     return localStorage.getItem(key) || null
@@ -240,35 +163,79 @@ const loadStoredVolume = () => {
   return 1
 }
 
-const teardownVoicePeer = (socketId, set) => {
-  const pc = voicePeerConnections.get(socketId)
-  if (pc) {
-    try {
-      pc.onicecandidate = null
-      pc.ontrack = null
-      pc.onconnectionstatechange = null
-      pc.close()
-    } catch (err) {
-      console.warn('peer close failed', err)
+const syncLivekitIdentityMap = (participants = []) => {
+  livekitIdentityToSocket.clear()
+  if (!Array.isArray(participants)) return
+  participants.forEach((participant) => {
+    if (participant?.userId && participant?.socketId) {
+      livekitIdentityToSocket.set(participant.userId, participant.socketId)
     }
-    voicePeerConnections.delete(socketId)
+  })
+}
+
+const resolveSocketKey = (identity, get) => {
+  if (!identity) return null
+  const cached = livekitIdentityToSocket.get(identity)
+  if (cached) return cached
+  const roomId = get().activeVoiceRoomId
+  if (!roomId) return identity
+  const participants = get().voiceParticipants[roomId] || []
+  const match = participants.find((entry) => entry.userId === identity)
+  if (match?.socketId) {
+    livekitIdentityToSocket.set(identity, match.socketId)
+    return match.socketId
   }
-  stopSpeakingMonitor(socketId, set)
+  return identity
+}
+
+const registerRemoteAudioTrack = (track, participant, get, set) => {
+  if (!track || track.kind !== Track.Kind.Audio) return
+  const key = resolveSocketKey(participant.identity, get) || participant.sid || participant.identity
+  if (!key) return
+  const stream = new MediaStream([track.mediaStreamTrack])
+  livekitRemoteTracks.set(key, { track, stream, participantIdentity: participant.identity })
+  set((state) => ({
+    voiceRemoteStreams: {
+      ...state.voiceRemoteStreams,
+      [key]: {
+        stream,
+        userId: participant.identity,
+        username: participant.name || participant.identity,
+      },
+    },
+    voicePeerStates: { ...state.voicePeerStates, [key]: 'connected' },
+  }))
+}
+
+const unregisterRemoteAudioTrack = (participant, get, set) => {
+  const identity = typeof participant === 'string' ? participant : participant?.identity
+  const fallbackKey = typeof participant === 'object' ? participant?.socketId : null
+  if (!identity && !fallbackKey) return
+  const key = resolveSocketKey(identity, get) || fallbackKey || identity
+  const meta = livekitRemoteTracks.get(key)
+  if (meta?.track && typeof meta.track.detach === 'function') {
+    try {
+      meta.track.detach()
+    } catch (err) {
+      console.warn('livekit track detach failed', err)
+    }
+  }
+  livekitRemoteTracks.delete(key)
   set((state) => {
     const nextStreams = { ...state.voiceRemoteStreams }
     const nextStates = { ...state.voicePeerStates }
     const nextSpeaking = { ...state.voiceSpeaking }
     let changed = false
-    if (nextStreams[socketId]) {
-      delete nextStreams[socketId]
+    if (nextStreams[key]) {
+      delete nextStreams[key]
       changed = true
     }
-    if (nextStates[socketId]) {
-      delete nextStates[socketId]
+    if (nextStates[key]) {
+      delete nextStates[key]
       changed = true
     }
-    if (typeof nextSpeaking[socketId] !== 'undefined') {
-      delete nextSpeaking[socketId]
+    if (typeof nextSpeaking[key] !== 'undefined') {
+      delete nextSpeaking[key]
       changed = true
     }
     if (!changed) return state
@@ -276,96 +243,65 @@ const teardownVoicePeer = (socketId, set) => {
   })
 }
 
-const setupVoicePeer = async ({ socket, roomId, participant, initiator, get, set }) => {
-  if (!participant || participant.socketId === socket.id) return null
-  let pc = voicePeerConnections.get(participant.socketId)
-  if (pc) return pc
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
-  voicePeerConnections.set(participant.socketId, pc)
-  const stream = get().voiceStream
-  if (stream) {
-    stream.getAudioTracks().forEach((track) => {
-      try {
-        pc.addTrack(track, stream)
-      } catch (err) {
-        console.error('addTrack failed', err)
-      }
+const updateActiveSpeakers = (speakers, get, set) => {
+  const activeKeys = new Set()
+  if (Array.isArray(speakers)) {
+    speakers.forEach((speaker) => {
+      const key = resolveSocketKey(speaker?.identity, get) || speaker?.sid || speaker?.identity
+      if (key) activeKeys.add(key)
     })
   }
-
-  pc.onicecandidate = (event) => {
-    try {
-      if (event.candidate) {
-        // diagnostic log
-        try { if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] sending candidate', { to: participant.socketId }) } catch(e){}
-        socket.emit('voice:signal', { targetId: participant.socketId, data: { candidate: event.candidate } })
-      }
-    } catch (e) {
-      console.error('onicecandidate handler error', e)
-    }
+  const localIdentity = livekitRoom?.localParticipant?.identity
+  const selfSocketId = get().voiceSelfSocketId
+  if (localIdentity && selfSocketId) {
+    const isSpeaking = Array.isArray(speakers) && speakers.some((speaker) => speaker?.identity === localIdentity)
+    if (isSpeaking) activeKeys.add(selfSocketId)
   }
+  set((state) => {
+    const next = { ...state.voiceSpeaking }
+    const keys = new Set([...Object.keys(next), ...activeKeys])
+    keys.forEach((key) => {
+      next[key] = activeKeys.has(key)
+    })
+    return { voiceSpeaking: next }
+  })
+}
 
-  pc.ontrack = (event) => {
-    const [remoteStream] = event.streams
-    if (!remoteStream) return
-    try { if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] ontrack', { from: participant.socketId }) } catch(e){}
-    set((state) => ({
-      voiceRemoteStreams: {
-        ...state.voiceRemoteStreams,
-        [participant.socketId]: {
-          stream: remoteStream,
-          userId: participant.userId,
-          username: participant.username,
-        },
-      },
-    }))
-    startSpeakingMonitor(participant.socketId, remoteStream, set)
-  }
-
-  pc.onconnectionstatechange = () => {
-    const state = pc.connectionState
+const cleanupLivekit = (set) => {
+  if (livekitRoom) {
     try {
-      set((current) => ({
-        voicePeerStates: { ...current.voicePeerStates, [participant.socketId]: state },
-      }))
-      if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] connection state change', { peer: participant.socketId, state })
-      if (state === 'failed' || state === 'disconnected' || state === 'closed') {
-        teardownVoicePeer(participant.socketId, set)
-      }
-    } catch (e) {
-      console.error('onconnectionstatechange handler error', e)
-    }
-  }
-
-  if (initiator) {
-    try {
-      const offer = await pc.createOffer()
-      await pc.setLocalDescription(offer)
-      try { if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] created offer', { to: participant.socketId, sdpType: offer.type, sdpLen: offer.sdp?.length }) } catch(e){}
-      socket.emit('voice:signal', { targetId: participant.socketId, data: { sdp: pc.localDescription } })
+      livekitRoom.removeAllListeners()
+      livekitRoom.disconnect(true)
     } catch (err) {
-      console.error('offer create failed', err)
+      console.warn('livekit disconnect failed', err)
     }
+    livekitRoom = null
   }
-
-  // drain any pending candidates for this peer (if any)
-  try {
-    const pend = pendingIceCandidates.get(participant.socketId)
-    if (pend && pend.length) {
-      for (const cand of pend) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(cand))
-        } catch (e) {
-          console.warn('drain candidate failed', e)
-        }
+  if (livekitLocalTrack) {
+    try {
+      livekitLocalTrack.stop()
+    } catch (err) {
+      console.warn('livekit local track stop failed', err)
+    }
+    livekitLocalTrack = null
+  }
+  livekitRemoteTracks.forEach((meta) => {
+    if (meta?.track && typeof meta.track.detach === 'function') {
+      try {
+        meta.track.detach()
+      } catch (err) {
+        console.warn('livekit track detach failed', err)
       }
-      pendingIceCandidates.delete(participant.socketId)
     }
-  } catch (e) {
-    console.warn('failed draining pending candidates', e)
-  }
-
-  return pc
+  })
+  livekitRemoteTracks.clear()
+  livekitIdentityToSocket.clear()
+  set((state) => ({
+    voiceRemoteStreams: {},
+    voicePeerStates: {},
+    voiceSpeaking: {},
+    voiceStream: null,
+  }))
 }
 
 export const buildDirectChannelId = (a, b) => {
@@ -666,6 +602,7 @@ const useStore = create((set, get) => ({
   },
   setView: (view) => set({ view }),
   openProfile: () => set({ view: 'profile' }),
+  openSettings: () => set({ view: 'settings' }),
   openChat: () => set({ view: 'chat' }),
   openAdmin: () => {
     if (get().user?.role !== 'admin') return
@@ -830,34 +767,18 @@ const useStore = create((set, get) => ({
     if (!socket || !roomId) return
     if (get().activeVoiceRoomId === roomId) return
     if (get().activeVoiceRoomId) get().leaveVoiceRoom(false)
-    try {
-      if (!navigator?.mediaDevices?.getUserMedia) throw new Error('media_unsupported')
-      const deviceId = get().audioInputDeviceId
-      const constraints = deviceId ? { audio: { deviceId: { exact: deviceId } } } : { audio: true }
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
-      set({ voiceStream: stream, voiceStatus: 'connecting', activeVoiceRoomId: roomId, voiceSelfSocketId: null })
-      socket.emit('voice:join', { roomId })
-    } catch (err) {
-      console.error('joinVoiceRoom failed', err)
-      set({ voiceStatus: 'error' })
-    }
+    livekitIdentityToSocket.clear()
+    set({ voiceStatus: 'connecting', activeVoiceRoomId: roomId, voiceSelfSocketId: null })
+    socket.emit('voice:join', { roomId })
   },
   leaveVoiceRoom: (emit = true) => {
     const socket = get().socket
     const roomId = get().activeVoiceRoomId
     if (emit && socket && roomId) socket.emit('voice:leave')
-    voicePeerConnections.forEach((_, id) => teardownVoicePeer(id, set))
-    voicePeerConnections.clear()
-    const stream = get().voiceStream
-    if (stream) stream.getTracks().forEach((track) => track.stop())
-    speakingMonitors.forEach((_, key) => stopSpeakingMonitor(key))
+    cleanupLivekit(set)
     set((state) => ({
       activeVoiceRoomId: null,
-      voiceStream: null,
       voiceStatus: null,
-      voiceRemoteStreams: {},
-      voicePeerStates: {},
-      voiceSpeaking: {},
       voiceSelfSocketId: null,
       voiceParticipants: roomId ? { ...state.voiceParticipants, [roomId]: [] } : state.voiceParticipants,
     }))
@@ -1340,137 +1261,170 @@ const useStore = create((set, get) => ({
     })
     socket.on('voice:state', ({ roomId, participants }) => {
       if (!roomId) return
+      const list = Array.isArray(participants) ? participants : []
       set((state) => ({
-        voiceParticipants: { ...state.voiceParticipants, [roomId]: participants || [] },
-        voiceRooms: state.voiceRooms.map((room) => (room.id === roomId ? { ...room, participantCount: (participants || []).length } : room)),
+        voiceParticipants: { ...state.voiceParticipants, [roomId]: list },
+        voiceRooms: state.voiceRooms.map((room) => (room.id === roomId ? { ...room, participantCount: list.length } : room)),
       }))
-    })
-    socket.on('voice:participants', async ({ roomId, participants }) => {
-      if (!roomId) return
-      set((state) => ({
-        voiceParticipants: { ...state.voiceParticipants, [roomId]: participants || [] },
-      }))
-      if (get().activeVoiceRoomId !== roomId) return
-      const list = participants || []
-      for (const participant of list) {
-        await setupVoicePeer({ socket, roomId, participant, initiator: true, get, set })
+      if (get().activeVoiceRoomId === roomId) {
+        syncLivekitIdentityMap(list)
       }
     })
-    socket.on('voice:user-joined', async ({ roomId, participant }) => {
-      if (!roomId || !participant) return
-      set((state) => ({
-        voiceParticipants: {
-          ...state.voiceParticipants,
-          [roomId]: [...(state.voiceParticipants[roomId] || []), participant],
-        },
-      }))
-      if (get().activeVoiceRoomId !== roomId) return
-      await setupVoicePeer({ socket, roomId, participant, initiator: true, get, set })
+    socket.on('voice:participants', ({ roomId, participants }) => {
+      if (!roomId) return
+      const list = Array.isArray(participants) ? participants : []
+      const isActive = get().activeVoiceRoomId === roomId
+      set((state) => {
+        const payload = {
+          voiceParticipants: { ...state.voiceParticipants, [roomId]: list },
+        }
+        if (isActive) {
+          const nextStates = { ...state.voicePeerStates }
+          list.forEach((p) => {
+            if (!nextStates[p.socketId]) {
+              nextStates[p.socketId] = p.socketId === state.voiceSelfSocketId ? 'connected' : 'connecting'
+            }
+          })
+          Object.keys(nextStates).forEach((key) => {
+            if (!list.some((p) => p.socketId === key)) delete nextStates[key]
+          })
+          payload.voicePeerStates = nextStates
+        }
+        return payload
+      })
+      if (isActive) syncLivekitIdentityMap(list)
     })
-    socket.on('voice:user-left', ({ roomId, socketId }) => {
+    socket.on('voice:user-joined', ({ roomId, participant }) => {
+      if (!roomId || !participant) return
+      const isActive = get().activeVoiceRoomId === roomId
+      set((state) => {
+        const existing = state.voiceParticipants[roomId] || []
+        const filtered = existing.filter((p) => p.socketId !== participant.socketId)
+        const nextParticipants = [...filtered, participant]
+        const payload = {
+          voiceParticipants: { ...state.voiceParticipants, [roomId]: nextParticipants },
+        }
+        if (isActive) {
+          payload.voicePeerStates = {
+            ...state.voicePeerStates,
+            [participant.socketId]:
+              participant.socketId === state.voiceSelfSocketId
+                ? 'connected'
+                : state.voicePeerStates[participant.socketId] || 'connecting',
+          }
+        }
+        return payload
+      })
+      if (isActive && participant.userId && participant.socketId) {
+        livekitIdentityToSocket.set(participant.userId, participant.socketId)
+      }
+    })
+    socket.on('voice:user-left', ({ roomId, socketId, userId }) => {
       if (!roomId || !socketId) return
+      const isActive = get().activeVoiceRoomId === roomId
       set((state) => ({
         voiceParticipants: {
           ...state.voiceParticipants,
           [roomId]: (state.voiceParticipants[roomId] || []).filter((p) => p.socketId !== socketId),
         },
       }))
-      teardownVoicePeer(socketId, set)
-    })
-    socket.on('voice:signal', async ({ from, data }) => {
-      if (!from || !data) return
-      const roomId = get().activeVoiceRoomId
-      if (!roomId) return
-      let pc = voicePeerConnections.get(from)
-      if (!pc) {
-        const participant = (get().voiceParticipants[roomId] || []).find((p) => p.socketId === from) || {
-          socketId: from,
-          userId: from,
-          username: 'Участник',
-        }
-        if (!participant) return
-        pc = await setupVoicePeer({ socket, roomId, participant, initiator: false, get, set })
-        if (!pc) return
-      }
-      if (data.sdp) {
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
-          // after remote description set, drain any buffered ICE candidates
-          try {
-            const pend = pendingIceCandidates.get(from)
-            if (pend && pend.length) {
-              for (const cand of pend) {
-                try {
-                  await pc.addIceCandidate(new RTCIceCandidate(cand))
-                } catch (e) {
-                  console.error('candidate add failed during drain', e)
-                }
-              }
-              pendingIceCandidates.delete(from)
-            }
-          } catch (e) {
-            console.error('drain after setRemoteDescription failed', e)
-          }
-          if (data.sdp.type === 'offer') {
-            const answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-            socket.emit('voice:signal', { targetId: from, data: { sdp: pc.localDescription } })
-          }
-        } catch (err) {
-          console.error('sdp handling failed', err)
-        }
-      }
-      if (data.candidate) {
-          try {
-            // If remoteDescription is not yet set, buffer the candidate
-            const remoteDesc = pc.remoteDescription
-            if (!remoteDesc || !remoteDesc.type) {
-              const list = pendingIceCandidates.get(from) || []
-              list.push(data.candidate)
-              pendingIceCandidates.set(from, list)
-              if (typeof window !== 'undefined' && window.__NE_VOICE_DEBUG__) console.debug('[voice] buffering candidate until remoteDescription', { from })
-            } else {
-              await pc.addIceCandidate(new RTCIceCandidate(data.candidate))
-            }
-          } catch (err) {
-            console.error('candidate add failed', err)
-          }
+      if (isActive) {
+        if (userId) livekitIdentityToSocket.delete(userId)
+        unregisterRemoteAudioTrack({ identity: userId, socketId }, get, set)
       }
     })
-    socket.on('voice:joined', async ({ roomId, participant }) => {
+    socket.on('voice:signal', () => {})
+    socket.on('voice:joined', async ({ roomId, participant, livekit }) => {
       if (!roomId) return
+      const session = livekit && typeof livekit === 'object' ? livekit : null
+      if (!session?.token || !session?.url) {
+        set({ voiceStatus: 'error' })
+        return
+      }
+      cleanupLivekit(set)
       const alreadyConnected = get().voiceStatus === 'connected'
       set((state) => {
         const list = state.voiceParticipants[roomId] || []
         const exists = participant ? list.some((p) => p.socketId === participant.socketId) : false
         const nextList = participant && !exists ? [...list, participant] : list
-        return {
-          voiceStatus: 'connected',
+        const payload = {
+          voiceStatus: 'connecting',
           activeVoiceRoomId: roomId,
           voiceSelfSocketId: participant?.socketId || state.voiceSelfSocketId,
           voiceParticipants: { ...state.voiceParticipants, [roomId]: nextList },
         }
+        if (participant?.socketId) {
+          payload.voicePeerStates = {
+            ...state.voicePeerStates,
+            [participant.socketId]: 'connecting',
+          }
+        }
+        return payload
       })
-      if (!alreadyConnected) {
-        try {
-          playVoiceJoinSound()
-        } catch (err) {
-          console.warn('voice join sound failed', err)
-        }
+      if (participant?.userId && participant?.socketId) {
+        livekitIdentityToSocket.set(participant.userId, participant.socketId)
       }
-      let localStream = get().voiceStream
-      if (!localStream) {
-        try {
-          localStream = await navigator.mediaDevices.getUserMedia({ audio: true })
-          set({ voiceStream: localStream })
-        } catch (err) {
+      try {
+        const deviceId = get().audioInputDeviceId || undefined
+        const audioTrack = await createLocalAudioTrack({
+          deviceId,
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true,
+        })
+        livekitLocalTrack = audioTrack
+        const localStream = new MediaStream([audioTrack.mediaStreamTrack])
+        set((state) => ({
+          voiceStream: localStream,
+          voicePeerStates: participant?.socketId
+            ? { ...state.voicePeerStates, [participant.socketId]: 'connected' }
+            : state.voicePeerStates,
+        }))
+        const room = new Room({
+          adaptiveStream: true,
+          dynacast: true,
+          publishDefaults: { audioBitrate: 32000 },
+        })
+        livekitRoom = room
+        room.on(RoomEvent.TrackSubscribed, (track, publication, remoteParticipant) => {
+          registerRemoteAudioTrack(track, remoteParticipant, get, set)
+        })
+        room.on(RoomEvent.TrackUnsubscribed, (track, publication, remoteParticipant) => {
+          if (track?.kind !== Track.Kind.Audio) return
+          unregisterRemoteAudioTrack(remoteParticipant, get, set)
+        })
+        room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => updateActiveSpeakers(speakers, get, set))
+        room.on(RoomEvent.ParticipantDisconnected, (remoteParticipant) => {
+          unregisterRemoteAudioTrack(remoteParticipant, get, set)
+        })
+        room.on(RoomEvent.Disconnected, () => {
+          set({ voiceStatus: 'disconnected' })
+        })
+        await room.connect(session.url, session.token, { autoSubscribe: true })
+        await room.localParticipant.publishTrack(audioTrack)
+        room.participants.forEach((remoteParticipant) => {
+          remoteParticipant.trackPublications.forEach((publication) => {
+            if (publication.isSubscribed && publication.track?.kind === Track.Kind.Audio) {
+              registerRemoteAudioTrack(publication.track, remoteParticipant, get, set)
+            }
+          })
+        })
+        set({ voiceStatus: 'connected' })
+        if (!alreadyConnected) {
+          try {
+            playVoiceJoinSound()
+          } catch (err) {
+            console.warn('voice join sound failed', err)
+          }
+        }
+      } catch (err) {
+        console.error('livekit connect failed', err)
+        if (err?.name === 'NotAllowedError' || err?.name === 'NotReadableError') {
           set({ voiceStatus: 'mic_denied' })
-          console.error('Не удалось получить доступ к микрофону', err)
-          return
+        } else {
+          set({ voiceStatus: 'error' })
         }
-      }
-      if (participant?.socketId && localStream) {
-        startSpeakingMonitor(participant.socketId, localStream, set)
+        cleanupLivekit(set)
       }
     })
     socket.on('voice:room-closed', ({ roomId }) => {
@@ -1479,22 +1433,27 @@ const useStore = create((set, get) => ({
         set({ voiceStatus: 'room_closed' })
       }
     })
-    socket.on('voice:error', ({ error }) => set({ voiceStatus: error || 'error' }))
-    socket.on('disconnect', (reason) => {
-      const stream = get().voiceStream
-      if (stream) stream.getTracks().forEach((track) => track.stop())
-      voicePeerConnections.forEach((_, id) => teardownVoicePeer(id, set))
-      voicePeerConnections.clear()
-      speakingMonitors.forEach((_, key) => stopSpeakingMonitor(key))
-      set({
-        voiceStream: null,
+    socket.on('voice:error', ({ error }) => {
+      cleanupLivekit(set)
+      set((state) => ({
+        voiceStatus: error || 'error',
         activeVoiceRoomId: null,
-        voiceRemoteStreams: {},
-        voicePeerStates: {},
-        voiceSpeaking: {},
+        voiceSelfSocketId: null,
+        voiceParticipants: state.activeVoiceRoomId
+          ? { ...state.voiceParticipants, [state.activeVoiceRoomId]: [] }
+          : state.voiceParticipants,
+      }))
+    })
+    socket.on('disconnect', (reason) => {
+      cleanupLivekit(set)
+      set((state) => ({
+        activeVoiceRoomId: null,
         voiceSelfSocketId: null,
         voiceStatus: 'disconnected',
-      })
+        voiceParticipants: state.activeVoiceRoomId
+          ? { ...state.voiceParticipants, [state.activeVoiceRoomId]: [] }
+          : state.voiceParticipants,
+      }))
       if (reason === 'io client disconnect') return
       scheduleReconnect(reason)
     })
