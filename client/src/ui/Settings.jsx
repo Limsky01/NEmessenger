@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import useStore from '../state/store.js'
 
 export default function Settings() {
@@ -18,6 +18,74 @@ export default function Settings() {
   const [autostartEnabled, setAutostartEnabled] = useState(false)
   const [autostartStatus, setAutostartStatus] = useState(null)
   const [autostartLoading, setAutostartLoading] = useState(false)
+  const [appVersion, setAppVersion] = useState('')
+  const [updateState, setUpdateState] = useState({
+    status: 'idle',
+    info: null,
+    progress: null,
+    message: null,
+    reason: null,
+    autoDownload: false,
+  })
+
+  const applyUpdateStatus = useCallback((incoming = {}) => {
+    setUpdateState((prev) => {
+      const status = incoming.status ?? prev.status ?? 'idle'
+      const info = Object.prototype.hasOwnProperty.call(incoming, 'info')
+        ? incoming.info
+        : ['available', 'downloading', 'downloaded'].includes(status)
+          ? prev.info
+          : null
+      const progress =
+        status === 'downloading'
+          ? (Object.prototype.hasOwnProperty.call(incoming, 'progress') ? incoming.progress : prev.progress)
+          : null
+      const message = Object.prototype.hasOwnProperty.call(incoming, 'message')
+        ? incoming.message
+        : status === prev.status
+          ? prev.message
+          : null
+      const reason = Object.prototype.hasOwnProperty.call(incoming, 'reason')
+        ? incoming.reason
+        : status === prev.status
+          ? prev.reason
+          : null
+      const autoDownload = Object.prototype.hasOwnProperty.call(incoming, 'autoDownload')
+        ? Boolean(incoming.autoDownload)
+        : prev.autoDownload ?? false
+      return {
+        status,
+        info,
+        progress,
+        message,
+        reason,
+        autoDownload,
+      }
+    })
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI) return undefined
+    let disposed = false
+    const bootstrap = async () => {
+      try {
+        const version = await window.electronAPI.getAppVersion?.()
+        if (!disposed && version) setAppVersion(version)
+      } catch (err) {}
+      try {
+        const initialStatus = await window.electronAPI.getUpdateStatus?.()
+        if (!disposed && initialStatus) applyUpdateStatus(initialStatus)
+      } catch (err) {}
+    }
+    bootstrap()
+    const unsubscribe = window.electronAPI.onUpdateStatus?.((payload) => {
+      if (!disposed) applyUpdateStatus(payload)
+    })
+    return () => {
+      disposed = true
+      if (typeof unsubscribe === 'function') unsubscribe()
+    }
+  }, [applyUpdateStatus])
 
   useEffect(() => {
     refreshAudioDevices()
@@ -120,6 +188,138 @@ export default function Settings() {
       setAutostartLoading(false)
     }
   }
+
+  const handleCheckUpdates = async () => {
+    if (typeof window === 'undefined' || !window.electronAPI?.checkForUpdates) return
+    applyUpdateStatus({ status: 'checking', message: null })
+    try {
+      const result = await window.electronAPI.checkForUpdates()
+      if (!result) return
+      if (result.ok === false) {
+        if (result.reason === 'development') {
+          applyUpdateStatus({
+            status: 'disabled',
+            reason: 'development',
+            message: 'Auto-update works only in packaged builds.',
+          })
+        } else if (result.error) {
+          applyUpdateStatus({ status: 'error', message: result.error })
+        }
+      }
+    } catch (err) {
+      const message = err?.message || err || 'Could not check for updates.'
+      applyUpdateStatus({ status: 'error', message })
+    }
+  }
+
+  const handleDownloadUpdate = async () => {
+    if (typeof window === 'undefined' || !window.electronAPI?.downloadUpdate) return
+    applyUpdateStatus({ status: 'downloading' })
+    try {
+      const result = await window.electronAPI.downloadUpdate()
+      if (result?.ok === false) {
+        if (result.reason === 'development') {
+          applyUpdateStatus({
+            status: 'disabled',
+            reason: 'development',
+            message: 'Auto-update works only in packaged builds.',
+          })
+        } else if (result.error) {
+          applyUpdateStatus({ status: 'error', message: result.error })
+        }
+      }
+    } catch (err) {
+      const message = err?.message || err || 'Failed to download update.'
+      applyUpdateStatus({ status: 'error', message })
+    }
+  }
+
+  const handleInstallUpdate = async () => {
+    if (typeof window === 'undefined' || !window.electronAPI?.installUpdate) return
+    try {
+      const result = await window.electronAPI.installUpdate()
+      if (result?.ok === false) {
+        if (result.reason === 'development') {
+          applyUpdateStatus({
+            status: 'disabled',
+            reason: 'development',
+            message: 'Auto-update works only in packaged builds.',
+          })
+        } else if (result.error) {
+          applyUpdateStatus({ status: 'error', message: result.error })
+        }
+        return
+      }
+      applyUpdateStatus({
+        status: 'downloaded',
+        message: 'Restarting to apply the update...',
+      })
+    } catch (err) {
+      const message = err?.message || err || 'Failed to apply update.'
+      applyUpdateStatus({ status: 'error', message })
+    }
+  }
+
+  const updateStatus = updateState.status
+  const updateInfoVersion = updateState.info?.version ?? null
+  const progressPercent =
+    typeof updateState.progress?.percent === 'number'
+      ? Math.max(0, Math.min(100, Math.round(updateState.progress.percent)))
+      : null
+  const updateIsDisabled = updateStatus === 'disabled'
+  const updateIsChecking = updateStatus === 'checking'
+  const updateIsDownloading = updateStatus === 'downloading'
+  const updateReadyToInstall = updateStatus === 'downloaded'
+  const updateCanDownload = updateStatus === 'available' && !updateState.autoDownload
+  let updateStatusText = 'Updates have not been checked yet.'
+  let updateStatusClass = 'text-white/60'
+
+  switch (updateStatus) {
+    case 'disabled':
+      updateStatusText = updateState.message || 'Auto-update works only in packaged builds.'
+      updateStatusClass = 'text-white/40'
+      break
+    case 'checking':
+      updateStatusText = 'Checking for updates...'
+      updateStatusClass = 'text-white/70'
+      break
+    case 'available':
+      updateStatusText = updateInfoVersion
+        ? `Version ${updateInfoVersion} is available.` +
+          (updateState.autoDownload ? ' Download will start automatically.' : '')
+        : 'An update is available.'
+      updateStatusClass = 'text-emerald-300'
+      break
+    case 'downloading':
+      updateStatusText = updateInfoVersion
+        ? `Downloading version ${updateInfoVersion}...`
+        : 'Downloading update...'
+      updateStatusClass = 'text-emerald-300'
+      break
+    case 'downloaded':
+      updateStatusText =
+        updateState.message ||
+        (updateInfoVersion
+          ? `Update ${updateInfoVersion} downloaded. Ready to install.`
+          : 'Update downloaded. Ready to install.')
+      updateStatusClass = 'text-emerald-300'
+      break
+    case 'not-available':
+      updateStatusText = 'You already have the latest version.'
+      updateStatusClass = 'text-white/60'
+      break
+    case 'error':
+      updateStatusText = updateState.message || 'Update failed.'
+      updateStatusClass = 'text-red-300'
+      break
+    case 'cancelled':
+      updateStatusText = 'Update download cancelled.'
+      updateStatusClass = 'text-red-300'
+      break
+    default:
+      break
+  }
+
 
   return (
     <div className="flex-1 h-full overflow-y-auto p-10 space-y-8 text-sm">
@@ -233,6 +433,66 @@ export default function Settings() {
               {autostartStatus.message}
             </div>
           )}
+        </div>
+        <div className="border-t border-white/10 pt-4 space-y-4">
+          <div className="text-white/60 text-xs uppercase tracking-[0.25em]">Updates</div>
+          <div className="space-y-2 text-xs">
+            <div className="text-white/60">
+              Current version: <span className="text-white/80">{appVersion || '—'}</span>
+            </div>
+            {updateInfoVersion && (
+              <div className="text-white/60">
+                Latest available version: <span className="text-white/80">{updateInfoVersion}</span>
+              </div>
+            )}
+            <div className={updateStatusClass}>{updateStatusText}</div>
+          </div>
+          {progressPercent !== null && (
+            <div className="space-y-2">
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full bg-emerald-400 transition-all duration-200"
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+              <div className="text-[10px] text-white/50">{progressPercent}%</div>
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleCheckUpdates}
+              disabled={updateIsDisabled || updateIsChecking || updateIsDownloading}
+              className={`px-4 py-2 rounded-2xl bg-white/10 transition ${
+                updateIsDisabled || updateIsChecking || updateIsDownloading
+                  ? 'opacity-40 cursor-not-allowed'
+                  : 'hover:bg-white/20'
+              }`}
+            >
+              {updateIsChecking ? 'Checking...' : 'Check for updates'}
+            </button>
+            {updateCanDownload && (
+              <button
+                type="button"
+                onClick={handleDownloadUpdate}
+                disabled={updateIsDownloading}
+                className={`px-4 py-2 rounded-2xl bg-white/10 transition ${
+                  updateIsDownloading ? 'opacity-40 cursor-not-allowed' : 'hover:bg-white/20'
+                }`}
+              >
+                {updateIsDownloading ? 'Downloading...' : 'Download update'}
+              </button>
+            )}
+            {updateReadyToInstall && (
+              <button
+                type="button"
+                onClick={handleInstallUpdate}
+                className="px-4 py-2 rounded-2xl bg-emerald-500/80 hover:bg-emerald-500 text-white transition"
+              >
+                Install and restart
+              </button>
+            )}
+          </div>
         </div>
         <div className="border-t border-white/10 pt-4 space-y-3">
           <div className="text-white/60 text-xs uppercase tracking-[0.25em]">Сессия</div>

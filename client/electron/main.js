@@ -2,6 +2,10 @@ import { app, BrowserWindow, ipcMain, Notification, Tray, Menu, nativeImage } fr
 import path from 'path'
 import { fileURLToPath } from 'url'
 import fs from 'fs'
+import { createRequire } from 'module'
+
+const require = createRequire(import.meta.url)
+const { autoUpdater } = require('electron-updater')
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -9,6 +13,82 @@ const __dirname = path.dirname(__filename)
 let win = null
 let tray = null
 let forceQuit = false
+let updaterInitialized = false
+let updateCheckInProgress = false
+let updateDownloadInProgress = false
+let lastUpdateStatus = null
+
+const buildUpdateStatusPayload = (status, extra = {}) => ({
+  status,
+  timestamp: Date.now(),
+  ...extra,
+})
+
+const broadcastUpdateStatus = (status, extra = {}) => {
+  const payload = buildUpdateStatusPayload(status, extra)
+  lastUpdateStatus = payload
+  const targets = BrowserWindow.getAllWindows()
+  for (const target of targets) {
+    try {
+      if (target?.webContents && !target.webContents.isDestroyed()) {
+        target.webContents.send('update:status', payload)
+      }
+    } catch (error) {
+      console.warn('[main] failed to send update status', error)
+    }
+  }
+}
+
+const initializeAutoUpdater = () => {
+  if (updaterInitialized) return
+  updaterInitialized = true
+
+  if (!app.isPackaged) {
+    broadcastUpdateStatus('disabled', { reason: 'development' })
+    return
+  }
+
+  autoUpdater.autoDownload = true
+  autoUpdater.autoInstallOnAppQuit = true
+  autoUpdater.logger = console
+
+  autoUpdater.on('checking-for-update', () => {
+    updateCheckInProgress = true
+    broadcastUpdateStatus('checking')
+  })
+
+  autoUpdater.on('update-available', (info) => {
+    updateCheckInProgress = false
+    broadcastUpdateStatus('available', { info, autoDownload: autoUpdater.autoDownload })
+  })
+
+  autoUpdater.on('update-not-available', (info) => {
+    updateCheckInProgress = false
+    broadcastUpdateStatus('not-available', { info })
+  })
+
+  autoUpdater.on('download-progress', (progress) => {
+    updateDownloadInProgress = true
+    broadcastUpdateStatus('downloading', { progress })
+  })
+
+  autoUpdater.on('update-downloaded', (info) => {
+    updateDownloadInProgress = false
+    broadcastUpdateStatus('downloaded', { info })
+  })
+
+  autoUpdater.on('error', (error) => {
+    updateCheckInProgress = false
+    updateDownloadInProgress = false
+    const message = error instanceof Error ? error.message : String(error)
+    broadcastUpdateStatus('error', { message })
+  })
+
+  autoUpdater.on('update-cancelled', () => {
+    updateDownloadInProgress = false
+    broadcastUpdateStatus('cancelled')
+  })
+}
 
 const resolveFirstExistingPath = (candidates = []) => {
   for (const candidate of candidates) {
@@ -150,6 +230,8 @@ const sendWindowState = () => {
 }
 
 const registerIpcHandlers = () => {
+  initializeAutoUpdater()
+
   ipcMain.removeHandler('window:get-state')
   ipcMain.removeAllListeners('window:minimize')
   ipcMain.removeAllListeners('window:toggle-maximize')
@@ -158,8 +240,65 @@ const registerIpcHandlers = () => {
   ipcMain.removeHandler('autostart:get')
   ipcMain.removeHandler('autostart:set')
   ipcMain.removeHandler('autostart:is-supported')
+  ipcMain.removeHandler('app:get-version')
+  ipcMain.removeHandler('update:check')
+  ipcMain.removeHandler('update:download')
+  ipcMain.removeHandler('update:install')
+  ipcMain.removeHandler('update:get-status')
+  ipcMain.removeAllListeners('notify')
 
   ipcMain.handle('window:get-state', () => getWindowState())
+  ipcMain.handle('app:get-version', () => app.getVersion())
+  ipcMain.handle('update:get-status', () => lastUpdateStatus)
+  ipcMain.handle('update:check', async () => {
+    if (!app.isPackaged) {
+      broadcastUpdateStatus('disabled', { reason: 'development' })
+      return { ok: false, reason: 'development' }
+    }
+    if (updateCheckInProgress) return { ok: true, inProgress: true }
+    try {
+      updateCheckInProgress = true
+      const result = await autoUpdater.checkForUpdates()
+      return { ok: true, info: result?.updateInfo ?? null }
+    } catch (error) {
+      updateCheckInProgress = false
+      const message = error instanceof Error ? error.message : String(error)
+      broadcastUpdateStatus('error', { message })
+      return { ok: false, error: message }
+    }
+  })
+  ipcMain.handle('update:download', async () => {
+    if (!app.isPackaged) {
+      broadcastUpdateStatus('disabled', { reason: 'development' })
+      return { ok: false, reason: 'development' }
+    }
+    if (updateDownloadInProgress) return { ok: true, inProgress: true }
+    try {
+      updateDownloadInProgress = true
+      const downloadedFile = await autoUpdater.downloadUpdate()
+      return { ok: true, downloadedFile }
+    } catch (error) {
+      updateDownloadInProgress = false
+      const message = error instanceof Error ? error.message : String(error)
+      broadcastUpdateStatus('error', { message })
+      return { ok: false, error: message }
+    }
+  })
+  ipcMain.handle('update:install', () => {
+    if (!app.isPackaged) {
+      broadcastUpdateStatus('disabled', { reason: 'development' })
+      return { ok: false, reason: 'development' }
+    }
+    setImmediate(() => {
+      try {
+        autoUpdater.quitAndInstall(true, true)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        broadcastUpdateStatus('error', { message })
+      }
+    })
+    return { ok: true }
+  })
 
   ipcMain.on('window:minimize', () => {
     win?.minimize()
@@ -262,6 +401,17 @@ function createWindow() {
 
   registerIpcHandlers()
 
+  win.webContents.once('did-finish-load', () => {
+    if (!lastUpdateStatus) return
+    try {
+      if (!win?.webContents?.isDestroyed()) {
+        win.webContents.send('update:status', lastUpdateStatus)
+      }
+    } catch (error) {
+      console.warn('[main] unable to send initial update status', error)
+    }
+  })
+
   win.on('maximize', sendWindowState)
   win.on('unmaximize', sendWindowState)
   win.on('enter-full-screen', sendWindowState)
@@ -287,6 +437,17 @@ function createWindow() {
 app.whenReady().then(() => {
   createWindow()
   createTray()
+  initializeAutoUpdater()
+  if (app.isPackaged) {
+    setTimeout(() => {
+      autoUpdater
+        .checkForUpdates()
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error)
+          broadcastUpdateStatus('error', { message })
+        })
+    }, 3000)
+  }
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow()

@@ -47,5 +47,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   getAutostartStatus: () => ipcRenderer.invoke('autostart:get').catch(() => false),
   setAutostartStatus: (enabled) => ipcRenderer.invoke('autostart:set', Boolean(enabled)),
-  isAutostartSupported: () => ipcRenderer.invoke('autostart:is-supported').catch(() => false)
+  isAutostartSupported: () => ipcRenderer.invoke('autostart:is-supported').catch(() => false),
+  getAppVersion: () => ipcRenderer.invoke('app:get-version').catch(() => null),
+  getUpdateStatus: () => ipcRenderer.invoke('update:get-status').catch(() => null),
+  checkForUpdates: () => ipcRenderer.invoke('update:check').catch((error) => ({ ok: false, error: error?.message || String(error) })),
+  downloadUpdate: () => ipcRenderer.invoke('update:download').catch((error) => ({ ok: false, error: error?.message || String(error) })),
+  installUpdate: () => ipcRenderer.invoke('update:install').catch((error) => ({ ok: false, error: error?.message || String(error) })),
+  onUpdateStatus: (callback) => {
+    if (typeof callback !== 'function') return () => {}
+    const handler = (_event, payload) => callback(payload)
+    ipcRenderer.on('update:status', handler)
+    return () => ipcRenderer.removeListener('update:status', handler)
+  }
 })
