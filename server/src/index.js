@@ -148,6 +148,47 @@ const resolveFileMime = (file) => {
   return guessed || 'application/octet-stream'
 }
 
+const safeMimePattern = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i
+const FALLBACK_DOWNLOAD_NAME = 'file'
+const sanitizeDownloadFilename = (name) => {
+  if (!name || typeof name !== 'string') return FALLBACK_DOWNLOAD_NAME
+  const cleaned = name.replace(/[\r\n]/g, ' ').replace(/"/g, "'").trim()
+  return cleaned || FALLBACK_DOWNLOAD_NAME
+}
+
+const sanitizeDiskFilename = (name) => {
+  const safe = sanitizeDownloadFilename(name)
+  const normalized = safe.replace(/[^a-zA-Z0-9_.-]/g, '_')
+  return normalized || FALLBACK_DOWNLOAD_NAME
+}
+
+const determineStoredMime = (rawMime, filename) => {
+  const raw = typeof rawMime === 'string' ? rawMime.trim() : ''
+  const guessed = mime.lookup(filename || '') || ''
+  if (raw && safeMimePattern.test(raw) && (!guessed || raw.toLowerCase() === guessed.toLowerCase())) {
+    return raw.toLowerCase()
+  }
+  if (guessed) return guessed
+  return 'application/octet-stream'
+}
+
+const INLINE_SAFE_VIEW_MIME_PREFIXES = ['image/', 'video/', 'audio/']
+const INLINE_SAFE_VIEW_MIME_VALUES = new Set(['application/pdf', 'text/plain'])
+
+const resolveInlineMimeType = (mimeType) => {
+  const normalized = typeof mimeType === 'string' ? mimeType.trim().toLowerCase() : ''
+  if (!normalized) return 'application/octet-stream'
+  if (INLINE_SAFE_VIEW_MIME_VALUES.has(normalized)) return normalized
+  if (INLINE_SAFE_VIEW_MIME_PREFIXES.some((prefix) => normalized.startsWith(prefix))) return normalized
+  return 'application/octet-stream'
+}
+
+const buildContentDisposition = (filename, { inline = false } = {}) => {
+  const safeName = sanitizeDownloadFilename(filename)
+  const encoded = encodeURIComponent(safeName)
+  return `${inline ? 'inline' : 'attachment'}; filename="${safeName}"; filename*=UTF-8''${encoded}`
+}
+
 app.use(cors({ origin: origins, credentials: true }))
 app.use(express.json({ limit: '5mb' }))
 
@@ -313,6 +354,7 @@ ensureColumn('users', 'avatar_updated_at', 'INTEGER DEFAULT 0')
 ensureColumn('users', 'avatar_mime', 'TEXT DEFAULT ""')
 ensureColumn('files', 'iv', 'TEXT DEFAULT ""')
 ensureColumn('files', 'auth_tag', 'TEXT DEFAULT ""')
+ensureColumn('files', 'channel_id', 'TEXT DEFAULT ""')
 ensureColumn('invites', 'claim_token', 'TEXT DEFAULT ""')
 ensureColumn('invites', 'claimed_at', 'INTEGER')
 ensureColumn('invites', 'used_by', 'TEXT')
@@ -349,6 +391,9 @@ try {
 } catch (err) {}
 try {
   db.prepare('ALTER TABLE files ADD COLUMN auth_tag TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE files ADD COLUMN channel_id TEXT DEFAULT ""').run()
 } catch (err) {}
 try {
   db.prepare('ALTER TABLE invites ADD COLUMN claim_token TEXT DEFAULT ""').run()
@@ -599,6 +644,7 @@ const fileMeta = (file) => {
     name: file.original_name,
     mime: file.mime || '',
     size: file.size ?? 0,
+    channelId: file.channel_id || '',
   }
 }
 
@@ -775,6 +821,32 @@ const isMemberOfDirectChannel = (channelId, userId) => {
   if (!parsed) return false
   return parsed.first === userId || parsed.second === userId
 }
+
+const normalizeUploadChannelTarget = (rawChannelId, user) => {
+  if (!rawChannelId) return { id: '' }
+  if (typeof rawChannelId !== 'string') return { error: 'invalid_channel', status: 400 }
+  if (rawChannelId.startsWith('dm:')) {
+    if (!isMemberOfDirectChannel(rawChannelId, user.id)) return { error: 'forbidden', status: 403 }
+    const normalized = normalizeDirectChannelId(rawChannelId)
+    if (!normalized) return { error: 'invalid_channel', status: 400 }
+    return { id: normalized }
+  }
+  const access = resolveChannelAccess(user, rawChannelId)
+  if (!access.allowed) return { error: 'forbidden', status: 403 }
+  return { id: rawChannelId }
+}
+
+const canAccessFile = (file, user) => {
+  if (!file || !user) return false
+  if (user.role === 'admin') return true
+  if (file.uploader_id && file.uploader_id === user.id) return true
+  const channelId = file.channel_id || ''
+  if (!channelId) return false
+  if (channelId.startsWith('dm:')) return isMemberOfDirectChannel(channelId, user.id)
+  const access = resolveChannelAccess(user, channelId)
+  return !!access.allowed
+}
+
 
 const auth = (req, res, next) => {
   const hdr = req.headers.authorization || ''
@@ -1684,52 +1756,111 @@ const voiceAvatarUpload = multer({
 
 const upload = multer({ storage: multer.memoryStorage() })
 
+const resolveUploadSessionMeta = (dir) => {
+  const metaPath = path.join(dir, 'meta.json')
+  try {
+    const raw = fs.readFileSync(metaPath, 'utf8')
+    return JSON.parse(raw)
+  } catch (err) {
+    return null
+  }
+}
+
 app.post('/api/upload/init', auth, (req, res) => {
-  const { filename, size } = req.body || {}
-  if (!filename || !size) return res.status(400).json({ error: 'bad_request' })
+  const { filename: rawName, size, mime: rawMime, channelId: rawChannelId } = req.body || {}
+  const normalizedSize = Number(size)
+  if (!rawName || !Number.isFinite(normalizedSize) || normalizedSize <= 0)
+    return res.status(400).json({ error: 'bad_request' })
+  const normalizedName = sanitizeDownloadFilename(rawName)
+  const safeName = sanitizeDiskFilename(normalizedName)
+  const normalizedMime = determineStoredMime(rawMime, normalizedName || safeName)
+  const channelResult = normalizeUploadChannelTarget(rawChannelId, req.user)
+  if (channelResult.error) return res.status(channelResult.status || 400).json({ error: channelResult.error })
   const id = uuidv4()
   const tmpDir = path.join(UPLOAD_DIR, 'tmp', id)
   fs.mkdirSync(tmpDir, { recursive: true })
-  log('[UPLOAD] init', 'user=' + req.user.id, 'upload=' + id, 'name=' + filename, 'size=' + size)
+  const meta = {
+    ownerId: req.user.id,
+    originalName: normalizedName,
+    safeName,
+    size: normalizedSize,
+    mime: normalizedMime,
+    channelId: channelResult.id || '',
+  }
+  fs.writeFileSync(path.join(tmpDir, 'meta.json'), JSON.stringify(meta, null, 2))
+  log(
+    '[UPLOAD] init',
+    'user=' + req.user.id,
+    'upload=' + id,
+    'name=' + normalizedName,
+    'size=' + normalizedSize,
+    'channel=' + (channelResult.id || 'none'),
+  )
   res.json({ uploadId: id })
 })
 
 app.post('/api/upload/chunk', auth, upload.single('chunk'), (req, res) => {
   const { uploadId, index } = req.body || {}
   if (!uploadId || typeof index === 'undefined') return res.status(400).json({ error: 'bad_request' })
+  const chunkIndex = Number(index)
+  if (!Number.isInteger(chunkIndex) || chunkIndex < 0) return res.status(400).json({ error: 'bad_chunk' })
+  if (!req.file?.buffer?.length) return res.status(400).json({ error: 'empty_chunk' })
   const tmpDir = path.join(UPLOAD_DIR, 'tmp', uploadId)
   if (!fs.existsSync(tmpDir)) return res.status(400).json({ error: 'no_session' })
-  const chunkPath = path.join(tmpDir, `chunk_${index}`)
+  const meta = resolveUploadSessionMeta(tmpDir)
+  if (!meta || meta.ownerId !== req.user.id) return res.status(403).json({ error: 'forbidden' })
+  const chunkPath = path.join(tmpDir, `chunk_${chunkIndex}`)
+  if (fs.existsSync(chunkPath)) return res.status(409).json({ error: 'chunk_exists' })
   fs.writeFileSync(chunkPath, req.file.buffer)
-  log('[UPLOAD] chunk', 'user=' + req.user.id, 'upload=' + uploadId, 'index=' + index, 'bytes=' + (req.file?.buffer?.length || 0))
+  log(
+    '[UPLOAD] chunk',
+    'user=' + req.user.id,
+    'upload=' + uploadId,
+    'index=' + chunkIndex,
+    'bytes=' + req.file.buffer.length,
+  )
   res.json({ ok: true })
 })
 
 app.post('/api/upload/complete', auth, (req, res) => {
-  const { uploadId, filename, mime: rawMime } = req.body || {}
-  if (!uploadId || !filename) return res.status(400).json({ error: 'bad_request' })
+  const { uploadId } = req.body || {}
+  if (!uploadId) return res.status(400).json({ error: 'bad_request' })
   const tmpDir = path.join(UPLOAD_DIR, 'tmp', uploadId)
   if (!fs.existsSync(tmpDir)) return res.status(400).json({ error: 'no_session' })
+  const meta = resolveUploadSessionMeta(tmpDir)
+  if (!meta || meta.ownerId !== req.user.id) return res.status(403).json({ error: 'forbidden' })
   const chunks = fs
     .readdirSync(tmpDir)
     .filter((n) => n.startsWith('chunk_'))
     .sort((a, b) => parseInt(a.split('_')[1], 10) - parseInt(b.split('_')[1], 10))
   if (!chunks.length) return res.status(400).json({ error: 'no_chunks' })
 
-  const safeName = filename.replace(/[^a-zA-Z0-9_.-]/g, '_')
-  const providedMime = typeof rawMime === 'string' ? rawMime.trim() : ''
-  const guessedMime = mime.lookup(filename) || mime.lookup(safeName) || ''
-  const finalMime = providedMime || guessedMime || 'application/octet-stream'
+  const parsedChunks = chunks.map((name) => ({
+    name,
+    index: parseInt(name.split('_')[1], 10),
+  }))
+  if (parsedChunks.some((entry) => !Number.isInteger(entry.index) || entry.index < 0))
+    return res.status(400).json({ error: 'bad_chunk_index' })
+  for (let expected = 0; expected < parsedChunks.length; expected += 1) {
+    if (parsedChunks[expected].index !== expected) {
+      return res.status(400).json({ error: 'chunk_order' })
+    }
+  }
+
+  const originalName = sanitizeDownloadFilename(meta.originalName || FALLBACK_DOWNLOAD_NAME)
+  const safeName = meta.safeName || sanitizeDiskFilename(originalName)
+  const finalMime = determineStoredMime(meta.mime, originalName)
   const finalId = uuidv4()
   const finalPath = path.join(UPLOAD_DIR, `${finalId}_${safeName}`)
+  const expectedSize = Number(meta.size) || 0
   const { cipher, iv } = createFileCipher()
   let authTagBase64 = ''
   let plaintextSize = 0
   let fd
   try {
     fd = fs.openSync(finalPath, 'w')
-    for (const chunkName of chunks) {
-      const chunkPath = path.join(tmpDir, chunkName)
+    for (const chunkEntry of parsedChunks) {
+      const chunkPath = path.join(tmpDir, chunkEntry.name)
       const data = fs.readFileSync(chunkPath)
       plaintextSize += data.length
       const encryptedPart = cipher.update(data)
@@ -1743,7 +1874,9 @@ app.post('/api/upload/complete', auth, (req, res) => {
     try {
       if (fd) fs.closeSync(fd)
     } catch (_) {}
-    try { fs.unlinkSync(finalPath) } catch (_) {}
+    try {
+      fs.unlinkSync(finalPath)
+    } catch (_) {}
     fs.rmSync(tmpDir, { recursive: true, force: true })
     return res.status(500).json({ error: 'merge_failed' })
   } finally {
@@ -1753,10 +1886,38 @@ app.post('/api/upload/complete', auth, (req, res) => {
     fs.rmSync(tmpDir, { recursive: true, force: true })
   }
 
-  db.prepare('INSERT INTO files (id,uploader_id,original_name,mime,size,path,created_at,iv,auth_tag) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run(finalId, req.user.id, filename, finalMime, plaintextSize, finalPath, Date.now(), iv.toString('base64'), authTagBase64)
-  log('[UPLOAD] complete', 'user=' + req.user.id, 'upload=' + uploadId, 'file=' + finalId, 'name=' + filename, 'size=' + plaintextSize)
-  res.json({ file: { id: finalId, name: filename, mime: finalMime, size: plaintextSize } })
+  if (expectedSize && plaintextSize !== expectedSize) {
+    warn('[UPLOAD] size_mismatch', 'upload=' + uploadId, 'expected=' + expectedSize, 'actual=' + plaintextSize)
+    try {
+      fs.unlinkSync(finalPath)
+    } catch (_) {}
+    return res.status(400).json({ error: 'size_mismatch' })
+  }
+
+  db.prepare(
+    'INSERT INTO files (id,uploader_id,original_name,mime,size,path,created_at,iv,auth_tag,channel_id) VALUES (?,?,?,?,?,?,?,?,?,?)',
+  ).run(
+    finalId,
+    req.user.id,
+    originalName,
+    finalMime,
+    plaintextSize,
+    finalPath,
+    Date.now(),
+    iv.toString('base64'),
+    authTagBase64,
+    meta.channelId || '',
+  )
+  log(
+    '[UPLOAD] complete',
+    'user=' + req.user.id,
+    'upload=' + uploadId,
+    'file=' + finalId,
+    'name=' + originalName,
+    'size=' + plaintextSize,
+    'channel=' + (meta.channelId || 'none'),
+  )
+  res.json({ file: { id: finalId, name: originalName, mime: finalMime, size: plaintextSize } })
 })
 
 app.get('/api/files/:id/meta', auth, (req, res) => {
@@ -1770,9 +1931,11 @@ app.get('/api/files/:id', auth, (req, res) => {
   const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
   if (!file) return res.status(404).json({ error: 'not_found' })
   if (!file.path || !fs.existsSync(file.path)) return res.status(404).json({ error: 'missing_file' })
+  if (!canAccessFile(file, req.user)) return res.status(403).json({ error: 'forbidden' })
   log('[FILES] download', 'user=' + req.user.id, 'file=' + req.params.id, 'name=' + file.original_name)
-  res.setHeader('Content-Type', file.mime || 'application/octet-stream')
-  res.setHeader('Content-Disposition', `attachment; filename="${file.original_name}"`)
+  const mimeType = resolveFileMime(file)
+  res.setHeader('Content-Type', mimeType)
+  res.setHeader('Content-Disposition', buildContentDisposition(file.original_name, { inline: false }))
   if (typeof file.size === 'number' && Number.isFinite(file.size)) res.setHeader('Content-Length', file.size)
   pipeFileToResponse(file, res)
 })
@@ -1781,9 +1944,11 @@ app.get('/api/files/:id/view', auth, (req, res) => {
   const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
   if (!file) return res.status(404).json({ error: 'not_found' })
   if (!file.path || !fs.existsSync(file.path)) return res.status(404).json({ error: 'missing_file' })
+  if (!canAccessFile(file, req.user)) return res.status(403).json({ error: 'forbidden' })
   log('[FILES] inline', 'user=' + req.user.id, 'file=' + req.params.id, 'name=' + file.original_name)
-  res.setHeader('Content-Type', file.mime || 'application/octet-stream')
-  res.setHeader('Content-Disposition', `inline; filename="${file.original_name}"`)
+  const mimeType = resolveInlineMimeType(resolveFileMime(file))
+  res.setHeader('Content-Type', mimeType)
+  res.setHeader('Content-Disposition', buildContentDisposition(file.original_name, { inline: mimeType !== 'application/octet-stream' }))
   if (typeof file.size === 'number' && Number.isFinite(file.size)) res.setHeader('Content-Length', file.size)
   pipeFileToResponse(file, res)
 })
