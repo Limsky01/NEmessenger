@@ -3,18 +3,17 @@ import { io } from 'socket.io-client'
 import axios from 'axios'
 import nacl from 'tweetnacl'
 import * as u8 from 'tweetnacl-util'
-import { Room, RoomEvent, Track, createLocalAudioTrack } from 'livekit-client'
 import { showNewMessageNotification } from '../utils/notifications'
-import { playVoiceJoinSound } from '../utils/sounds'
 
 const encoder = new TextEncoder()
 const storageKeyForChannel = (cid) => `chkey:${cid}`
-let livekitRoom = null
-let livekitLocalTrack = null
-const livekitRemoteTracks = new Map()
-const livekitIdentityToSocket = new Map()
 const APPEARANCE_STORAGE_KEY = 'nemessenger:appearance'
 const AUTH_STORAGE_KEY = 'nemessenger:auth'
+const USER_STATUS_KEY = 'nemessenger:user-status'
+const NAME_STYLE_KEY = 'nemessenger:name-style'
+const PROFILE_STATUS_KEY = 'nemessenger:profile-status'
+const PROFILE_BACKGROUND_KEY = 'nemessenger:profile-background'
+const SERVER_URL_KEY = 'nemessenger:server-url'
 const DEFAULT_APPEARANCE = Object.freeze({
   backgroundMode: 'gradient',
   gradient: { angle: 135, colors: ['#11131f', '#090a0f', '#141b2d'] },
@@ -24,6 +23,11 @@ const DEFAULT_APPEARANCE = Object.freeze({
   glassOpacity: 0.12,
   panelOpacity: 0.18,
   noiseStrength: 0.12,
+})
+const DEFAULT_NAME_STYLE = Object.freeze({
+  font: 'rubik',
+  effect: 'minimal',
+  color: '#8ec5ff',
 })
 
 const clamp = (value, min, max) => {
@@ -140,169 +144,6 @@ const RECONNECT_DELAYS = [5000, 10000, 20000]
 let reconnectTimeoutId = null
 let reconnectCountdownIntervalId = null
 
-const loadStoredDevice = (key) => {
-  try {
-    return localStorage.getItem(key) || null
-  } catch (err) {
-    console.warn('audio device restore failed', err)
-    return null
-  }
-}
-
-const loadStoredVolume = () => {
-  try {
-    const raw = localStorage.getItem('audioVolume')
-    if (!raw) return 1
-    const value = parseFloat(raw)
-    if (Number.isFinite(value)) {
-      return Math.min(Math.max(value, 0), 1)
-    }
-  } catch (err) {
-    console.warn('audio volume restore failed', err)
-  }
-  return 1
-}
-
-const syncLivekitIdentityMap = (participants = []) => {
-  livekitIdentityToSocket.clear()
-  if (!Array.isArray(participants)) return
-  participants.forEach((participant) => {
-    if (participant?.userId && participant?.socketId) {
-      livekitIdentityToSocket.set(participant.userId, participant.socketId)
-    }
-  })
-}
-
-const resolveSocketKey = (identity, get) => {
-  if (!identity) return null
-  const cached = livekitIdentityToSocket.get(identity)
-  if (cached) return cached
-  const roomId = get().activeVoiceRoomId
-  if (!roomId) return identity
-  const participants = get().voiceParticipants[roomId] || []
-  const match = participants.find((entry) => entry.userId === identity)
-  if (match?.socketId) {
-    livekitIdentityToSocket.set(identity, match.socketId)
-    return match.socketId
-  }
-  return identity
-}
-
-const registerRemoteAudioTrack = (track, participant, get, set) => {
-  if (!track || track.kind !== Track.Kind.Audio) return
-  const key = resolveSocketKey(participant.identity, get) || participant.sid || participant.identity
-  if (!key) return
-  const stream = new MediaStream([track.mediaStreamTrack])
-  livekitRemoteTracks.set(key, { track, stream, participantIdentity: participant.identity })
-  set((state) => ({
-    voiceRemoteStreams: {
-      ...state.voiceRemoteStreams,
-      [key]: {
-        stream,
-        userId: participant.identity,
-        username: participant.name || participant.identity,
-      },
-    },
-    voicePeerStates: { ...state.voicePeerStates, [key]: 'connected' },
-  }))
-}
-
-const unregisterRemoteAudioTrack = (participant, get, set) => {
-  const identity = typeof participant === 'string' ? participant : participant?.identity
-  const fallbackKey = typeof participant === 'object' ? participant?.socketId : null
-  if (!identity && !fallbackKey) return
-  const key = resolveSocketKey(identity, get) || fallbackKey || identity
-  const meta = livekitRemoteTracks.get(key)
-  if (meta?.track && typeof meta.track.detach === 'function') {
-    try {
-      meta.track.detach()
-    } catch (err) {
-      console.warn('livekit track detach failed', err)
-    }
-  }
-  livekitRemoteTracks.delete(key)
-  set((state) => {
-    const nextStreams = { ...state.voiceRemoteStreams }
-    const nextStates = { ...state.voicePeerStates }
-    const nextSpeaking = { ...state.voiceSpeaking }
-    let changed = false
-    if (nextStreams[key]) {
-      delete nextStreams[key]
-      changed = true
-    }
-    if (nextStates[key]) {
-      delete nextStates[key]
-      changed = true
-    }
-    if (typeof nextSpeaking[key] !== 'undefined') {
-      delete nextSpeaking[key]
-      changed = true
-    }
-    if (!changed) return state
-    return { voiceRemoteStreams: nextStreams, voicePeerStates: nextStates, voiceSpeaking: nextSpeaking }
-  })
-}
-
-const updateActiveSpeakers = (speakers, get, set) => {
-  const activeKeys = new Set()
-  if (Array.isArray(speakers)) {
-    speakers.forEach((speaker) => {
-      const key = resolveSocketKey(speaker?.identity, get) || speaker?.sid || speaker?.identity
-      if (key) activeKeys.add(key)
-    })
-  }
-  const localIdentity = livekitRoom?.localParticipant?.identity
-  const selfSocketId = get().voiceSelfSocketId
-  if (localIdentity && selfSocketId) {
-    const isSpeaking = Array.isArray(speakers) && speakers.some((speaker) => speaker?.identity === localIdentity)
-    if (isSpeaking) activeKeys.add(selfSocketId)
-  }
-  set((state) => {
-    const next = { ...state.voiceSpeaking }
-    const keys = new Set([...Object.keys(next), ...activeKeys])
-    keys.forEach((key) => {
-      next[key] = activeKeys.has(key)
-    })
-    return { voiceSpeaking: next }
-  })
-}
-
-const cleanupLivekit = (set) => {
-  if (livekitRoom) {
-    try {
-      livekitRoom.removeAllListeners()
-      livekitRoom.disconnect(true)
-    } catch (err) {
-      console.warn('livekit disconnect failed', err)
-    }
-    livekitRoom = null
-  }
-  if (livekitLocalTrack) {
-    try {
-      livekitLocalTrack.stop()
-    } catch (err) {
-      console.warn('livekit local track stop failed', err)
-    }
-    livekitLocalTrack = null
-  }
-  livekitRemoteTracks.forEach((meta) => {
-    if (meta?.track && typeof meta.track.detach === 'function') {
-      try {
-        meta.track.detach()
-      } catch (err) {
-        console.warn('livekit track detach failed', err)
-      }
-    }
-  })
-  livekitRemoteTracks.clear()
-  livekitIdentityToSocket.clear()
-  set((state) => ({
-    voiceRemoteStreams: {},
-    voicePeerStates: {},
-    voiceSpeaking: {},
-    voiceStream: null,
-  }))
-}
 
 export const buildDirectChannelId = (a, b) => {
   if (!a || !b) return null
@@ -330,6 +171,22 @@ const peerFromDirectChannel = (channelId, selfId) => {
   return null
 }
 
+const normalizeNameStyle = (raw) => {
+  if (!raw) return DEFAULT_NAME_STYLE
+  if (typeof raw === 'string') {
+    try {
+      return normalizeNameStyle(JSON.parse(raw))
+    } catch (err) {
+      return DEFAULT_NAME_STYLE
+    }
+  }
+  return {
+    font: typeof raw.font === 'string' ? raw.font : DEFAULT_NAME_STYLE.font,
+    effect: typeof raw.effect === 'string' ? raw.effect : DEFAULT_NAME_STYLE.effect,
+    color: typeof raw.color === 'string' ? raw.color : DEFAULT_NAME_STYLE.color,
+  }
+}
+
 const normalizeUser = (raw) => {
   if (!raw) return null
   return {
@@ -339,6 +196,10 @@ const normalizeUser = (raw) => {
     avatarSeed: raw.avatarSeed ?? raw.avatar_seed ?? '',
     avatarUrl: raw.avatarUrl ?? raw.avatar_url ?? '',
     avatarUpdatedAt: raw.avatarUpdatedAt ?? raw.avatar_updated_at ?? 0,
+    displayName: raw.displayName ?? raw.display_name ?? '',
+    profileStatus: raw.profileStatus ?? raw.profile_status ?? '',
+    profileBackground: raw.profileBackground ?? raw.profile_background ?? '',
+    nameStyle: normalizeNameStyle(raw.nameStyle ?? raw.name_style),
   }
 }
 
@@ -357,6 +218,148 @@ const loadStoredAuth = () => {
   }
 }
 
+const loadUserStatus = () => {
+  if (typeof window === 'undefined') return 'online'
+  try {
+    const raw = window.localStorage.getItem(USER_STATUS_KEY)
+    if (!raw) return 'online'
+    const normalized = raw.trim().toLowerCase()
+    if (['online', 'idle', 'dnd', 'invisible'].includes(normalized)) return normalized
+  } catch (err) {
+    console.warn('user status restore failed', err)
+  }
+  return 'online'
+}
+
+const persistUserStatus = (status) => {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(USER_STATUS_KEY, status)
+  } catch (err) {
+    console.warn('user status persist failed', err)
+  }
+}
+
+const loadProfileStatus = () => {
+  if (typeof window === 'undefined') return ''
+  try {
+    const raw = window.localStorage.getItem(PROFILE_STATUS_KEY)
+    return typeof raw === 'string' ? raw : ''
+  } catch (err) {
+    console.warn('profile status restore failed', err)
+    return ''
+  }
+}
+
+const persistProfileStatus = (value) => {
+  if (typeof window === 'undefined') return
+  try {
+    if (value) window.localStorage.setItem(PROFILE_STATUS_KEY, value)
+    else window.localStorage.removeItem(PROFILE_STATUS_KEY)
+  } catch (err) {
+    console.warn('profile status persist failed', err)
+  }
+}
+
+const loadNameStyle = () => {
+  if (typeof window === 'undefined') return DEFAULT_NAME_STYLE
+  try {
+    const raw = window.localStorage.getItem(NAME_STYLE_KEY)
+    if (!raw) return DEFAULT_NAME_STYLE
+    const parsed = JSON.parse(raw)
+    return {
+      font: typeof parsed.font === 'string' ? parsed.font : DEFAULT_NAME_STYLE.font,
+      effect: typeof parsed.effect === 'string' ? parsed.effect : DEFAULT_NAME_STYLE.effect,
+      color: typeof parsed.color === 'string' ? parsed.color : DEFAULT_NAME_STYLE.color,
+    }
+  } catch (err) {
+    console.warn('name style restore failed', err)
+    return DEFAULT_NAME_STYLE
+  }
+}
+
+const persistNameStyle = (style) => {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(NAME_STYLE_KEY, JSON.stringify(style))
+  } catch (err) {
+    console.warn('name style persist failed', err)
+  }
+}
+
+export const buildNameStyle = (style = DEFAULT_NAME_STYLE) => {
+  const font = style?.font || DEFAULT_NAME_STYLE.font
+  const effect = style?.effect || DEFAULT_NAME_STYLE.effect
+  const color = style?.color || DEFAULT_NAME_STYLE.color
+  const families = {
+    rubik: '"Rubik", sans-serif',
+    inter: '"Inter", sans-serif',
+    mono: '"JetBrains Mono", monospace',
+    serif: '"Times New Roman", serif',
+    display: '"Trebuchet MS", sans-serif',
+    georgia: 'Georgia, serif',
+  }
+  const result = {
+    fontFamily: families[font] || families[DEFAULT_NAME_STYLE.font],
+    color,
+  }
+  if (effect === 'gradient') {
+    result.backgroundImage = `linear-gradient(90deg, ${color}, #ffffff)`
+    result.WebkitBackgroundClip = 'text'
+    result.backgroundClip = 'text'
+    result.WebkitTextFillColor = 'transparent'
+    result.color = 'transparent'
+  } else if (effect === 'neon') {
+    result.textShadow = `0 0 10px ${color}, 0 0 24px ${color}`
+  } else if (effect === 'glow') {
+    result.textShadow = `0 0 6px ${color}`
+  } else if (effect === 'outline') {
+    result.textShadow = `-1px 0 ${color}, 0 1px ${color}, 1px 0 ${color}, 0 -1px ${color}`
+  }
+  return result
+}
+
+const loadProfileBackground = () => {
+  if (typeof window === 'undefined') return ''
+  try {
+    const raw = window.localStorage.getItem(PROFILE_BACKGROUND_KEY)
+    return typeof raw === 'string' ? raw : ''
+  } catch (err) {
+    console.warn('profile background restore failed', err)
+    return ''
+  }
+}
+
+const persistProfileBackground = (value) => {
+  if (typeof window === 'undefined') return
+  try {
+    if (value) window.localStorage.setItem(PROFILE_BACKGROUND_KEY, value)
+    else window.localStorage.removeItem(PROFILE_BACKGROUND_KEY)
+  } catch (err) {
+    console.warn('profile background persist failed', err)
+  }
+}
+
+const loadServerUrl = () => {
+  if (typeof window === 'undefined') return ''
+  try {
+    const raw = window.localStorage.getItem(SERVER_URL_KEY)
+    return typeof raw === 'string' ? raw : ''
+  } catch (err) {
+    console.warn('server url restore failed', err)
+    return ''
+  }
+}
+
+const persistServerUrl = (value) => {
+  if (typeof window === 'undefined') return
+  try {
+    if (value) window.localStorage.setItem(SERVER_URL_KEY, value)
+    else window.localStorage.removeItem(SERVER_URL_KEY)
+  } catch (err) {
+    console.warn('server url persist failed', err)
+  }
+}
 const persistAuth = (token, user) => {
   if (typeof window === 'undefined') return
   try {
@@ -370,16 +373,6 @@ const persistAuth = (token, user) => {
   }
 }
 
-const normalizeFileMeta = (raw) => {
-  if (!raw) return null
-  const name = raw.name ?? raw.originalName ?? raw.original_name ?? raw.filename ?? 'file'
-  return {
-    id: raw.id,
-    name,
-    mime: raw.mime || raw.type || '',
-    size: raw.size ?? 0,
-  }
-}
 
 const normalizeInvite = (raw) => {
   if (!raw) return null
@@ -412,33 +405,6 @@ const normalizeChannel = (raw) => {
   }
 }
 
-const normalizeVoiceMember = (raw) => {
-  if (!raw) return null
-  return {
-    userId: raw.userId ?? raw.user_id ?? '',
-    username: raw.username ?? '',
-    role: raw.role ?? 'member',
-    addedAt: raw.addedAt ?? raw.added_at ?? 0,
-  }
-}
-
-const normalizeVoiceRoom = (raw) => {
-  if (!raw) return null
-  const members = Array.isArray(raw.members)
-    ? raw.members.map(normalizeVoiceMember).filter(Boolean)
-    : undefined
-  return {
-    id: raw.id,
-    name: raw.name ?? 'Voice room',
-    createdAt: raw.createdAt ?? raw.created_at ?? 0,
-    createdBy: raw.createdBy ?? raw.created_by ?? '',
-    participantCount: raw.participantCount ?? raw.participant_count ?? 0,
-    membershipRole: raw.membershipRole ?? raw.membership_role ?? '',
-    avatarUrl: raw.avatarUrl ?? raw.avatar_url ?? '',
-    avatarUpdatedAt: raw.avatarUpdatedAt ?? raw.avatar_updated_at ?? 0,
-    members,
-  }
-}
 
 const deriveKey = (cid) => {
   if (!cid) return null
@@ -490,15 +456,10 @@ const enc = {
   },
 }
 
-const replyAttachmentPattern = /\[file:[^\]]+\]/g
-
 const buildReplyPreview = (content, fallback = 'Без текста') => {
   if (typeof content !== 'string') return fallback
-  const attachments = content.match(replyAttachmentPattern) || []
-  const text = content.replace(replyAttachmentPattern, ' ').replace(/\s+/g, ' ').trim()
+  const text = content.replace(/\s+/g, ' ').trim()
   if (text) return text.length > 140 ? `${text.slice(0, 137)}...` : text
-  if (attachments.length === 1) return 'Вложение'
-  if (attachments.length > 1) return `Вложения (${attachments.length})`
   return fallback
 }
 
@@ -540,9 +501,13 @@ const buildAuthHeaders = (token) => ({ Authorization: `Bearer ${token}` })
 const initialAuth = loadStoredAuth()
 
 const useStore = create((set, get) => ({
-  serverUrl: import.meta.env.VITE_LGM_SERVER || 'http://localhost:4000',
+  serverUrl: loadServerUrl() || import.meta.env.VITE_LGM_SERVER || 'http://localhost:4000',
   token: initialAuth.token,
   user: initialAuth.user,
+  userStatus: loadUserStatus(),
+  profileBackground: loadProfileBackground(),
+  profileStatus: loadProfileStatus(),
+  nameStyle: loadNameStyle(),
   users: [],
   view: 'chat',
   socket: null,
@@ -558,25 +523,13 @@ const useStore = create((set, get) => ({
   messages: {},
   unread: {},
   onlineUserIds: [],
+  friends: [],
+  friendRequests: { incoming: [], outgoing: [] },
   historyLoading: {},
   historyComplete: {},
   directPeers: {},
-  files: {},
   channelMembers: {},
   typing: {},
-  audioDevices: { inputs: [], outputs: [] },
-  audioInputDeviceId: loadStoredDevice('audioInputDeviceId'),
-  audioOutputDeviceId: loadStoredDevice('audioOutputDeviceId'),
-  audioVolume: loadStoredVolume(),
-  voiceRooms: [],
-  voiceParticipants: {},
-  voiceRemoteStreams: {},
-  voicePeerStates: {},
-  voiceSpeaking: {},
-  activeVoiceRoomId: null,
-  voiceStatus: null,
-  voiceStream: null,
-  voiceSelfSocketId: null,
   invites: [],
   appearance: loadAppearance(),
   appearanceNoise: null,
@@ -586,6 +539,9 @@ const useStore = create((set, get) => ({
     const shouldPersist = options.persist ?? true
     if (token && normalized && shouldPersist) persistAuth(token, normalized)
     else if (!token || !shouldPersist) persistAuth(null, null)
+    if (normalized?.nameStyle) persistNameStyle(normalized.nameStyle)
+    if (typeof normalized?.profileStatus === 'string') persistProfileStatus(normalized.profileStatus)
+    if (typeof normalized?.profileBackground === 'string') persistProfileBackground(normalized.profileBackground)
     set((state) => {
       let list = state.users
       if (normalized) {
@@ -595,12 +551,95 @@ const useStore = create((set, get) => ({
       return {
         token,
         user: normalized,
+        nameStyle: normalized?.nameStyle || state.nameStyle,
+        profileStatus: normalized?.profileStatus ?? state.profileStatus,
+        profileBackground: normalized?.profileBackground ?? state.profileBackground,
         users: list,
         view: 'chat',
       }
     })
   },
   setView: (view) => set({ view }),
+  setUserStatus: (status) => {
+    const normalized = typeof status === 'string' ? status.trim().toLowerCase() : ''
+    if (!['online', 'idle', 'dnd', 'invisible'].includes(normalized)) return
+    persistUserStatus(normalized)
+    set({ userStatus: normalized })
+  },
+  setProfileStatus: (value) => {
+    const normalized = typeof value === 'string' ? value.trim() : ''
+    persistProfileStatus(normalized)
+    set((state) => ({
+      profileStatus: normalized,
+      user: state.user ? { ...state.user, profileStatus: normalized } : state.user,
+      users: state.user?.id
+        ? state.users.map((u) => (u.id === state.user.id ? { ...u, profileStatus: normalized } : u))
+        : state.users,
+    }))
+  },
+  setNameStyle: (patch) => {
+    const next = {
+      font: DEFAULT_NAME_STYLE.font,
+      effect: DEFAULT_NAME_STYLE.effect,
+      color: DEFAULT_NAME_STYLE.color,
+      ...(typeof patch === 'object' && patch ? patch : {}),
+    }
+    persistNameStyle(next)
+    set((state) => ({
+      nameStyle: next,
+      user: state.user ? { ...state.user, nameStyle: next } : state.user,
+      users: state.user?.id
+        ? state.users.map((u) => (u.id === state.user.id ? { ...u, nameStyle: next } : u))
+        : state.users,
+    }))
+  },
+  updateNameStyle: async (style) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const payload = {
+      font: typeof style?.font === 'string' ? style.font : DEFAULT_NAME_STYLE.font,
+      effect: typeof style?.effect === 'string' ? style.effect : DEFAULT_NAME_STYLE.effect,
+      color: typeof style?.color === 'string' ? style.color : DEFAULT_NAME_STYLE.color,
+    }
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/profile/name-style`,
+      payload,
+      { headers: buildAuthHeaders(token) },
+    )
+    const updated = normalizeUser(data.user ?? data)
+    if (!updated) return null
+    persistNameStyle(updated.nameStyle)
+    set((state) => ({
+      nameStyle: updated.nameStyle,
+      user: state.user?.id === updated.id ? updated : state.user,
+      users: state.users.some((u) => u.id === updated.id)
+        ? state.users.map((u) => (u.id === updated.id ? updated : u))
+        : [...state.users, updated],
+    }))
+    return updated
+  },
+  setProfileBackground: (value) => {
+    const normalized = typeof value === 'string' ? value : ''
+    persistProfileBackground(normalized)
+    set((state) => ({
+      profileBackground: normalized,
+      user: state.user ? { ...state.user, profileBackground: normalized } : state.user,
+      users: state.user?.id
+        ? state.users.map((u) => (u.id === state.user.id ? { ...u, profileBackground: normalized } : u))
+        : state.users,
+    }))
+  },
+  setServerUrl: (nextUrl, options = {}) => {
+    const raw = typeof nextUrl === 'string' ? nextUrl.trim() : ''
+    if (!raw) return false
+    const normalized = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`
+    persistServerUrl(normalized)
+    set({ serverUrl: normalized })
+    if (options.reconnect && get().token) {
+      get().connect()
+    }
+    return true
+  },
   openProfile: () => set({ view: 'profile' }),
   openSettings: () => set({ view: 'settings' }),
   openChat: () => set({ view: 'chat' }),
@@ -615,11 +654,6 @@ const useStore = create((set, get) => ({
       if (typeof socket.removeAllListeners === 'function') socket.removeAllListeners()
       if (socket.io?.off) socket.io.off('close')
       socket.disconnect()
-    }
-    try {
-      get().leaveVoiceRoom(false)
-    } catch (err) {
-      console.warn('leaveVoiceRoom on logout failed', err)
     }
     try {
       get().cancelReconnectCountdown()
@@ -643,21 +677,13 @@ const useStore = create((set, get) => ({
       messages: {},
       unread: {},
       onlineUserIds: [],
+      friends: [],
+      friendRequests: { incoming: [], outgoing: [] },
       historyLoading: {},
       historyComplete: {},
       directPeers: {},
-      files: {},
       channelMembers: {},
       typing: {},
-      voiceRooms: [],
-      voiceParticipants: {},
-      voiceRemoteStreams: {},
-      voicePeerStates: {},
-      voiceSpeaking: {},
-      activeVoiceRoomId: null,
-      voiceStatus: null,
-      voiceStream: null,
-      voiceSelfSocketId: null,
       invites: [],
     })
   },
@@ -707,166 +733,6 @@ const useStore = create((set, get) => ({
       console.error('channel avatar url build failed', err)
       return null
     }
-  },
-  buildVoiceRoomAvatarUrl: (room) => {
-    if (!room?.avatarUrl) return null
-    try {
-      const server = get().serverUrl
-      const base = server.endsWith('/') ? server : `${server}/`
-      const url = new URL(room.avatarUrl, base)
-      if (room.avatarUpdatedAt) url.searchParams.set('v', room.avatarUpdatedAt)
-      return url.toString()
-    } catch (err) {
-      console.error('voice avatar url build failed', err)
-      return null
-    }
-  },
-  refreshAudioDevices: async () => {
-    if (!navigator?.mediaDevices?.enumerateDevices) return
-    try {
-      const devices = await navigator.mediaDevices.enumerateDevices()
-      const inputs = devices.filter((d) => d.kind === 'audioinput')
-      const outputs = devices.filter((d) => d.kind === 'audiooutput')
-      set({ audioDevices: { inputs, outputs } })
-    } catch (err) {
-      console.error('enumerate devices failed', err)
-    }
-  },
-  setAudioDevice: (type, deviceId) => {
-    if (type === 'input') {
-      try {
-        if (deviceId) localStorage.setItem('audioInputDeviceId', deviceId)
-        else localStorage.removeItem('audioInputDeviceId')
-      } catch (err) {
-        console.warn('audio device save failed', err)
-      }
-      set({ audioInputDeviceId: deviceId || null })
-      return
-    }
-    if (type === 'output') {
-      try {
-        if (deviceId) localStorage.setItem('audioOutputDeviceId', deviceId)
-        else localStorage.removeItem('audioOutputDeviceId')
-      } catch (err) {
-        console.warn('audio device save failed', err)
-      }
-      set({ audioOutputDeviceId: deviceId || null })
-    }
-  },
-  setAudioVolume: (value) => {
-    const next = Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 1
-    try {
-      localStorage.setItem('audioVolume', String(next))
-    } catch (err) {
-      console.warn('audio volume save failed', err)
-    }
-    set({ audioVolume: next })
-  },
-  joinVoiceRoom: async (roomId) => {
-    const socket = get().socket
-    if (!socket || !roomId) return
-    if (get().activeVoiceRoomId === roomId) return
-    if (get().activeVoiceRoomId) get().leaveVoiceRoom(false)
-    livekitIdentityToSocket.clear()
-    set({ voiceStatus: 'connecting', activeVoiceRoomId: roomId, voiceSelfSocketId: null })
-    socket.emit('voice:join', { roomId })
-  },
-  leaveVoiceRoom: (emit = true) => {
-    const socket = get().socket
-    const roomId = get().activeVoiceRoomId
-    if (emit && socket && roomId) socket.emit('voice:leave')
-    cleanupLivekit(set)
-    set((state) => ({
-      activeVoiceRoomId: null,
-      voiceStatus: null,
-      voiceSelfSocketId: null,
-      voiceParticipants: roomId ? { ...state.voiceParticipants, [roomId]: [] } : state.voiceParticipants,
-    }))
-  },
-  createVoiceRoom: async (name, options = {}) => {
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    const trimmed = typeof name === 'string' ? name.trim() : ''
-    if (!trimmed) throw new Error('invalid_name')
-    const members = Array.isArray(options.members) ? options.members : []
-    const admins = Array.isArray(options.admins) ? options.admins : []
-    const payload = { name: trimmed }
-    if (members.length) payload.members = members
-    if (admins.length) payload.admins = admins
-    const { data } = await axios.post(
-      `${get().serverUrl}/api/voice-rooms`,
-      payload,
-      { headers: buildAuthHeaders(token) },
-    )
-    const room = normalizeVoiceRoom(data?.room)
-    if (room) {
-      set((state) => ({ voiceRooms: [...state.voiceRooms.filter((entry) => entry.id !== room.id), room] }))
-    }
-    return room
-  },
-  updateVoiceRoomMembers: async (roomId, { upserts = [], remove = [] } = {}) => {
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    const { data } = await axios.post(
-      `${get().serverUrl}/api/voice-rooms/${roomId}/members`,
-      { upserts, remove },
-      { headers: buildAuthHeaders(token) },
-    )
-    const room = normalizeVoiceRoom(data?.room)
-    if (room) {
-      set((state) => ({
-        voiceRooms: state.voiceRooms.some((entry) => entry.id === roomId)
-          ? state.voiceRooms.map((entry) => (entry.id === roomId ? { ...entry, ...room } : entry))
-          : [...state.voiceRooms, room],
-      }))
-    }
-    return room
-  },
-  deleteVoiceRoom: async (roomId) => {
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    await axios.delete(`${get().serverUrl}/api/voice-rooms/${roomId}`, { headers: buildAuthHeaders(token) })
-    set((state) => ({
-      voiceRooms: state.voiceRooms.filter((room) => room.id !== roomId),
-      voiceParticipants: { ...state.voiceParticipants, [roomId]: [] },
-    }))
-    if (get().activeVoiceRoomId === roomId) get().leaveVoiceRoom(false)
-  },
-  uploadVoiceRoomAvatar: async (roomId, file) => {
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    if (!roomId || !file) throw new Error('invalid_payload')
-    const form = new FormData()
-    form.append('avatar', file)
-    const { data } = await axios.post(`${get().serverUrl}/api/voice-rooms/${roomId}/avatar`, form, {
-      headers: buildAuthHeaders(token),
-    })
-    const room = normalizeVoiceRoom(data?.room)
-    if (room) {
-      set((state) => ({
-        voiceRooms: state.voiceRooms.some((entry) => entry.id === room.id)
-          ? state.voiceRooms.map((entry) => (entry.id === room.id ? { ...entry, ...room } : entry))
-          : [...state.voiceRooms, room],
-      }))
-    }
-    return room
-  },
-  deleteVoiceRoomAvatar: async (roomId) => {
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    if (!roomId) throw new Error('invalid_room')
-    const { data } = await axios.delete(`${get().serverUrl}/api/voice-rooms/${roomId}/avatar`, {
-      headers: buildAuthHeaders(token),
-    })
-    const room = normalizeVoiceRoom(data?.room)
-    if (room) {
-      set((state) => ({
-        voiceRooms: state.voiceRooms.some((entry) => entry.id === room.id)
-          ? state.voiceRooms.map((entry) => (entry.id === room.id ? { ...entry, ...room } : entry))
-          : [...state.voiceRooms, room],
-      }))
-    }
-    return room
   },
 
   cancelReconnectCountdown: () => {
@@ -1000,32 +866,34 @@ const useStore = create((set, get) => ({
 
     if (manager?.on) manager.on('close', handleClose)
 
-    socket.on('connect', async () => {
-      get().cancelReconnectCountdown()
-      set({ connectionStatus: 'connected', reconnectAttempt: 0, connectionError: null })
-      socket.emit('init:request', {})
-      try {
-        const { data } = await axios.get(`${server}/api/users`, { headers: buildAuthHeaders(get().token) })
+      socket.on('connect', async () => {
+        get().cancelReconnectCountdown()
+        set({ connectionStatus: 'connected', reconnectAttempt: 0, connectionError: null })
+        socket.emit('init:request', {})
+        try {
+          const { data } = await axios.get(`${server}/api/users`, { headers: buildAuthHeaders(get().token) })
         const normalized = (data.users || []).map(normalizeUser).filter(Boolean)
         set((state) => {
           const current = state.user ? normalized.find((u) => u.id === state.user.id) || state.user : state.user
           return { users: normalized, user: current }
         })
-      } catch (err) {
-        console.error('users fetch failed', err)
-      }
-      try {
-        const { data: voiceData } = await axios.get(`${server}/api/voice-rooms`, { headers: buildAuthHeaders(get().token) })
-        set({ voiceRooms: (voiceData.rooms || []).map(normalizeVoiceRoom).filter(Boolean) })
-      } catch (err) {
-        console.error('voice rooms fetch failed', err)
-      }
-      get().refreshAudioDevices()
-    })
+        } catch (err) {
+          console.error('users fetch failed', err)
+        }
+      })
 
-    socket.on('connect_error', (err) => {
-      scheduleReconnect(err)
-    })
+      socket.on('connect_error', (err) => {
+        scheduleReconnect(err)
+      })
+
+      socket.on('friends:requests:update', () => {
+        get().fetchFriendRequests().catch((error) => {
+          console.warn('fetch friend requests failed', error)
+        })
+        get().fetchFriends().catch((error) => {
+          console.warn('fetch friends failed', error)
+        })
+      })
 
     socket.on('init:response', ({ workspaces, channels, activeChannelId, messages }) => {
       const normalizeMessage = formatMessage(activeChannelId)
@@ -1093,12 +961,14 @@ const useStore = create((set, get) => ({
         const peerUser = peerId ? state.users.find((u) => u.id === peerId) : null
         const channelEntry = !isDirectChannel ? state.channels.find((entry) => entry.id === payload.channelId) : null
         if (normalized.senderId !== state.user?.id) {
-          const author = state.users.find((u) => u.id === normalized.senderId)?.username || 'Неизвестный'
+          const authorUser = state.users.find((u) => u.id === normalized.senderId)
+          const author = authorUser?.displayName || authorUser?.username || 'Неизвестный'
           const hasContent = typeof normalized.content === 'string' && normalized.content.trim()
-          const channelLabel = channelEntry?.name || (peerUser ? `@${peerUser.username}` : isDirectChannel ? 'Личные сообщения' : null)
+          const peerLabel = peerUser?.displayName || peerUser?.username || ''
+          const channelLabel = channelEntry?.name || (peerLabel ? peerLabel : isDirectChannel ? 'Личные сообщения' : null)
           showNewMessageNotification({
             author,
-            content: hasContent ? normalized.content : 'Новое сообщение',
+            content: hasContent ? normalized.content : 'Нет содержимого',
             messageId: normalized.id,
             channelId: payload.channelId,
             channelName: channelLabel,
@@ -1225,14 +1095,22 @@ const useStore = create((set, get) => ({
       })
     })
 
-    socket.on('typing:update', ({ channelId, userId: typingUserId, username, typing }) => {
+    socket.on('typing:update', ({ channelId, userId: typingUserId, username, displayName, typing, nameStyle }) => {
       if (!channelId || !typingUserId) return
       set((state) => {
         if (typingUserId === state.user?.id) return state
         const existing = state.typing[channelId] || []
         const filtered = existing.filter((entry) => entry.userId !== typingUserId)
         if (typing) {
-          const nextList = [...filtered, { userId: typingUserId, username: username || typingUserId }]
+          const nextList = [
+            ...filtered,
+            {
+              userId: typingUserId,
+              username: username || typingUserId,
+              displayName: typeof displayName === 'string' ? displayName : '',
+              nameStyle: normalizeNameStyle(nameStyle),
+            },
+          ]
           return { typing: { ...state.typing, [channelId]: nextList } }
         }
         if (filtered.length === existing.length) return state
@@ -1251,209 +1129,28 @@ const useStore = create((set, get) => ({
           ? state.users.map((u) => (u.id === normalized.id ? { ...u, ...normalized } : u))
           : [...state.users, normalized]
         const user = state.user?.id === normalized.id ? { ...state.user, ...normalized } : state.user
-        return { users, user }
+        const isSelf = state.user?.id === normalized.id
+        const nameStyle = isSelf ? normalized.nameStyle : state.nameStyle
+        const patch = { users, user, nameStyle }
+        if (isSelf && normalized?.nameStyle) {
+          persistNameStyle(normalized.nameStyle)
+        }
+        if (state.user?.id === normalized.id) {
+          if (typeof normalized.profileStatus === 'string') {
+            persistProfileStatus(normalized.profileStatus)
+            patch.profileStatus = normalized.profileStatus
+          }
+          if (typeof normalized.profileBackground === 'string') {
+            persistProfileBackground(normalized.profileBackground)
+            patch.profileBackground = normalized.profileBackground
+          }
+        }
+        return patch
       })
     })
 
     socket.on('presence:update', ({ onlineUserIds }) => set({ onlineUserIds }))
-    socket.on('voice:rooms:update', ({ rooms }) => {
-      if (Array.isArray(rooms)) set({ voiceRooms: rooms.map(normalizeVoiceRoom).filter(Boolean) })
-    })
-    socket.on('voice:state', ({ roomId, participants }) => {
-      if (!roomId) return
-      const list = Array.isArray(participants) ? participants : []
-      set((state) => ({
-        voiceParticipants: { ...state.voiceParticipants, [roomId]: list },
-        voiceRooms: state.voiceRooms.map((room) => (room.id === roomId ? { ...room, participantCount: list.length } : room)),
-      }))
-      if (get().activeVoiceRoomId === roomId) {
-        syncLivekitIdentityMap(list)
-      }
-    })
-    socket.on('voice:participants', ({ roomId, participants }) => {
-      if (!roomId) return
-      const list = Array.isArray(participants) ? participants : []
-      const isActive = get().activeVoiceRoomId === roomId
-      set((state) => {
-        const payload = {
-          voiceParticipants: { ...state.voiceParticipants, [roomId]: list },
-        }
-        if (isActive) {
-          const nextStates = { ...state.voicePeerStates }
-          list.forEach((p) => {
-            if (!nextStates[p.socketId]) {
-              nextStates[p.socketId] = p.socketId === state.voiceSelfSocketId ? 'connected' : 'connecting'
-            }
-          })
-          Object.keys(nextStates).forEach((key) => {
-            if (!list.some((p) => p.socketId === key)) delete nextStates[key]
-          })
-          payload.voicePeerStates = nextStates
-        }
-        return payload
-      })
-      if (isActive) syncLivekitIdentityMap(list)
-    })
-    socket.on('voice:user-joined', ({ roomId, participant }) => {
-      if (!roomId || !participant) return
-      const isActive = get().activeVoiceRoomId === roomId
-      set((state) => {
-        const existing = state.voiceParticipants[roomId] || []
-        const filtered = existing.filter((p) => p.socketId !== participant.socketId)
-        const nextParticipants = [...filtered, participant]
-        const payload = {
-          voiceParticipants: { ...state.voiceParticipants, [roomId]: nextParticipants },
-        }
-        if (isActive) {
-          payload.voicePeerStates = {
-            ...state.voicePeerStates,
-            [participant.socketId]:
-              participant.socketId === state.voiceSelfSocketId
-                ? 'connected'
-                : state.voicePeerStates[participant.socketId] || 'connecting',
-          }
-        }
-        return payload
-      })
-      if (isActive && participant.userId && participant.socketId) {
-        livekitIdentityToSocket.set(participant.userId, participant.socketId)
-      }
-    })
-    socket.on('voice:user-left', ({ roomId, socketId, userId }) => {
-      if (!roomId || !socketId) return
-      const isActive = get().activeVoiceRoomId === roomId
-      set((state) => ({
-        voiceParticipants: {
-          ...state.voiceParticipants,
-          [roomId]: (state.voiceParticipants[roomId] || []).filter((p) => p.socketId !== socketId),
-        },
-      }))
-      if (isActive) {
-        if (userId) livekitIdentityToSocket.delete(userId)
-        unregisterRemoteAudioTrack({ identity: userId, socketId }, get, set)
-      }
-    })
-    socket.on('voice:signal', () => {})
-    socket.on('voice:joined', async ({ roomId, participant, livekit }) => {
-      if (!roomId) return
-      const session = livekit && typeof livekit === 'object' ? livekit : null
-      if (!session?.token || !session?.url) {
-        set({ voiceStatus: 'error' })
-        return
-      }
-      cleanupLivekit(set)
-      const alreadyConnected = get().voiceStatus === 'connected'
-      set((state) => {
-        const list = state.voiceParticipants[roomId] || []
-        const exists = participant ? list.some((p) => p.socketId === participant.socketId) : false
-        const nextList = participant && !exists ? [...list, participant] : list
-        const payload = {
-          voiceStatus: 'connecting',
-          activeVoiceRoomId: roomId,
-          voiceSelfSocketId: participant?.socketId || state.voiceSelfSocketId,
-          voiceParticipants: { ...state.voiceParticipants, [roomId]: nextList },
-        }
-        if (participant?.socketId) {
-          payload.voicePeerStates = {
-            ...state.voicePeerStates,
-            [participant.socketId]: 'connecting',
-          }
-        }
-        return payload
-      })
-      if (participant?.userId && participant?.socketId) {
-        livekitIdentityToSocket.set(participant.userId, participant.socketId)
-      }
-      try {
-        const deviceId = get().audioInputDeviceId || undefined
-        const audioTrack = await createLocalAudioTrack({
-          deviceId,
-          noiseSuppression: true,
-          echoCancellation: true,
-          autoGainControl: true,
-        })
-        livekitLocalTrack = audioTrack
-        const localStream = new MediaStream([audioTrack.mediaStreamTrack])
-        set((state) => ({
-          voiceStream: localStream,
-          voicePeerStates: participant?.socketId
-            ? { ...state.voicePeerStates, [participant.socketId]: 'connected' }
-            : state.voicePeerStates,
-        }))
-        const room = new Room({
-          adaptiveStream: true,
-          dynacast: true,
-          publishDefaults: { audioBitrate: 32000 },
-        })
-        livekitRoom = room
-        room.on(RoomEvent.TrackSubscribed, (track, publication, remoteParticipant) => {
-          registerRemoteAudioTrack(track, remoteParticipant, get, set)
-        })
-        room.on(RoomEvent.TrackUnsubscribed, (track, publication, remoteParticipant) => {
-          if (track?.kind !== Track.Kind.Audio) return
-          unregisterRemoteAudioTrack(remoteParticipant, get, set)
-        })
-        room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => updateActiveSpeakers(speakers, get, set))
-        room.on(RoomEvent.ParticipantDisconnected, (remoteParticipant) => {
-          unregisterRemoteAudioTrack(remoteParticipant, get, set)
-        })
-        room.on(RoomEvent.Disconnected, () => {
-          set({ voiceStatus: 'disconnected' })
-        })
-        await room.connect(session.url, session.token, { autoSubscribe: true })
-        await room.localParticipant.publishTrack(audioTrack)
-        room.participants.forEach((remoteParticipant) => {
-          remoteParticipant.trackPublications.forEach((publication) => {
-            if (publication.isSubscribed && publication.track?.kind === Track.Kind.Audio) {
-              registerRemoteAudioTrack(publication.track, remoteParticipant, get, set)
-            }
-          })
-        })
-        set({ voiceStatus: 'connected' })
-        if (!alreadyConnected) {
-          try {
-            playVoiceJoinSound()
-          } catch (err) {
-            console.warn('voice join sound failed', err)
-          }
-        }
-      } catch (err) {
-        console.error('livekit connect failed', err)
-        if (err?.name === 'NotAllowedError' || err?.name === 'NotReadableError') {
-          set({ voiceStatus: 'mic_denied' })
-        } else {
-          set({ voiceStatus: 'error' })
-        }
-        cleanupLivekit(set)
-      }
-    })
-    socket.on('voice:room-closed', ({ roomId }) => {
-      if (get().activeVoiceRoomId === roomId) {
-        get().leaveVoiceRoom(false)
-        set({ voiceStatus: 'room_closed' })
-      }
-    })
-    socket.on('voice:error', ({ error }) => {
-      cleanupLivekit(set)
-      set((state) => ({
-        voiceStatus: error || 'error',
-        activeVoiceRoomId: null,
-        voiceSelfSocketId: null,
-        voiceParticipants: state.activeVoiceRoomId
-          ? { ...state.voiceParticipants, [state.activeVoiceRoomId]: [] }
-          : state.voiceParticipants,
-      }))
-    })
     socket.on('disconnect', (reason) => {
-      cleanupLivekit(set)
-      set((state) => ({
-        activeVoiceRoomId: null,
-        voiceSelfSocketId: null,
-        voiceStatus: 'disconnected',
-        voiceParticipants: state.activeVoiceRoomId
-          ? { ...state.voiceParticipants, [state.activeVoiceRoomId]: [] }
-          : state.voiceParticipants,
-      }))
       if (reason === 'io client disconnect') return
       scheduleReconnect(reason)
     })
@@ -1474,6 +1171,8 @@ const useStore = create((set, get) => ({
     const socket = get().socket
     const me = get().user
     if (!socket || !me?.id || !userId || userId === me.id) return
+    const isFriend = get().friends.some((friend) => friend.id === userId)
+    if (!isFriend) return
     const channelId = buildDirectChannelId(me.id, userId)
     set((state) => ({
       activeChannelId: channelId,
@@ -1555,6 +1254,86 @@ const useStore = create((set, get) => ({
       set((state) => ({ channelMembers: { ...state.channelMembers, [channel.id]: members } }))
     }
     return channel
+  },
+
+  fetchFriends: async () => {
+    const token = get().token
+    if (!token) return []
+    const { data } = await axios.get(`${get().serverUrl}/api/friends`, { headers: buildAuthHeaders(token) })
+    const friends = Array.isArray(data?.friends) ? data.friends.map(normalizeUser).filter(Boolean) : []
+    set((state) => {
+      const known = new Map(state.users.map((u) => [u.id, u]))
+      friends.forEach((friend) => {
+        if (friend?.id && !known.has(friend.id)) known.set(friend.id, friend)
+      })
+      return { friends, users: Array.from(known.values()) }
+    })
+    return friends
+  },
+
+  fetchFriendRequests: async () => {
+    const token = get().token
+    if (!token) return { incoming: [], outgoing: [] }
+    const { data } = await axios.get(`${get().serverUrl}/api/friends/requests`, { headers: buildAuthHeaders(token) })
+    const incoming = Array.isArray(data?.incoming)
+      ? data.incoming
+          .map((entry) => ({
+            id: entry.id,
+            fromUser: normalizeUser(entry.fromUser),
+            createdAt: entry.createdAt || 0,
+          }))
+          .filter((entry) => entry.fromUser)
+      : []
+    const outgoing = Array.isArray(data?.outgoing)
+      ? data.outgoing
+          .map((entry) => ({
+            id: entry.id,
+            toUser: normalizeUser(entry.toUser),
+            createdAt: entry.createdAt || 0,
+          }))
+          .filter((entry) => entry.toUser)
+      : []
+    set({ friendRequests: { incoming, outgoing } })
+    return { incoming, outgoing }
+  },
+
+  sendFriendRequest: async (username) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const trimmed = typeof username === 'string' ? username.trim() : ''
+    if (!trimmed) throw new Error('invalid_username')
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/friends/request`,
+      { username: trimmed },
+      { headers: buildAuthHeaders(token) },
+    )
+    await get().fetchFriendRequests()
+    await get().fetchFriends()
+    return data
+  },
+
+  respondFriendRequest: async (requestId, accept) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!requestId) throw new Error('invalid_request')
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/friends/respond`,
+      { requestId, accept: Boolean(accept) },
+      { headers: buildAuthHeaders(token) },
+    )
+    await get().fetchFriendRequests()
+    await get().fetchFriends()
+    return data
+  },
+
+  removeFriend: async (userId) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!userId) throw new Error('invalid_user')
+    await axios.delete(`${get().serverUrl}/api/friends/${userId}`, { headers: buildAuthHeaders(token) })
+    set((state) => ({
+      friends: state.friends.filter((friend) => friend.id !== userId),
+    }))
   },
   uploadChannelAvatar: async (channelId, file) => {
     const token = get().token
@@ -1747,6 +1526,70 @@ const useStore = create((set, get) => ({
     )
   },
 
+  updateDisplayName: async (displayName) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const trimmed = typeof displayName === 'string' ? displayName.trim() : ''
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/profile/display-name`,
+      { displayName: trimmed },
+      { headers: buildAuthHeaders(token) },
+    )
+    const updated = normalizeUser(data.user ?? data)
+    if (!updated) return null
+    set((state) => ({
+      user: state.user?.id === updated.id ? updated : state.user,
+      users: state.users.some((u) => u.id === updated.id)
+        ? state.users.map((u) => (u.id === updated.id ? updated : u))
+        : [...state.users, updated],
+    }))
+    return updated
+  },
+
+  updateProfileStatus: async (status) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const trimmed = typeof status === 'string' ? status.trim() : ''
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/profile/status`,
+      { status: trimmed },
+      { headers: buildAuthHeaders(token) },
+    )
+    const updated = normalizeUser(data.user ?? data)
+    if (!updated) return null
+    persistProfileStatus(updated.profileStatus || '')
+    set((state) => ({
+      profileStatus: updated.profileStatus || '',
+      user: state.user?.id === updated.id ? updated : state.user,
+      users: state.users.some((u) => u.id === updated.id)
+        ? state.users.map((u) => (u.id === updated.id ? updated : u))
+        : [...state.users, updated],
+    }))
+    return updated
+  },
+
+  updateProfileBackground: async (background) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const normalized = typeof background === 'string' ? background.trim() : ''
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/profile/background`,
+      { background: normalized },
+      { headers: buildAuthHeaders(token) },
+    )
+    const updated = normalizeUser(data.user ?? data)
+    if (!updated) return null
+    persistProfileBackground(updated.profileBackground || '')
+    set((state) => ({
+      profileBackground: updated.profileBackground || '',
+      user: state.user?.id === updated.id ? updated : state.user,
+      users: state.users.some((u) => u.id === updated.id)
+        ? state.users.map((u) => (u.id === updated.id ? updated : u))
+        : [...state.users, updated],
+    }))
+    return updated
+  },
+
   fetchInvites: async () => {
     const token = get().token
     if (!token) return []
@@ -1785,17 +1628,6 @@ const useStore = create((set, get) => ({
   },
 
   // Admin helpers
-  fetchFiles: async () => {
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    const { data } = await axios.get(`${get().serverUrl}/api/admin/files`, { headers: buildAuthHeaders(token) })
-    return data.files
-  },
-  deleteFile: async (id) => {
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    await axios.delete(`${get().serverUrl}/api/admin/files/${id}`, { headers: buildAuthHeaders(token) })
-  },
   adminUpdateUserRole: async (userId, role) => {
     const token = get().token
     if (!token) throw new Error('not_authenticated')
@@ -1877,80 +1709,6 @@ const useStore = create((set, get) => ({
     })
   },
 
-  registerFileMeta: (file) => {
-    const normalized = normalizeFileMeta(file)
-    if (!normalized) return normalized
-    set((state) => ({ files: { ...state.files, [normalized.id]: normalized } }))
-    return normalized
-  },
-
-  ensureFileMeta: async (fileId) => {
-    if (!fileId) return null
-    const existing = get().files[fileId]
-    if (existing) return existing
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    const { data } = await axios.get(`${get().serverUrl}/api/files/${fileId}/meta`, {
-      headers: buildAuthHeaders(token),
-    })
-    const normalized = normalizeFileMeta(data.file)
-    if (normalized) {
-      set((state) => ({ files: { ...state.files, [normalized.id]: normalized } }))
-    }
-    return normalized
-  },
-
-  buildFileUrl: (fileId, { inline = false } = {}) => {
-    const { serverUrl, token } = get()
-    if (!token || !fileId) return null
-    const path = inline ? `/api/files/${fileId}/view` : `/api/files/${fileId}`
-    const url = new URL(path, serverUrl.endsWith('/') ? serverUrl : `${serverUrl}/`)
-    url.searchParams.set('token', token)
-    return url.toString()
-  },
-
-  // Upload (chunked)
-  uploadFile: async (file, onProgress) => {
-    const server = get().serverUrl
-    const token = get().token
-    if (!token) throw new Error('not_authenticated')
-    const headers = buildAuthHeaders(token)
-    const init = await axios.post(
-      `${server}/api/upload/init`,
-      { filename: file.name, size: file.size, mime: file.type },
-      { headers },
-    )
-    const id = init.data.uploadId
-    const chunkSize = 10 * 1024 * 1024
-    let uploaded = 0
-    let idx = 0
-    while (uploaded < file.size) {
-      const slice = file.slice(uploaded, Math.min(uploaded + chunkSize, file.size))
-      const form = new FormData()
-      form.append('chunk', slice)
-      form.append('uploadId', id)
-      form.append('index', String(idx))
-      await fetch(`${server}/api/upload/chunk`, {
-        method: 'POST',
-        headers: { Authorization: headers.Authorization },
-        body: form,
-      })
-      uploaded += slice.size
-      idx += 1
-      if (onProgress) onProgress(Math.round((uploaded / file.size) * 100))
-    }
-    const done = await axios.post(
-      `${server}/api/upload/complete`,
-      { uploadId: id, filename: file.name, mime: file.type },
-      { headers },
-    )
-    const filePayload = done.data.file || { id: done.data.fileId, name: file.name, mime: file.type, size: file.size }
-    const normalized = normalizeFileMeta(filePayload)
-    if (normalized) {
-      set((state) => ({ files: { ...state.files, [normalized.id]: normalized } }))
-    }
-    return normalized
-  },
 }))
 
 export default useStore

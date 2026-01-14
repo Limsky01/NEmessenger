@@ -1,23 +1,22 @@
-import React, { useCallback, useEffect, useState } from 'react'
-import useStore from '../state/store.js'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import useStore, { buildNameStyle } from '../state/store.js'
+import AvatarImage from './AvatarImage.jsx'
+import Profile from './Profile.jsx'
 
 export default function Settings() {
+  const user = useStore((s) => s.user)
   const openChat = useStore((s) => s.openChat)
-  const audioDevices = useStore((s) => s.audioDevices)
-  const audioInputDeviceId = useStore((s) => s.audioInputDeviceId)
-  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
-  const setAudioDevice = useStore((s) => s.setAudioDevice)
-  const refreshAudioDevices = useStore((s) => s.refreshAudioDevices)
   const logout = useStore((s) => s.logout)
+  const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
+  const nameStyleValue = useStore((s) => s.nameStyle)
 
-  const inputs = audioDevices?.inputs ?? []
-  const outputs = audioDevices?.outputs ?? []
-
-  const [deviceStatus, setDeviceStatus] = useState(null)
   const [autostartSupported, setAutostartSupported] = useState(false)
   const [autostartEnabled, setAutostartEnabled] = useState(false)
   const [autostartStatus, setAutostartStatus] = useState(null)
   const [autostartLoading, setAutostartLoading] = useState(false)
+  const [uiScale, setUiScale] = useState(1)
+  const [activeSection, setActiveSection] = useState('account')
+  const [settingsSearch, setSettingsSearch] = useState('')
   const [appVersion, setAppVersion] = useState('')
   const [updateState, setUpdateState] = useState({
     status: 'idle',
@@ -88,8 +87,26 @@ export default function Settings() {
   }, [applyUpdateStatus])
 
   useEffect(() => {
-    refreshAudioDevices()
-  }, [refreshAudioDevices])
+    if (typeof window === 'undefined') return
+    try {
+      const stored = window.localStorage.getItem('nemessenger:ui-scale')
+      const parsed = stored ? Number.parseFloat(stored) : 1
+      if (!Number.isNaN(parsed)) setUiScale(parsed)
+    } catch (err) {
+      console.warn('ui scale restore failed', err)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const value = Number.isFinite(uiScale) ? uiScale : 1
+    document.documentElement.style.setProperty('--ui-scale', String(value))
+    try {
+      window.localStorage.setItem('nemessenger:ui-scale', String(value))
+    } catch (err) {
+      console.warn('ui scale persist failed', err)
+    }
+  }, [uiScale])
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.electronAPI) return
@@ -118,53 +135,6 @@ export default function Settings() {
     const timer = setTimeout(() => setAutostartStatus(null), 4000)
     return () => clearTimeout(timer)
   }, [autostartStatus])
-
-  const handleRefreshDevices = async () => {
-    if (!navigator?.mediaDevices) {
-      setDeviceStatus({ type: 'error', message: 'Браузер не поддерживает работу с устройствами' })
-      setTimeout(() => setDeviceStatus(null), 4000)
-      return
-    }
-    setDeviceStatus({ type: 'info', message: 'Обновление списка устройств...' })
-    try {
-      await refreshAudioDevices()
-      let latest = useStore.getState().audioDevices
-      if (!latest.inputs.length) {
-        await navigator.mediaDevices.getUserMedia({ audio: true })
-        await refreshAudioDevices()
-        latest = useStore.getState().audioDevices
-      }
-      setDeviceStatus({
-        type: 'success',
-        message: `Обновлено. Найдено микрофонов: ${latest.inputs.length}, динамиков: ${latest.outputs.length}`,
-      })
-    } catch (err) {
-      console.error(err)
-      setDeviceStatus({ type: 'error', message: 'Не удалось получить список устройств. Разрешите доступ к микрофону.' })
-    } finally {
-      setTimeout(() => setDeviceStatus(null), 4000)
-    }
-  }
-
-  const handleTestMicrophone = async () => {
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      setDeviceStatus({ type: 'error', message: 'Доступ к микрофону не поддерживается' })
-      setTimeout(() => setDeviceStatus(null), 4000)
-      return
-    }
-    setDeviceStatus({ type: 'info', message: 'Запрос доступа к микрофону...' })
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      stream.getTracks().forEach((track) => track.stop())
-      await refreshAudioDevices()
-      setDeviceStatus({ type: 'success', message: 'Микрофон доступен и готов к использованию' })
-    } catch (err) {
-      console.error(err)
-      setDeviceStatus({ type: 'error', message: 'Не удалось получить доступ к микрофону' })
-    } finally {
-      setTimeout(() => setDeviceStatus(null), 4000)
-    }
-  }
 
   const handleToggleAutostart = async () => {
     if (typeof window === 'undefined' || !autostartSupported) return
@@ -288,13 +258,13 @@ export default function Settings() {
         ? `Version ${updateInfoVersion} is available.` +
           (updateState.autoDownload ? ' Download will start automatically.' : '')
         : 'An update is available.'
-      updateStatusClass = 'text-emerald-300'
+      updateStatusClass = 'text-sky-300'
       break
     case 'downloading':
       updateStatusText = updateInfoVersion
         ? `Downloading version ${updateInfoVersion}...`
         : 'Downloading update...'
-      updateStatusClass = 'text-emerald-300'
+      updateStatusClass = 'text-sky-300'
       break
     case 'downloaded':
       updateStatusText =
@@ -302,7 +272,7 @@ export default function Settings() {
         (updateInfoVersion
           ? `Update ${updateInfoVersion} downloaded. Ready to install.`
           : 'Update downloaded. Ready to install.')
-      updateStatusClass = 'text-emerald-300'
+      updateStatusClass = 'text-sky-300'
       break
     case 'not-available':
       updateStatusText = 'You already have the latest version.'
@@ -321,193 +291,239 @@ export default function Settings() {
   }
 
 
-  return (
-    <div className="flex-1 h-full overflow-y-auto p-10 space-y-8 text-sm">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white/10 text-2xl">⚙</div>
-          <div>
-            <div className="text-2xl font-semibold">Настройки</div>
-            <div className="text-white/60">Управляйте оборудованием и приложением</div>
-          </div>
-        </div>
-        <button
-          type="button"
-          onClick={openChat}
-          className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
-        >
-          Вернуться в чат
-        </button>
-      </div>
+  const sections = useMemo(
+    () => [
+      { id: 'account', label: 'Моя учётная запись', group: 'user' },
+      { id: 'invites', label: 'Приглашения', group: 'user' },
+      { id: 'security', label: 'Пароль и безопасность', group: 'user' },
+      { id: 'appearance', label: 'Внешний вид', group: 'app' },
+      { id: 'system', label: 'Системные', group: 'app' },
+      { id: 'updates', label: 'Обновления', group: 'app' },
+      { id: 'session', label: 'Сессия', group: 'app' },
+    ],
+    [],
+  )
 
-      <section className="panel rounded-3xl px-6 py-5 space-y-4">
-        <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Аудио</div>
-        <div className="space-y-4 text-sm text-white/80">
-          <div className="space-y-2">
-            <div className="text-xs text-white/50">Входное устройство</div>
-            <select
-              value={audioInputDeviceId || ''}
-              onChange={(e) => setAudioDevice('input', e.target.value || null)}
-              className="settings-select w-full rounded-2xl px-4 py-2 bg-white/10 text-white outline-none focus:bg-white/15 focus:text-white"
-            >
-              <option value="">По умолчанию системы</option>
-              {inputs.map((device, index) => (
-                <option key={device.deviceId || index} value={device.deviceId}>
-                  {device.label || `Микрофон ${index + 1}`}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="space-y-2">
-            <div className="text-xs text-white/50">Выходное устройство</div>
-            <select
-              value={audioOutputDeviceId || ''}
-              onChange={(e) => setAudioDevice('output', e.target.value || null)}
-              className="settings-select w-full rounded-2xl px-4 py-2 bg-white/10 text-white outline-none focus:bg-white/15 focus:text-white"
-            >
-              <option value="">По умолчанию системы</option>
-              {outputs.map((device, index) => (
-                <option key={device.deviceId || index} value={device.deviceId}>
-                  {device.label || `Динамики ${index + 1}`}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={handleRefreshDevices}
-              className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
-            >
-              Обновить устройства
-            </button>
-            <button
-              type="button"
-              onClick={handleTestMicrophone}
-              className="px-4 py-2 rounded-2xl bg-white/5 hover:bg-white/15 transition"
-            >
-              Проверить микрофон
-            </button>
-          </div>
-          {deviceStatus && (
-            <div className={deviceStatus.type === 'error' ? 'text-red-300 text-xs' : deviceStatus.type === 'success' ? 'text-emerald-300 text-xs' : 'text-white/60 text-xs'}>
-              {deviceStatus.message}
-            </div>
-          )}
-          <p className="text-xs text-white/50">
-            Совет: если устройства не отображаются или названы по умолчанию, разрешите доступ к микрофону в браузере и нажмите
-            «Обновить устройства».
-          </p>
-        </div>
-      </section>
+  const profileSrc = user ? buildAvatarUrl?.(user) : null
+  const nameStyle = buildNameStyle(nameStyleValue)
+  const filteredSections = sections.filter((item) =>
+    item.label.toLowerCase().includes(settingsSearch.trim().toLowerCase()),
+  )
 
-      <section className="panel rounded-3xl px-6 py-5 space-y-4">
-        <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Приложение</div>
-        <div className="space-y-4 text-sm text-white/80">
-          <div className="flex items-center justify-between gap-4">
+  const renderAppearance = () => (
+    <section className="panel rounded-3xl px-6 py-5 space-y-4">
+      <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Внешний вид</div>
+      <div className="space-y-4 text-sm text-white/80">
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
             <div>
-              <div className="text-sm text-white/80">Автозапуск</div>
-              <div className="text-xs text-white/50">
-                {autostartSupported
-                  ? 'Запускайте NE Messenger вместе с системой.'
-                  : 'Функция доступна в десктопном приложении.'}
-              </div>
+              <div className="text-sm text-white/80">Размер интерфейса</div>
+              <div className="text-xs text-white/50">Масштабирование интерфейса приложения</div>
             </div>
-            <button
-              type="button"
-              onClick={handleToggleAutostart}
-              disabled={!autostartSupported || autostartLoading}
-              className={`relative inline-flex h-7 w-14 items-center rounded-full border border-white/15 px-1 transition-all duration-200 ${
-                autostartEnabled ? 'bg-emerald-400/90 shadow-[0_0_12px_rgba(16,185,129,0.45)]' : 'bg-white/10'
-              } ${(!autostartSupported || autostartLoading) ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer hover:bg-white/15'}`}
-            >
-              <span
-                className={`h-5 w-5 rounded-full bg-white shadow transition-transform duration-200 ease-out ${
-                  autostartEnabled ? 'translate-x-7' : 'translate-x-0'
-                }`}
-              />
-            </button>
+            <div className="text-xs text-white/60">{Math.round(uiScale * 100)}%</div>
           </div>
-          {autostartStatus && (
-            <div className={autostartStatus.type === 'error' ? 'text-xs text-red-300' : 'text-xs text-emerald-300'}>
-              {autostartStatus.message}
-            </div>
-          )}
+          <input
+            type="range"
+            min="0.85"
+            max="1.3"
+            step="0.01"
+            value={uiScale}
+            onChange={(event) => setUiScale(Number(event.target.value))}
+            className="w-full accent-sky-400"
+          />
         </div>
-        <div className="border-t border-white/10 pt-4 space-y-4">
-          <div className="text-white/60 text-xs uppercase tracking-[0.25em]">Updates</div>
-          <div className="space-y-2 text-xs">
-            <div className="text-white/60">
-              Current version: <span className="text-white/80">{appVersion || '—'}</span>
+      </div>
+    </section>
+  )
+
+  const renderSystem = () => (
+    <section className="panel rounded-3xl px-6 py-5 space-y-4">
+      <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Системные</div>
+      <div className="space-y-4 text-sm text-white/80">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <div className="text-sm text-white/80">Автозапуск</div>
+            <div className="text-xs text-white/50">
+              {autostartSupported
+                ? 'Запускайте NE Messenger вместе с системой.'
+                : 'Функция доступна в десктопном приложении.'}
             </div>
-            {updateInfoVersion && (
-              <div className="text-white/60">
-                Latest available version: <span className="text-white/80">{updateInfoVersion}</span>
-              </div>
-            )}
-            <div className={updateStatusClass}>{updateStatusText}</div>
           </div>
-          {progressPercent !== null && (
-            <div className="space-y-2">
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
-                <div
-                  className="h-full bg-emerald-400 transition-all duration-200"
-                  style={{ width: `${progressPercent}%` }}
-                />
-              </div>
-              <div className="text-[10px] text-white/50">{progressPercent}%</div>
-            </div>
-          )}
-          <div className="flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              onClick={handleCheckUpdates}
-              disabled={updateIsDisabled || updateIsChecking || updateIsDownloading}
-              className={`px-4 py-2 rounded-2xl bg-white/10 transition ${
-                updateIsDisabled || updateIsChecking || updateIsDownloading
-                  ? 'opacity-40 cursor-not-allowed'
-                  : 'hover:bg-white/20'
-              }`}
-            >
-              {updateIsChecking ? 'Checking...' : 'Check for updates'}
-            </button>
-            {updateCanDownload && (
-              <button
-                type="button"
-                onClick={handleDownloadUpdate}
-                disabled={updateIsDownloading}
-                className={`px-4 py-2 rounded-2xl bg-white/10 transition ${
-                  updateIsDownloading ? 'opacity-40 cursor-not-allowed' : 'hover:bg-white/20'
-                }`}
-              >
-                {updateIsDownloading ? 'Downloading...' : 'Download update'}
-              </button>
-            )}
-            {updateReadyToInstall && (
-              <button
-                type="button"
-                onClick={handleInstallUpdate}
-                className="px-4 py-2 rounded-2xl bg-emerald-500/80 hover:bg-emerald-500 text-white transition"
-              >
-                Install and restart
-              </button>
-            )}
-          </div>
-        </div>
-        <div className="border-t border-white/10 pt-4 space-y-3">
-          <div className="text-white/60 text-xs uppercase tracking-[0.25em]">Сессия</div>
-          <p className="text-xs text-white/50">
-            Завершите текущий вход, чтобы авторизоваться под другой учетной записью или сбросить сохранённый токен.
-          </p>
           <button
             type="button"
-            onClick={logout}
-            className="px-4 py-2 rounded-2xl bg-red-500/80 hover:bg-red-500 text-white transition"
+            onClick={handleToggleAutostart}
+            disabled={!autostartSupported || autostartLoading}
+            className={`relative inline-flex h-7 w-14 items-center rounded-full border border-white/15 px-1 transition-all duration-200 ${
+              autostartEnabled ? 'bg-sky-400/90 shadow-[0_0_12px_rgba(56,189,248,0.4)]' : 'bg-white/10'
+            } ${(!autostartSupported || autostartLoading) ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer hover:bg-white/15'}`}
           >
-            Выйти из аккаунта
+            <span
+              className={`h-5 w-5 rounded-full bg-white shadow transition-transform duration-200 ease-out ${
+                autostartEnabled ? 'translate-x-7' : 'translate-x-0'
+              }`}
+            />
           </button>
         </div>
-      </section>
+        {autostartStatus && (
+          <div className={autostartStatus.type === 'error' ? 'text-xs text-red-300' : 'text-xs text-sky-300'}>
+            {autostartStatus.message}
+          </div>
+        )}
+      </div>
+    </section>
+  )
+
+  const renderUpdates = () => (
+    <section className="panel rounded-3xl px-6 py-5 space-y-4">
+      <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Обновления</div>
+      <div className="space-y-2 text-xs">
+        <div className="text-white/60">
+          Current version: <span className="text-white/80">{appVersion || '-'}</span>
+        </div>
+        {updateInfoVersion && (
+          <div className="text-white/60">
+            Latest available version: <span className="text-white/80">{updateInfoVersion}</span>
+          </div>
+        )}
+        <div className={updateStatusClass}>{updateStatusText}</div>
+      </div>
+      {progressPercent !== null && (
+        <div className="space-y-2">
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+            <div
+              className="h-full bg-sky-400 transition-all duration-200"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+          <div className="text-[10px] text-white/50">{progressPercent}%</div>
+        </div>
+      )}
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={handleCheckUpdates}
+          disabled={updateIsDisabled || updateIsChecking || updateIsDownloading}
+          className={`tg-button ${
+            updateIsDisabled || updateIsChecking || updateIsDownloading
+              ? 'opacity-40 cursor-not-allowed'
+              : ''
+          }`}
+        >
+          {updateIsChecking ? 'Checking...' : 'Check for updates'}
+        </button>
+        {updateCanDownload && (
+          <button
+            type="button"
+            onClick={handleDownloadUpdate}
+            disabled={updateIsDownloading}
+            className={`tg-button ${updateIsDownloading ? 'opacity-40 cursor-not-allowed' : ''}`}
+          >
+            {updateIsDownloading ? 'Downloading...' : 'Download update'}
+          </button>
+        )}
+        {updateReadyToInstall && (
+          <button
+            type="button"
+            onClick={handleInstallUpdate}
+            className="tg-button tg-button--primary"
+          >
+            Install and restart
+          </button>
+        )}
+      </div>
+    </section>
+  )
+
+  const renderSession = () => (
+    <section className="panel rounded-3xl px-6 py-5 space-y-4">
+      <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Сессия</div>
+      <p className="text-xs text-white/50">
+        Завершите текущий вход, чтобы авторизоваться под другой учетной записью или сбросить сохранённый токен.
+      </p>
+      <button
+        type="button"
+        onClick={logout}
+        className="px-4 py-2 rounded-2xl bg-red-500/80 hover:bg-red-500 text-white transition"
+      >
+        Выйти из аккаунта
+      </button>
+    </section>
+  )
+
+  return (
+    <div className="h-full w-full flex text-sm">
+      <aside className="w-72 border-r border-white/10 bg-[#141222] p-4 space-y-4">
+        <div className="flex items-center gap-3">
+          <AvatarImage user={user} size={44} src={profileSrc} className="flex-shrink-0" />
+          <div className="min-w-0">
+            <div className="text-sm font-semibold truncate" style={nameStyle}>
+              {user?.displayName || user?.username || 'user'}
+            </div>
+            <div className="text-xs text-white/50 truncate">Редактировать профиль</div>
+          </div>
+        </div>
+        <input
+          type="search"
+          value={settingsSearch}
+          onChange={(event) => setSettingsSearch(event.target.value)}
+          placeholder="Поиск"
+          className="tg-input text-xs placeholder:text-white/40"
+        />
+        <div className="space-y-3">
+          <div className="text-[11px] uppercase tracking-[0.2em] text-white/40">Настройки пользователя</div>
+          <div className="space-y-1">
+            {filteredSections.filter((item) => item.group === 'user').map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setActiveSection(item.id)}
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-sm transition ${
+                  activeSection === item.id ? 'panel' : 'hover:bg-white/10'
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <div className="text-[11px] uppercase tracking-[0.2em] text-white/40 pt-2">Настройки приложения</div>
+          <div className="space-y-1">
+            {filteredSections.filter((item) => item.group === 'app').map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setActiveSection(item.id)}
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-sm transition ${
+                  activeSection === item.id ? 'panel' : 'hover:bg-white/10'
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </aside>
+      <div className="flex-1 overflow-y-auto scroll-thin p-8 space-y-8">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-2xl font-semibold">Настройки</div>
+            <div className="text-white/60">Управление профилем и приложением</div>
+          </div>
+        </div>
+        {activeSection === 'account' && (
+          <Profile embedded includeInvites={false} includePassword={false} includeProfileEditor />
+        )}
+        {activeSection === 'invites' && (
+          <Profile embedded includeInvites includePassword={false} includeProfileEditor={false} />
+        )}
+        {activeSection === 'security' && (
+          <Profile embedded includeInvites={false} includePassword includeProfileEditor={false} />
+        )}
+        {activeSection === 'appearance' && renderAppearance()}
+        {activeSection === 'system' && renderSystem()}
+        {activeSection === 'updates' && renderUpdates()}
+        {activeSection === 'session' && renderSession()}
+      </div>
     </div>
   )
+
 }

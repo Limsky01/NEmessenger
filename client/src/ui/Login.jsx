@@ -237,7 +237,7 @@ export default function Login() {
         value={username}
         onChange={(e) => setUsername(e.target.value)}
         placeholder="Имя пользователя"
-        className="w-full bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
+        className="tg-input"
         autoComplete="username"
       />
       <input
@@ -245,13 +245,13 @@ export default function Login() {
         value={password}
         onChange={(e) => setPassword(e.target.value)}
         placeholder="Пароль"
-        className="w-full bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
+        className="tg-input"
         autoComplete="current-password"
       />
       <label className="flex items-center gap-2 text-sm text-white/70 select-none">
         <input
           type="checkbox"
-          className="w-4 h-4 accent-emerald-400 rounded"
+          className="w-4 h-4 accent-sky-400 rounded"
           checked={rememberLogin}
           onChange={(e) => setRememberLogin(e.target.checked)}
         />
@@ -259,7 +259,7 @@ export default function Login() {
       </label>
       {status && <div className="text-sm text-red-400 text-center">{status}</div>}
       <button
-        className="w-full bg-white/20 hover:bg-white/30 rounded-2xl py-3 transition disabled:opacity-60"
+        className="w-full tg-button tg-button--primary py-3 disabled:opacity-60"
         disabled={processing}
       >
         Войти
@@ -283,11 +283,11 @@ export default function Login() {
         value={inviteCodeInput}
         onChange={(e) => setInviteCodeInput(e.target.value.toUpperCase())}
         placeholder="Например, A1B2C3D4"
-        className="w-full uppercase tracking-[0.3em] text-center text-lg bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
+        className="tg-input uppercase tracking-[0.3em] text-center text-lg"
       />
       {status && <div className="text-sm text-red-400 text-center">{status}</div>}
       <button
-        className="w-full bg-white/20 hover:bg-white/30 rounded-2xl py-3 transition disabled:opacity-60"
+        className="w-full tg-button tg-button--primary py-3 disabled:opacity-60"
         disabled={processing}
       >
         Проверить код
@@ -330,7 +330,7 @@ export default function Login() {
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           placeholder="Имя пользователя"
-          className="w-full bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
+          className="tg-input"
           autoComplete="username"
         />
         <input
@@ -338,7 +338,7 @@ export default function Login() {
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           placeholder="Пароль (мин. 8 символов, буквы и цифры)"
-          className="w-full bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
+          className="tg-input"
           autoComplete="new-password"
         />
         <input
@@ -346,13 +346,13 @@ export default function Login() {
           value={passwordConfirm}
           onChange={(e) => setPasswordConfirm(e.target.value)}
           placeholder="Повторите пароль"
-          className="w-full bg-white/5 border border-white/15 rounded-2xl px-4 py-3 outline-none focus:bg-white/10"
+          className="tg-input"
           autoComplete="new-password"
         />
         <label className="flex items-center gap-2 text-sm text-white/70 select-none">
           <input
             type="checkbox"
-            className="w-4 h-4 accent-emerald-400 rounded"
+            className="w-4 h-4 accent-sky-400 rounded"
             checked={rememberLogin}
             onChange={(e) => setRememberLogin(e.target.checked)}
           />
@@ -374,7 +374,7 @@ export default function Login() {
         </div>
         {status && <div className="text-sm text-red-400 text-center">{status}</div>}
         <button
-          className="w-full bg-emerald-500/80 hover:bg-emerald-500 rounded-2xl py-3 transition disabled:opacity-60"
+          className="w-full tg-button tg-button--primary py-3 disabled:opacity-60"
           disabled={processing}
         >
           Завершить регистрацию
@@ -397,10 +397,10 @@ export default function Login() {
   return (
     <div className="h-[calc(100%-48px)] flex items-center justify-center relative">
       <div className="absolute inset-0 pointer-events-none">
-        <div className="w-96 h-96 rounded-full blur-3xl opacity-30 bg-indigo-500/40 absolute -top-16 -left-16" />
-        <div className="w-96 h-96 rounded-full blur-3xl opacity-30 bg-emerald-500/40 absolute bottom-0 right-10" />
+        <div className="w-96 h-96 rounded-full blur-3xl opacity-30 bg-sky-500/30 absolute -top-16 -left-16" />
+        <div className="w-96 h-96 rounded-full blur-3xl opacity-30 bg-blue-500/30 absolute bottom-0 right-10" />
       </div>
-      <div className="glass p-10 rounded-3xl w-[520px] border-white/15 relative">
+      <div className="tg-card p-10 w-[520px] relative">
         <h1 className="text-2xl mb-6 tracking-widest text-white/90 text-center">
           {mode === 'login' && 'Добро пожаловать в NE Messenger'}
           {mode === 'invite' && 'Регистрация по приглашению'}

@@ -9,53 +9,6 @@ import Settings from './Settings.jsx'
 import useStore from '../state/store.js'
 import SplashScreen from './SplashScreen.jsx'
 
-function VoiceAudioLayer() {
-  const remoteStreams = useStore((s) => s.voiceRemoteStreams)
-  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
-  const refs = React.useRef({})
-
-  React.useEffect(() => {
-    const ids = new Set(Object.keys(remoteStreams))
-    Object.keys(refs.current).forEach((id) => {
-      if (!ids.has(id)) delete refs.current[id]
-    })
-  }, [remoteStreams])
-
-  React.useEffect(() => {
-    const sinkId = audioOutputDeviceId || 'default'
-    Object.entries(refs.current).forEach(([id, element]) => {
-      if (!element) return
-      const info = remoteStreams[id]
-      if (info?.stream && element.srcObject !== info.stream) {
-        element.srcObject = info.stream
-      }
-      if (typeof element.setSinkId === 'function') {
-        element
-          .setSinkId(sinkId)
-          .catch((err) => console.warn('setSinkId failed', err))
-      }
-    })
-  }, [remoteStreams, audioOutputDeviceId])
-
-  return (
-    <div style={{ display: 'none' }}>
-      {Object.entries(remoteStreams).map(([socketId, info]) => (
-        <audio
-          key={socketId}
-          ref={(node) => {
-            refs.current[socketId] = node
-            if (node && info?.stream && node.srcObject !== info.stream) {
-              node.srcObject = info.stream
-            }
-          }}
-          autoPlay
-          playsInline
-        />
-      ))}
-    </div>
-  )
-}
-
 function AppInner() {
   const token = useStore((s) => s.token)
   const connect = useStore((s) => s.connect)
@@ -66,12 +19,31 @@ function AppInner() {
   const retryDelay = useStore((s) => s.retryDelay)
   const connectionError = useStore((s) => s.connectionError)
   const triggerReconnectNow = useStore((s) => s.triggerReconnectNow)
+  const fetchFriends = useStore((s) => s.fetchFriends)
+  const fetchFriendRequests = useStore((s) => s.fetchFriendRequests)
+  const openChat = useStore((s) => s.openChat)
   const [showSplash, setShowSplash] = useState(true)
   const [minimumVisible, setMinimumVisible] = useState(false)
 
   useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const stored = window.localStorage.getItem('nemessenger:ui-scale')
+      if (stored) document.documentElement.style.setProperty('--ui-scale', stored)
+    } catch (err) {
+      console.warn('ui scale restore failed', err)
+    }
+  }, [])
+
+  useEffect(() => {
     if (token) connect()
   }, [token, connect])
+
+  useEffect(() => {
+    if (!token) return
+    fetchFriends().catch((err) => console.warn('fetch friends failed', err))
+    fetchFriendRequests().catch((err) => console.warn('fetch friend requests failed', err))
+  }, [token, fetchFriends, fetchFriendRequests])
 
   useEffect(() => {
     if (!token) return
@@ -137,9 +109,8 @@ function AppInner() {
   }, [token, connectionStatus, countdownSeconds, connectionError])
 
   const manualActionLabel = connectionStatus === 'awaiting_manual' ? 'Подключиться сейчас' : undefined
-
   return (
-    <div className="h-full w-full app-bg font-mc">
+    <div className="h-full w-full app-bg">
       <SplashScreen
         showSplash={showSplash}
         heading={token ? 'Секунду…' : 'Добро пожаловать'}
@@ -154,19 +125,30 @@ function AppInner() {
         {token ? (
           <div className="flex h-[calc(100%-48px)]">
             <Sidebar />
-            {view === 'profile'
-              ? <Profile />
-              : view === 'admin'
-              ? <AdminPanel />
-              : view === 'settings'
-              ? <Settings />
-              : <Chat />}
+            {view === 'admin' ? <AdminPanel /> : <Chat />}
           </div>
         ) : (
           <Login />
         )}
       </div>
-      <VoiceAudioLayer />
+
+      {token && (view === 'profile' || view === 'settings') && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6">
+          <div className="w-full max-w-5xl panel rounded-3xl overflow-hidden relative max-h-[92vh] h-[92vh]">
+            <button
+              type="button"
+              onClick={openChat}
+              className="absolute top-4 right-4 w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 transition z-10"
+              title="Закрыть"
+            >
+              ✕
+            </button>
+            <div className="h-full overflow-y-auto scroll-thin">
+              {view === 'profile' ? <Profile /> : <Settings />}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -175,5 +157,12 @@ export default function App() {
   // DIAGNOSTICS: notifications are global only
   return <AppInner />
 }
+
+
+
+
+
+
+
 
 

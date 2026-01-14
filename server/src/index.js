@@ -11,18 +11,28 @@ import fs from 'fs'
 import path from 'path'
 import multer from 'multer'
 import crypto from 'crypto'
-import mime from 'mime-types'
-import { AccessToken } from 'livekit-server-sdk'
+
 
 const app = express()
 const server = http.createServer(app)
 const origins = process.env.ORIGIN ? process.env.ORIGIN.split(',').map((s) => s.trim()) : ['*']
-const io = new Server(server, { cors: { origin: origins, methods: ['GET', 'POST', 'DELETE'] } })
+const io = new Server(server, {
+  cors: { origin: origins, methods: ['GET', 'POST', 'DELETE'] },
+  maxHttpBufferSize: 10 * 1024 * 1024,
+})
+
 
 const timestamp = () => new Date().toISOString()
 const log = (...args) => console.log(timestamp(), ...args)
 const warn = (...args) => console.warn(timestamp(), ...args)
 const logError = (...args) => console.error(timestamp(), ...args)
+
+const emitToUser = (userId, event, payload = {}) => {
+  if (!userId) return
+  const socketId = onlineUsers.get(userId)
+  if (!socketId) return
+  io.to(socketId).emit(event, payload)
+}
 
 const resolveEncryptionKey = () => {
   const raw = process.env.ENCRYPTION_KEY || ''
@@ -76,118 +86,7 @@ const decryptText = (maybeEncrypted) => {
   }
 }
 
-const createFileCipher = () => {
-  const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
-  return { cipher, iv }
-}
 
-const createFileDecipher = (ivBase64, tagBase64) => {
-  if (!ivBase64 || !tagBase64) return null
-  try {
-    const iv = Buffer.from(ivBase64, 'base64')
-    const tag = Buffer.from(tagBase64, 'base64')
-    if (iv.length !== 12 || tag.length !== 16) return null
-    const decipher = crypto.createDecipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
-    decipher.setAuthTag(tag)
-    return decipher
-  } catch (err) {
-    warn('[ENCRYPTION] init file decipher failed', err.message)
-    return null
-  }
-}
-
-const pipeFileToResponse = (file, res) => {
-  const stream = fs.createReadStream(file.path)
-  const handleStreamError = (err) => {
-    warn('[FILES] stream error', err?.message || err)
-    if (!res.headersSent) {
-      try {
-        res.status(500).end()
-      } catch (_) {}
-    } else {
-      res.destroy(err)
-    }
-  }
-  stream.on('error', handleStreamError)
-  if (!file.iv || !file.auth_tag) {
-    stream.pipe(res)
-    return
-  }
-  const decipher = createFileDecipher(file.iv, file.auth_tag)
-  if (!decipher) {
-    stream.destroy()
-    if (!res.headersSent) {
-      try {
-        res.status(500).end()
-      } catch (_) {}
-    } else {
-      res.destroy(new Error('decrypt_init_failed'))
-    }
-    return
-  }
-  decipher.on('error', (err) => {
-    warn('[ENCRYPTION] file decrypt failed', err?.message || err)
-    stream.destroy(err)
-    if (!res.headersSent) {
-      try {
-        res.status(500).end()
-      } catch (_) {}
-    } else {
-      res.destroy(err)
-    }
-  })
-  stream.pipe(decipher).pipe(res)
-}
-
-const resolveFileMime = (file) => {
-  if (!file) return 'application/octet-stream'
-  const stored = typeof file.mime === 'string' ? file.mime.trim() : ''
-  if (stored) return stored
-  const guessed = mime.lookup(file.original_name || '') || mime.lookup(file.path || '') || ''
-  return guessed || 'application/octet-stream'
-}
-
-const safeMimePattern = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i
-const FALLBACK_DOWNLOAD_NAME = 'file'
-const sanitizeDownloadFilename = (name) => {
-  if (!name || typeof name !== 'string') return FALLBACK_DOWNLOAD_NAME
-  const cleaned = name.replace(/[\r\n]/g, ' ').replace(/"/g, "'").trim()
-  return cleaned || FALLBACK_DOWNLOAD_NAME
-}
-
-const sanitizeDiskFilename = (name) => {
-  const safe = sanitizeDownloadFilename(name)
-  const normalized = safe.replace(/[^a-zA-Z0-9_.-]/g, '_')
-  return normalized || FALLBACK_DOWNLOAD_NAME
-}
-
-const determineStoredMime = (rawMime, filename) => {
-  const raw = typeof rawMime === 'string' ? rawMime.trim() : ''
-  const guessed = mime.lookup(filename || '') || ''
-  if (raw && safeMimePattern.test(raw) && (!guessed || raw.toLowerCase() === guessed.toLowerCase())) {
-    return raw.toLowerCase()
-  }
-  if (guessed) return guessed
-  return 'application/octet-stream'
-}
-
-const INLINE_SAFE_VIEW_MIME_PREFIXES = ['image/', 'video/', 'audio/']
-const INLINE_SAFE_VIEW_MIME_VALUES = new Set(['application/pdf', 'text/plain'])
-
-const resolveInlineMimeType = (mimeType) => {
-  const normalized = typeof mimeType === 'string' ? mimeType.trim().toLowerCase() : ''
-  if (!normalized) return 'application/octet-stream'
-  if (INLINE_SAFE_VIEW_MIME_VALUES.has(normalized)) return normalized
-  if (INLINE_SAFE_VIEW_MIME_PREFIXES.some((prefix) => normalized.startsWith(prefix))) return normalized
-  return 'application/octet-stream'
-}
-
-const buildContentDisposition = (filename, { inline = false } = {}) => {
-  const safeName = sanitizeDownloadFilename(filename)
-  const encoded = encodeURIComponent(safeName)
-  return `${inline ? 'inline' : 'attachment'}; filename="${safeName}"; filename*=UTF-8''${encoded}`
-}
 
 app.use(cors({ origin: origins, credentials: true }))
 app.use(express.json({ limit: '5mb' }))
@@ -207,21 +106,10 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret'
 const UPLOAD_DIR = process.env.UPLOAD_DIR || 'uploads'
 const AVATAR_DIR = path.join(UPLOAD_DIR, 'avatars')
 const CHANNEL_AVATAR_DIR = path.join(AVATAR_DIR, 'channels')
-const VOICE_AVATAR_DIR = path.join(AVATAR_DIR, 'voice-rooms')
-const LIVEKIT_URL = (process.env.LIVEKIT_URL || '').trim()
-const LIVEKIT_API_KEY = (process.env.LIVEKIT_API_KEY || '').trim()
-const LIVEKIT_API_SECRET = (process.env.LIVEKIT_API_SECRET || '').trim()
-const LIVEKIT_ENABLED = Boolean(LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET)
-
-if (!LIVEKIT_ENABLED) {
-  warn('[VOICE] LiveKit configuration missing. Voice SFU is disabled.')
-}
 
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
-if (!fs.existsSync(path.join(UPLOAD_DIR, 'tmp'))) fs.mkdirSync(path.join(UPLOAD_DIR, 'tmp'), { recursive: true })
 if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true })
 if (!fs.existsSync(CHANNEL_AVATAR_DIR)) fs.mkdirSync(CHANNEL_AVATAR_DIR, { recursive: true })
-if (!fs.existsSync(VOICE_AVATAR_DIR)) fs.mkdirSync(VOICE_AVATAR_DIR, { recursive: true })
 const UPLOADS_ROOT = path.resolve(UPLOAD_DIR)
 
 const db = new Database('messenger_v4.db')
@@ -263,7 +151,11 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'user',
-  avatar_seed TEXT DEFAULT ''
+  avatar_seed TEXT DEFAULT '',
+  display_name TEXT DEFAULT '',
+  name_style TEXT DEFAULT '',
+  profile_status TEXT DEFAULT '',
+  profile_background TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -301,39 +193,18 @@ CREATE TABLE IF NOT EXISTS channel_members (
   role TEXT NOT NULL DEFAULT 'member',
   PRIMARY KEY (channel_id, user_id)
 );
-CREATE TABLE IF NOT EXISTS files (
+CREATE TABLE IF NOT EXISTS friends (
+  user_id TEXT NOT NULL,
+  friend_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, friend_id)
+);
+CREATE TABLE IF NOT EXISTS friend_requests (
   id TEXT PRIMARY KEY,
-  uploader_id TEXT NOT NULL,
-  original_name TEXT NOT NULL,
-  mime TEXT,
-  size INTEGER NOT NULL,
-  path TEXT NOT NULL,
+  from_user_id TEXT NOT NULL,
+  to_user_id TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS voice_rooms (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  created_by TEXT NOT NULL,
-  avatar_url TEXT DEFAULT '',
-  avatar_updated_at INTEGER DEFAULT 0,
-  avatar_mime TEXT DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS voice_room_members (
-  room_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'member',
-  added_at INTEGER NOT NULL,
-  added_by TEXT NOT NULL,
-  PRIMARY KEY (room_id, user_id),
-  FOREIGN KEY (room_id) REFERENCES voice_rooms(id) ON DELETE CASCADE,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-  FOREIGN KEY (added_by) REFERENCES users(id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_voice_room_members_room ON voice_room_members(room_id);
-CREATE INDEX IF NOT EXISTS idx_voice_room_members_user ON voice_room_members(user_id);
 CREATE TABLE IF NOT EXISTS invites (
   id TEXT PRIMARY KEY,
   code TEXT UNIQUE NOT NULL,
@@ -352,9 +223,10 @@ ensureColumn('users', 'avatar_seed', 'TEXT DEFAULT ""')
 ensureColumn('users', 'avatar_url', 'TEXT DEFAULT ""')
 ensureColumn('users', 'avatar_updated_at', 'INTEGER DEFAULT 0')
 ensureColumn('users', 'avatar_mime', 'TEXT DEFAULT ""')
-ensureColumn('files', 'iv', 'TEXT DEFAULT ""')
-ensureColumn('files', 'auth_tag', 'TEXT DEFAULT ""')
-ensureColumn('files', 'channel_id', 'TEXT DEFAULT ""')
+ensureColumn('users', 'display_name', 'TEXT DEFAULT ""')
+ensureColumn('users', 'name_style', 'TEXT DEFAULT ""')
+ensureColumn('users', 'profile_status', 'TEXT DEFAULT ""')
+ensureColumn('users', 'profile_background', 'TEXT DEFAULT ""')
 ensureColumn('invites', 'claim_token', 'TEXT DEFAULT ""')
 ensureColumn('invites', 'claimed_at', 'INTEGER')
 ensureColumn('invites', 'used_by', 'TEXT')
@@ -365,9 +237,6 @@ ensureColumn('channels', 'created_by', 'TEXT DEFAULT ""')
 ensureColumn('channels', 'avatar_url', 'TEXT DEFAULT ""')
 ensureColumn('channels', 'avatar_updated_at', 'INTEGER DEFAULT 0')
 ensureColumn('channels', 'avatar_mime', 'TEXT DEFAULT ""')
-ensureColumn('voice_rooms', 'avatar_url', 'TEXT DEFAULT ""')
-ensureColumn('voice_rooms', 'avatar_updated_at', 'INTEGER DEFAULT 0')
-ensureColumn('voice_rooms', 'avatar_mime', 'TEXT DEFAULT ""')
 ensureColumn('messages', 'updated_at', 'INTEGER DEFAULT 0')
 ensureColumn('messages', 'reply_to', 'TEXT REFERENCES messages(id) ON DELETE SET NULL')
 
@@ -385,15 +254,6 @@ try {
 } catch (err) {}
 try {
   db.prepare('ALTER TABLE users ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE files ADD COLUMN iv TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE files ADD COLUMN auth_tag TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE files ADD COLUMN channel_id TEXT DEFAULT ""').run()
 } catch (err) {}
 try {
   db.prepare('ALTER TABLE invites ADD COLUMN claim_token TEXT DEFAULT ""').run()
@@ -426,15 +286,6 @@ try {
   db.prepare('ALTER TABLE channels ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
 } catch (err) {}
 try {
-  db.prepare('ALTER TABLE voice_rooms ADD COLUMN avatar_url TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE voice_rooms ADD COLUMN avatar_updated_at INTEGER DEFAULT 0').run()
-} catch (err) {}
-try {
-  db.prepare('ALTER TABLE voice_rooms ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
-} catch (err) {}
-try {
   db.prepare('ALTER TABLE messages ADD COLUMN updated_at INTEGER DEFAULT 0').run()
 } catch (err) {}
 try {
@@ -445,38 +296,46 @@ try {
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
 const selectUserById = db.prepare('SELECT * FROM users WHERE id=?')
+const selectUserByUsername = db.prepare('SELECT * FROM users WHERE username=?')
 const updateAvatarInfoStmt = db.prepare('UPDATE users SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?')
 const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id=?')
 const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
+const updateNameStyleStmt = db.prepare('UPDATE users SET name_style=? WHERE id=?')
+const updateDisplayNameStmt = db.prepare('UPDATE users SET display_name=? WHERE id=?')
+const updateProfileStatusStmt = db.prepare('UPDATE users SET profile_status=? WHERE id=?')
+const updateProfileBackgroundStmt = db.prepare('UPDATE users SET profile_background=? WHERE id=?')
 const countAdminsStmt = db.prepare("SELECT COUNT(*) as count FROM users WHERE role='admin'")
-const listVoiceRoomsStmt = db.prepare(
-  'SELECT id, name, created_at, created_by, avatar_url, avatar_updated_at, avatar_mime FROM voice_rooms ORDER BY created_at ASC',
-)
-const listVoiceRoomsForUserStmt = db.prepare(
-  `SELECT vr.id, vr.name, vr.created_at, vr.created_by, vr.avatar_url, vr.avatar_updated_at, vr.avatar_mime, vrm.role AS membership_role
-   FROM voice_rooms vr
-   LEFT JOIN voice_room_members vrm ON vrm.room_id = vr.id AND vrm.user_id = ?
-   WHERE vr.created_by = ? OR vrm.user_id = ?
-   ORDER BY vr.created_at ASC`
-)
-const insertVoiceRoomStmt = db.prepare('INSERT INTO voice_rooms (id, name, created_at, created_by) VALUES (?,?,?,?)')
-const deleteVoiceRoomStmt = db.prepare('DELETE FROM voice_rooms WHERE id=?')
-
-const selectVoiceRoomStmt = db.prepare(
-  'SELECT id, name, created_at, created_by, avatar_url, avatar_updated_at, avatar_mime FROM voice_rooms WHERE id=?',
-)
-const insertVoiceRoomMemberStmt = db.prepare(
-  'INSERT OR REPLACE INTO voice_room_members (room_id, user_id, role, added_at, added_by) VALUES (?,?,?,?,?)'
-)
-const deleteVoiceRoomMemberStmt = db.prepare('DELETE FROM voice_room_members WHERE room_id=? AND user_id=?')
-const listVoiceRoomMembersStmt = db.prepare(
-  `SELECT vrm.user_id, vrm.role, vrm.added_at, u.username
-   FROM voice_room_members vrm
-   LEFT JOIN users u ON u.id = vrm.user_id
-   WHERE vrm.room_id = ?
+const listFriendsStmt = db.prepare(
+  `SELECT u.* FROM friends f
+   JOIN users u ON u.id = f.friend_id
+   WHERE f.user_id = ?
    ORDER BY u.username COLLATE NOCASE ASC`
 )
-const selectVoiceRoomMemberStmt = db.prepare('SELECT role FROM voice_room_members WHERE room_id=? AND user_id=?')
+const listIncomingFriendRequestsStmt = db.prepare(
+  `SELECT fr.id AS request_id, fr.created_at, u.*
+   FROM friend_requests fr
+   JOIN users u ON u.id = fr.from_user_id
+   WHERE fr.to_user_id = ?
+   ORDER BY fr.created_at DESC`
+)
+const listOutgoingFriendRequestsStmt = db.prepare(
+  `SELECT fr.id AS request_id, fr.created_at, u.*
+   FROM friend_requests fr
+   JOIN users u ON u.id = fr.to_user_id
+   WHERE fr.from_user_id = ?
+   ORDER BY fr.created_at DESC`
+)
+const selectFriendshipStmt = db.prepare('SELECT 1 FROM friends WHERE user_id=? AND friend_id=?')
+const insertFriendStmt = db.prepare('INSERT OR IGNORE INTO friends (user_id, friend_id, created_at) VALUES (?,?,?)')
+const deleteFriendStmt = db.prepare('DELETE FROM friends WHERE user_id=? AND friend_id=?')
+const insertFriendRequestStmt = db.prepare(
+  'INSERT INTO friend_requests (id, from_user_id, to_user_id, created_at) VALUES (?,?,?,?)'
+)
+const selectFriendRequestBetweenStmt = db.prepare(
+  'SELECT * FROM friend_requests WHERE from_user_id=? AND to_user_id=?'
+)
+const selectFriendRequestByIdStmt = db.prepare('SELECT * FROM friend_requests WHERE id=?')
+const deleteFriendRequestByIdStmt = db.prepare('DELETE FROM friend_requests WHERE id=?')
 const insertInviteStmt = db.prepare(
   'INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at, revoked_at) VALUES (?,?,?,?,?, ?, NULL, NULL, NULL, NULL)'
 )
@@ -543,9 +402,6 @@ const deleteChannelStmt = db.prepare('DELETE FROM channels WHERE id=?')
 const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
 const countChannelMembersStmt = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id=?')
 const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
-const updateVoiceRoomAvatarStmt = db.prepare(
-  'UPDATE voice_rooms SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?',
-)
 
 const publicMessage = (row) => {
   if (!row || typeof row.content === 'undefined') return row
@@ -600,23 +456,29 @@ let defaultWs = db.prepare('SELECT id FROM workspaces LIMIT 1').get()
 if (!defaultWs) {
   const wsId = uuidv4()
   db.prepare('INSERT INTO workspaces (id,name,created_at) VALUES (?,?,?)').run(wsId, 'Home', Date.now())
-  const chId = uuidv4()
-  db.prepare('INSERT INTO channels (id,workspace_id,name,created_at,is_private,created_by) VALUES (?,?,?,?,?,?)').run(
-    chId,
-    wsId,
-    'general',
-    Date.now(),
-    0,
-    '',
-  )
   defaultWs = { id: wsId }
 }
 
-let cachedVoiceRooms = listVoiceRoomsStmt.all()
-if (!cachedVoiceRooms.length) {
-  const vrId = uuidv4()
-  insertVoiceRoomStmt.run(vrId, 'Общий голосовой', Date.now(), 'system')
-  cachedVoiceRooms = listVoiceRoomsStmt.all()
+const DEFAULT_NAME_STYLE = Object.freeze({
+  font: 'rubik',
+  effect: 'minimal',
+  color: '#8ec5ff',
+})
+
+const normalizeNameStyle = (raw) => {
+  if (!raw) return DEFAULT_NAME_STYLE
+  if (typeof raw === 'string') {
+    try {
+      return normalizeNameStyle(JSON.parse(raw))
+    } catch (err) {
+      return DEFAULT_NAME_STYLE
+    }
+  }
+  return {
+    font: typeof raw.font === 'string' ? raw.font : DEFAULT_NAME_STYLE.font,
+    effect: typeof raw.effect === 'string' ? raw.effect : DEFAULT_NAME_STYLE.effect,
+    color: typeof raw.color === 'string' ? raw.color : DEFAULT_NAME_STYLE.color,
+  }
 }
 
 const publicUser = (u) => {
@@ -624,9 +486,25 @@ const publicUser = (u) => {
   const seed = u.avatar_seed ?? u.avatarSeed ?? ''
   const avatarPath = u.avatar_url ?? u.avatarUrl ?? ''
   const avatarUpdatedAt = u.avatar_updated_at ?? u.avatarUpdatedAt ?? 0
+  const nameStyle = normalizeNameStyle(u.name_style ?? u.nameStyle ?? '')
+  const displayName = typeof (u.display_name ?? u.displayName) === 'string'
+    ? (u.display_name ?? u.displayName)
+    : ''
+  const profileStatus = typeof (u.profile_status ?? u.profileStatus) === 'string'
+    ? (u.profile_status ?? u.profileStatus)
+    : ''
+  const profileBackground = typeof (u.profile_background ?? u.profileBackground) === 'string'
+    ? (u.profile_background ?? u.profileBackground)
+    : ''
   return {
     id: u.id,
     username: u.username,
+    displayName,
+    display_name: displayName,
+    profileStatus,
+    profile_status: profileStatus,
+    profileBackground,
+    profile_background: profileBackground,
     role: u.role,
     avatarSeed: seed,
     avatar_seed: seed,
@@ -634,17 +512,8 @@ const publicUser = (u) => {
     avatar_url: avatarPath,
     avatarUpdatedAt,
     avatar_updated_at: avatarUpdatedAt,
-  }
-}
-
-const fileMeta = (file) => {
-  if (!file) return null
-  return {
-    id: file.id,
-    name: file.original_name,
-    mime: file.mime || '',
-    size: file.size ?? 0,
-    channelId: file.channel_id || '',
+    nameStyle,
+    name_style: nameStyle,
   }
 }
 
@@ -709,7 +578,7 @@ const getAccessibleChannelsForUser = (user) => {
   } catch (err) {
     warn('[CHANNELS] list memberships failed', err.message)
   }
-  const allChannels = listAllChannelsStmt.all(defaultWs.id)
+  const allChannels = listAllChannelsStmt.all(defaultWs.id).filter((row) => row.is_private)
   return allChannels
     .map((row) => ({ row, normalized: normalizeChannelRow(row) }))
     .filter(({ normalized }) => Boolean(normalized))
@@ -762,6 +631,18 @@ const emitChannelListForUsers = (userIds) => {
     seen.add(userId)
     emitChannelListForUser(userId)
   })
+}
+
+const areFriends = (userId, friendId) => {
+  if (!userId || !friendId) return false
+  if (userId === friendId) return false
+  return Boolean(selectFriendshipStmt.get(userId, friendId))
+}
+
+const addFriendship = (userId, friendId) => {
+  const now = Date.now()
+  insertFriendStmt.run(userId, friendId, now)
+  insertFriendStmt.run(friendId, userId, now)
 }
 
 const removeUserFromChannelRoom = (channelId, userId) => {
@@ -822,31 +703,13 @@ const isMemberOfDirectChannel = (channelId, userId) => {
   return parsed.first === userId || parsed.second === userId
 }
 
-const normalizeUploadChannelTarget = (rawChannelId, user) => {
-  if (!rawChannelId) return { id: '' }
-  if (typeof rawChannelId !== 'string') return { error: 'invalid_channel', status: 400 }
-  if (rawChannelId.startsWith('dm:')) {
-    if (!isMemberOfDirectChannel(rawChannelId, user.id)) return { error: 'forbidden', status: 403 }
-    const normalized = normalizeDirectChannelId(rawChannelId)
-    if (!normalized) return { error: 'invalid_channel', status: 400 }
-    return { id: normalized }
-  }
-  const access = resolveChannelAccess(user, rawChannelId)
-  if (!access.allowed) return { error: 'forbidden', status: 403 }
-  return { id: rawChannelId }
+const canAccessDirectChannel = (channelId, userId) => {
+  const parsed = parseDirectChannelId(channelId)
+  if (!parsed) return false
+  if (parsed.first !== userId && parsed.second !== userId) return false
+  const peerId = parsed.first === userId ? parsed.second : parsed.first
+  return areFriends(userId, peerId)
 }
-
-const canAccessFile = (file, user) => {
-  if (!file || !user) return false
-  if (user.role === 'admin') return true
-  if (file.uploader_id && file.uploader_id === user.id) return true
-  const channelId = file.channel_id || ''
-  if (!channelId) return false
-  if (channelId.startsWith('dm:')) return isMemberOfDirectChannel(channelId, user.id)
-  const access = resolveChannelAccess(user, channelId)
-  return !!access.allowed
-}
-
 
 const auth = (req, res, next) => {
   const hdr = req.headers.authorization || ''
@@ -917,6 +780,76 @@ app.post('/api/invites/claim', (req, res) => {
     },
     claimToken,
   })
+})
+
+app.get('/api/friends', auth, (req, res) => {
+  const friends = listFriendsStmt.all(req.user.id).map(publicUser)
+  res.json({ friends })
+})
+
+app.get('/api/friends/requests', auth, (req, res) => {
+  const incoming = listIncomingFriendRequestsStmt.all(req.user.id).map((row) => ({
+    id: row.request_id,
+    fromUser: publicUser(row),
+    createdAt: row.created_at,
+  }))
+  const outgoing = listOutgoingFriendRequestsStmt.all(req.user.id).map((row) => ({
+    id: row.request_id,
+    toUser: publicUser(row),
+    createdAt: row.created_at,
+  }))
+  res.json({ incoming, outgoing })
+})
+
+  app.post('/api/friends/request', auth, (req, res) => {
+    const username = typeof req.body?.username === 'string' ? req.body.username.trim() : ''
+    if (!username) return res.status(400).json({ error: 'invalid_username' })
+    const target = selectUserByUsername.get(username)
+    if (!target) return res.status(404).json({ error: 'not_found' })
+  if (target.id === req.user.id) return res.status(400).json({ error: 'invalid_target' })
+  if (areFriends(req.user.id, target.id)) return res.json({ status: 'already_friends' })
+
+  const reverse = selectFriendRequestBetweenStmt.get(target.id, req.user.id)
+    if (reverse) {
+      deleteFriendRequestByIdStmt.run(reverse.id)
+      addFriendship(req.user.id, target.id)
+      emitToUser(req.user.id, 'friends:requests:update', { reason: 'accepted' })
+      emitToUser(target.id, 'friends:requests:update', { reason: 'accepted' })
+      return res.json({ status: 'accepted' })
+    }
+    const existing = selectFriendRequestBetweenStmt.get(req.user.id, target.id)
+    if (existing) return res.json({ status: 'requested' })
+    const id = uuidv4()
+    insertFriendRequestStmt.run(id, req.user.id, target.id, Date.now())
+    emitToUser(req.user.id, 'friends:requests:update', { reason: 'requested' })
+    emitToUser(target.id, 'friends:requests:update', { reason: 'requested' })
+    res.json({ status: 'requested', requestId: id })
+  })
+
+  app.post('/api/friends/respond', auth, (req, res) => {
+    const requestId = typeof req.body?.requestId === 'string' ? req.body.requestId : ''
+    const accept = Boolean(req.body?.accept)
+    if (!requestId) return res.status(400).json({ error: 'invalid_request' })
+    const request = selectFriendRequestByIdStmt.get(requestId)
+  if (!request || request.to_user_id !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    deleteFriendRequestByIdStmt.run(requestId)
+    if (accept) {
+      addFriendship(req.user.id, request.from_user_id)
+      emitToUser(req.user.id, 'friends:requests:update', { reason: 'accepted' })
+      emitToUser(request.from_user_id, 'friends:requests:update', { reason: 'accepted' })
+      return res.json({ status: 'accepted' })
+    }
+    emitToUser(req.user.id, 'friends:requests:update', { reason: 'declined' })
+    emitToUser(request.from_user_id, 'friends:requests:update', { reason: 'declined' })
+    return res.json({ status: 'declined' })
+  })
+
+app.delete('/api/friends/:userId', auth, (req, res) => {
+  const friendId = req.params.userId
+  if (!friendId) return res.status(400).json({ error: 'invalid_user' })
+  deleteFriendStmt.run(req.user.id, friendId)
+  deleteFriendStmt.run(friendId, req.user.id)
+  res.json({ ok: true })
 })
 
 app.post('/api/register', (req, res) => {
@@ -1057,24 +990,23 @@ app.get('/api/channels', auth, (req, res) => {
 app.post('/api/channels', auth, (req, res) => {
   const user = selectUserById.get(req.user.id)
   if (!user) return res.status(404).json({ error: 'not_found' })
-  const { name, memberIds, isPrivate = true } = req.body || {}
+  const { name, memberIds } = req.body || {}
   const trimmed = typeof name === 'string' ? name.trim() : ''
   if (!trimmed || trimmed.length < 2 || trimmed.length > 64)
     return res.status(400).json({ error: 'invalid_name' })
-  const privateFlag = isPrivate !== false
+  const privateFlag = true
   const now = Date.now()
   const channelId = uuidv4()
-  insertChannelStmt.run(channelId, defaultWs.id, trimmed, now, privateFlag ? 1 : 0, privateFlag ? req.user.id : req.user.id)
-  if (privateFlag) {
-    insertChannelMemberStmt.run(channelId, req.user.id, 'owner')
-    const provided = Array.isArray(memberIds) ? memberIds : []
-    const unique = new Set(provided.filter((id) => typeof id === 'string' && id && id !== req.user.id))
-    unique.forEach((memberId) => {
-      const target = selectUserById.get(memberId)
-      if (!target) return
-      insertChannelMemberStmt.run(channelId, memberId, 'member')
-    })
-  }
+  insertChannelStmt.run(channelId, defaultWs.id, trimmed, now, 1, req.user.id)
+  insertChannelMemberStmt.run(channelId, req.user.id, 'owner')
+  const provided = Array.isArray(memberIds) ? memberIds : []
+  const unique = new Set(provided.filter((id) => typeof id === 'string' && id && id !== req.user.id))
+  unique.forEach((memberId) => {
+    if (!areFriends(req.user.id, memberId)) return
+    const target = selectUserById.get(memberId)
+    if (!target) return
+    insertChannelMemberStmt.run(channelId, memberId, 'member')
+  })
   const channelRow = selectChannelByIdStmt.get(channelId)
   const audience = getChannelAudienceUserIds(channelRow)
   emitChannelListForUsers(audience)
@@ -1085,7 +1017,7 @@ app.post('/api/channels', auth, (req, res) => {
       memberCount: channelRow.is_private ? getChannelMemberCount(channelRow.id) : 0,
       membershipRole: privateFlag ? 'owner' : '',
     })
-  const members = privateFlag ? getChannelMembersDetailed(channelId) : []
+  const members = getChannelMembersDetailed(channelId)
   log('[CHANNELS] create', channelId, 'user=' + req.user.id, 'private=' + privateFlag)
   res.status(201).json({ channel: channelPayload, members })
 })
@@ -1117,6 +1049,7 @@ app.post('/api/channels/:id/members', auth, (req, res) => {
   if (targetId === channel.created_by) return res.status(400).json({ error: 'cannot_modify_owner' })
   const targetUser = selectUserById.get(targetId)
   if (!targetUser) return res.status(404).json({ error: 'user_not_found' })
+  if (!areFriends(user.id, targetId)) return res.status(403).json({ error: 'not_friends' })
   insertChannelMemberStmt.run(req.params.id, targetId, 'member')
   const refreshed = selectChannelByIdStmt.get(req.params.id)
   const audience = getChannelAudienceUserIds(refreshed)
@@ -1300,7 +1233,7 @@ app.get('/api/channels/:id/avatar', (req, res) => {
 
 app.get('/api/users', auth, (req, res) => {
   const users = db
-    .prepare('SELECT id, username, role, avatar_seed, avatar_url, avatar_updated_at FROM users ORDER BY username ASC')
+    .prepare('SELECT id, username, display_name, profile_status, profile_background, role, avatar_seed, avatar_url, avatar_updated_at, name_style FROM users ORDER BY username ASC')
     .all()
   log('[USERS] list', 'by=' + req.user.id, 'count=' + users.length)
   res.json({ users: users.map(publicUser) })
@@ -1352,6 +1285,60 @@ app.post('/api/profile/avatar', auth, (req, res) => {
   })
 })
 
+app.post('/api/profile/display-name', auth, (req, res) => {
+  const raw = typeof req.body?.displayName === 'string' ? req.body.displayName.trim() : ''
+  if (raw && (raw.length < 2 || raw.length > 32)) {
+    return res.status(400).json({ error: 'invalid_display_name' })
+  }
+  updateDisplayNameStmt.run(raw, req.user.id)
+  const updated = selectUserById.get(req.user.id)
+  const payload = publicUser(updated)
+  io.emit('user:update', payload)
+  res.json({ user: payload })
+})
+
+app.post('/api/profile/status', auth, (req, res) => {
+  const raw = typeof req.body?.status === 'string' ? req.body.status.trim() : ''
+  if (raw.length > 120) {
+    return res.status(400).json({ error: 'invalid_status' })
+  }
+  updateProfileStatusStmt.run(raw, req.user.id)
+  const updated = selectUserById.get(req.user.id)
+  const payload = publicUser(updated)
+  io.emit('user:update', payload)
+  res.json({ user: payload })
+})
+
+app.post('/api/profile/background', auth, (req, res) => {
+  const raw = typeof req.body?.background === 'string' ? req.body.background.trim() : ''
+  if (raw.length > 8000000) {
+    return res.status(400).json({ error: 'invalid_background' })
+  }
+  updateProfileBackgroundStmt.run(raw, req.user.id)
+  const updated = selectUserById.get(req.user.id)
+  const payload = publicUser(updated)
+  io.emit('user:update', payload)
+  res.json({ user: payload })
+})
+
+app.post('/api/profile/name-style', auth, (req, res) => {
+  const font = typeof req.body?.font === 'string' ? req.body.font.trim() : ''
+  const effect = typeof req.body?.effect === 'string' ? req.body.effect.trim() : ''
+  const color = typeof req.body?.color === 'string' ? req.body.color.trim() : ''
+  const allowedFonts = new Set(['rubik', 'inter', 'mono', 'serif', 'display', 'georgia'])
+  const allowedEffects = new Set(['minimal', 'gradient', 'neon', 'glow', 'outline'])
+  const colorOk = /^#[0-9a-fA-F]{6}$/.test(color)
+  if (!allowedFonts.has(font) || !allowedEffects.has(effect) || !colorOk) {
+    return res.status(400).json({ error: 'invalid_style' })
+  }
+  const style = { font, effect, color }
+  updateNameStyleStmt.run(JSON.stringify(style), req.user.id)
+  const updated = selectUserById.get(req.user.id)
+  const payload = publicUser(updated)
+  io.emit('user:update', payload)
+  res.json({ user: payload })
+})
+
 app.get('/api/users/:id/avatar', (req, res) => {
   const user = selectUserById.get(req.params.id)
   if (!user?.avatar_url) {
@@ -1386,23 +1373,6 @@ app.post('/api/profile/password', auth, (req, res) => {
   res.json({ ok: true })
 })
 
-app.get('/api/admin/files', auth, adminOnly, (req, res) => {
-  log('[ADMIN] files:list', 'admin=' + req.user.id)
-  res.json({ files: db.prepare('SELECT * FROM files ORDER BY created_at DESC').all() })
-})
-app.delete('/api/admin/files/:id', auth, adminOnly, (req, res) => {
-  const f = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
-  if (!f) {
-    warn('[ADMIN] file:missing', 'admin=' + req.user.id, 'id=' + req.params.id)
-    return res.status(404).json({ error: 'not_found' })
-  }
-  try {
-    fs.unlinkSync(f.path)
-  } catch (e) {}
-  db.prepare('DELETE FROM files WHERE id=?').run(req.params.id)
-  log('[ADMIN] file:deleted', 'admin=' + req.user.id, 'id=' + req.params.id)
-  res.json({ ok: true })
-})
 app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
   const id = req.params.id
   const existing = selectUserById.get(id)
@@ -1440,184 +1410,6 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
   }
   log('[ADMIN] user:deleted', 'admin=' + req.user.id, 'target=' + id)
   res.json({ ok: true })
-})
-
-app.get('/api/voice-rooms', auth, (req, res) => {
-  const viewer = selectUserById.get(req.user.id) || req.user
-  const rooms = getVoiceRoomsForUser(viewer).map((room) => publicVoiceRoom(room, viewer))
-  res.json({ rooms })
-})
-
-app.post('/api/voice-rooms', auth, (req, res) => {
-  const viewer = selectUserById.get(req.user.id)
-  if (!viewer) return res.status(404).json({ error: 'not_found' })
-  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : ''
-  if (!name) return res.status(400).json({ error: 'invalid_name' })
-  const rawMembers = Array.isArray(req.body?.members) ? req.body.members : []
-  const memberSet = new Set(rawMembers.filter((id) => typeof id === 'string' && id !== viewer.id))
-  const adminSet = new Set(Array.isArray(req.body?.admins) ? req.body.admins : [])
-  const now = Date.now()
-  const id = uuidv4()
-  insertVoiceRoomStmt.run(id, name, now, viewer.id)
-  insertVoiceRoomMemberStmt.run(id, viewer.id, 'owner', now, viewer.id)
-  memberSet.forEach((userId) => {
-    insertVoiceRoomMemberStmt.run(id, userId, adminSet.has(userId) ? 'admin' : 'member', now, viewer.id)
-  })
-  emitVoiceRoomsUpdate()
-  res.status(201).json({ room: publicVoiceRoom({ id, name, created_at: now, created_by: viewer.id }, viewer) })
-})
-
-app.delete('/api/voice-rooms/:id', auth, (req, res) => {
-  const viewer = selectUserById.get(req.user.id)
-  if (!viewer) return res.status(404).json({ error: 'not_found' })
-  const room = selectVoiceRoomStmt.get(req.params.id)
-  if (!room) return res.status(404).json({ error: 'not_found' })
-  if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
-  const participants = voiceParticipants.get(room.id)
-  if (participants) {
-    for (const participant of participants.values()) {
-      const targetSocket = io.sockets.sockets.get(participant.socketId)
-      if (targetSocket) {
-        targetSocket.emit('voice:room-closed', { roomId: room.id })
-        leaveVoiceRoom(targetSocket, { silent: true })
-      }
-    }
-  }
-  if (room.avatar_url) {
-    const avatarPath = path.resolve(path.join(UPLOAD_DIR, room.avatar_url))
-    if (avatarPath.startsWith(UPLOADS_ROOT) && fs.existsSync(avatarPath)) {
-      try {
-        fs.unlinkSync(avatarPath)
-      } catch (err) {
-        warn('[VOICE] avatar cleanup failed', err.message)
-      }
-    }
-  }
-  deleteVoiceRoomStmt.run(room.id)
-  emitVoiceRoomsUpdate()
-  res.json({ ok: true })
-})
-
-app.post('/api/voice-rooms/:id/members', auth, (req, res) => {
-  const viewer = selectUserById.get(req.user.id)
-  if (!viewer) return res.status(404).json({ error: 'not_found' })
-  const room = selectVoiceRoomStmt.get(req.params.id)
-  if (!room) return res.status(404).json({ error: 'not_found' })
-  if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
-  const updates = Array.isArray(req.body?.upserts) ? req.body.upserts : []
-  const removals = Array.isArray(req.body?.remove) ? req.body.remove : []
-  const now = Date.now()
-
-  const removedUsers = []
-  removals
-    .filter((userId) => typeof userId === 'string' && userId !== room.created_by)
-    .forEach((userId) => {
-      deleteVoiceRoomMemberStmt.run(room.id, userId)
-      removedUsers.push(userId)
-    })
-
-  updates.forEach((entry) => {
-    if (!entry || typeof entry.userId !== 'string') return
-    const role = entry.role === 'admin' ? 'admin' : 'member'
-    if (entry.userId === room.created_by) return
-    if (!selectUserById.get(entry.userId)) return
-    insertVoiceRoomMemberStmt.run(room.id, entry.userId, role, now, viewer.id)
-  })
-
-  if (removedUsers.length) {
-    const participants = voiceParticipants.get(room.id)
-    if (participants) {
-      for (const participant of participants.values()) {
-        if (!removedUsers.includes(participant.userId)) continue
-        const targetSocket = io.sockets.sockets.get(participant.socketId)
-        if (targetSocket) {
-          targetSocket.emit('voice:room-closed', { roomId: room.id })
-          leaveVoiceRoom(targetSocket, { silent: true })
-        }
-      }
-    }
-  }
-
-  emitVoiceRoomsUpdate()
-  res.json({ room: publicVoiceRoom({ ...room }, viewer) })
-})
-
-app.post('/api/voice-rooms/:id/avatar', auth, (req, res) => {
-  voiceAvatarUpload.single('avatar')(req, res, (err) => {
-    if (err) {
-      warn('[VOICE] avatar upload failed', err?.message || err)
-      const code = err.code === 'LIMIT_FILE_SIZE' ? 'avatar_too_large' : 'invalid_avatar'
-      return res.status(400).json({ error: code })
-    }
-    if (!req.file) return res.status(400).json({ error: 'invalid_avatar' })
-
-    const viewer = selectUserById.get(req.user.id)
-    if (!viewer) return res.status(404).json({ error: 'not_found' })
-    const room = selectVoiceRoomStmt.get(req.params.id)
-    if (!room) return res.status(404).json({ error: 'not_found' })
-    if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
-
-    const relPath = path.relative(UPLOAD_DIR, req.file.path)
-    const previousPath = room.avatar_url ? path.join(UPLOAD_DIR, room.avatar_url) : ''
-    updateVoiceRoomAvatarStmt.run(relPath, Date.now(), req.file.mimetype || '', room.id)
-    if (previousPath && fs.existsSync(previousPath) && path.resolve(previousPath).startsWith(UPLOADS_ROOT)) {
-      if (path.resolve(previousPath) !== path.resolve(req.file.path)) {
-        try {
-          fs.unlinkSync(previousPath)
-        } catch (error) {
-          warn('[VOICE] avatar cleanup failed', error.message)
-        }
-      }
-    }
-
-    const updated = selectVoiceRoomStmt.get(room.id)
-    const membership = selectVoiceRoomMemberStmt.get(room.id, viewer.id)
-    const payload = publicVoiceRoom({ ...updated, membership_role: membership?.role || '' }, viewer)
-    emitVoiceRoomsUpdate()
-    log('[VOICE] avatar updated', room.id, 'actor=' + viewer.id)
-    res.json({ room: payload })
-  })
-})
-
-app.delete('/api/voice-rooms/:id/avatar', auth, (req, res) => {
-  const viewer = selectUserById.get(req.user.id)
-  if (!viewer) return res.status(404).json({ error: 'not_found' })
-  const room = selectVoiceRoomStmt.get(req.params.id)
-  if (!room) return res.status(404).json({ error: 'not_found' })
-  if (!canManageVoiceRoom(viewer, room)) return res.status(403).json({ error: 'forbidden' })
-
-  if (room.avatar_url) {
-    const avatarPath = path.resolve(path.join(UPLOAD_DIR, room.avatar_url))
-    if (avatarPath.startsWith(UPLOADS_ROOT) && fs.existsSync(avatarPath)) {
-      try {
-        fs.unlinkSync(avatarPath)
-      } catch (err) {
-        warn('[VOICE] avatar delete failed', err.message)
-      }
-    }
-  }
-  updateVoiceRoomAvatarStmt.run('', 0, '', room.id)
-  const updated = selectVoiceRoomStmt.get(room.id)
-  const membership = selectVoiceRoomMemberStmt.get(room.id, viewer.id)
-  const payload = publicVoiceRoom({ ...updated, membership_role: membership?.role || '' }, viewer)
-  emitVoiceRoomsUpdate()
-  log('[VOICE] avatar removed', room.id, 'actor=' + viewer.id)
-  res.json({ room: payload })
-})
-
-app.get('/api/voice-rooms/:id/avatar', (req, res) => {
-  const room = selectVoiceRoomStmt.get(req.params.id)
-  if (!room?.avatar_url) return res.status(404).json({ error: 'not_found' })
-  const avatarPath = path.resolve(path.join(UPLOAD_DIR, room.avatar_url))
-  if (!avatarPath.startsWith(UPLOADS_ROOT)) return res.status(403).json({ error: 'forbidden' })
-  if (!fs.existsSync(avatarPath)) {
-    warn('[VOICE] avatar missing file', req.params.id)
-    return res.status(404).json({ error: 'missing_file' })
-  }
-  if (room.avatar_mime) res.setHeader('Content-Type', room.avatar_mime)
-  if (room.avatar_updated_at) res.setHeader('Last-Modified', new Date(room.avatar_updated_at).toUTCString())
-  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
-  res.sendFile(avatarPath)
 })
 
 app.patch('/api/admin/users/:id/role', auth, adminOnly, (req, res) => {
@@ -1726,231 +1518,10 @@ const channelAvatarStorage = multer.diskStorage({
   },
 })
 
-const voiceAvatarStorage = multer.diskStorage({
-  destination: (req, _file, cb) => {
-    const safeId = sanitizeForPath(req.params?.id, 'unknown')
-    const target = path.join(VOICE_AVATAR_DIR, safeId)
-    fs.mkdirSync(target, { recursive: true })
-    cb(null, target)
-  },
-  filename: (_req, file, cb) => {
-    const ext = (path.extname(file.originalname || '') || '.png').toLowerCase()
-    const allowed = ['.png', '.jpg', '.jpeg', '.gif', '.webp']
-    const safeExt = allowed.includes(ext) ? ext : '.png'
-    const name = Date.now().toString() + safeExt
-    cb(null, name)
-  },
-})
-
 const channelAvatarUpload = multer({
   storage: channelAvatarStorage,
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: imageFileFilter,
-})
-
-const voiceAvatarUpload = multer({
-  storage: voiceAvatarStorage,
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: imageFileFilter,
-})
-
-const upload = multer({ storage: multer.memoryStorage() })
-
-const resolveUploadSessionMeta = (dir) => {
-  const metaPath = path.join(dir, 'meta.json')
-  try {
-    const raw = fs.readFileSync(metaPath, 'utf8')
-    return JSON.parse(raw)
-  } catch (err) {
-    return null
-  }
-}
-
-app.post('/api/upload/init', auth, (req, res) => {
-  const { filename: rawName, size, mime: rawMime, channelId: rawChannelId } = req.body || {}
-  const normalizedSize = Number(size)
-  if (!rawName || !Number.isFinite(normalizedSize) || normalizedSize <= 0)
-    return res.status(400).json({ error: 'bad_request' })
-  const normalizedName = sanitizeDownloadFilename(rawName)
-  const safeName = sanitizeDiskFilename(normalizedName)
-  const normalizedMime = determineStoredMime(rawMime, normalizedName || safeName)
-  const channelResult = normalizeUploadChannelTarget(rawChannelId, req.user)
-  if (channelResult.error) return res.status(channelResult.status || 400).json({ error: channelResult.error })
-  const id = uuidv4()
-  const tmpDir = path.join(UPLOAD_DIR, 'tmp', id)
-  fs.mkdirSync(tmpDir, { recursive: true })
-  const meta = {
-    ownerId: req.user.id,
-    originalName: normalizedName,
-    safeName,
-    size: normalizedSize,
-    mime: normalizedMime,
-    channelId: channelResult.id || '',
-  }
-  fs.writeFileSync(path.join(tmpDir, 'meta.json'), JSON.stringify(meta, null, 2))
-  log(
-    '[UPLOAD] init',
-    'user=' + req.user.id,
-    'upload=' + id,
-    'name=' + normalizedName,
-    'size=' + normalizedSize,
-    'channel=' + (channelResult.id || 'none'),
-  )
-  res.json({ uploadId: id })
-})
-
-app.post('/api/upload/chunk', auth, upload.single('chunk'), (req, res) => {
-  const { uploadId, index } = req.body || {}
-  if (!uploadId || typeof index === 'undefined') return res.status(400).json({ error: 'bad_request' })
-  const chunkIndex = Number(index)
-  if (!Number.isInteger(chunkIndex) || chunkIndex < 0) return res.status(400).json({ error: 'bad_chunk' })
-  if (!req.file?.buffer?.length) return res.status(400).json({ error: 'empty_chunk' })
-  const tmpDir = path.join(UPLOAD_DIR, 'tmp', uploadId)
-  if (!fs.existsSync(tmpDir)) return res.status(400).json({ error: 'no_session' })
-  const meta = resolveUploadSessionMeta(tmpDir)
-  if (!meta || meta.ownerId !== req.user.id) return res.status(403).json({ error: 'forbidden' })
-  const chunkPath = path.join(tmpDir, `chunk_${chunkIndex}`)
-  if (fs.existsSync(chunkPath)) return res.status(409).json({ error: 'chunk_exists' })
-  fs.writeFileSync(chunkPath, req.file.buffer)
-  log(
-    '[UPLOAD] chunk',
-    'user=' + req.user.id,
-    'upload=' + uploadId,
-    'index=' + chunkIndex,
-    'bytes=' + req.file.buffer.length,
-  )
-  res.json({ ok: true })
-})
-
-app.post('/api/upload/complete', auth, (req, res) => {
-  const { uploadId } = req.body || {}
-  if (!uploadId) return res.status(400).json({ error: 'bad_request' })
-  const tmpDir = path.join(UPLOAD_DIR, 'tmp', uploadId)
-  if (!fs.existsSync(tmpDir)) return res.status(400).json({ error: 'no_session' })
-  const meta = resolveUploadSessionMeta(tmpDir)
-  if (!meta || meta.ownerId !== req.user.id) return res.status(403).json({ error: 'forbidden' })
-  const chunks = fs
-    .readdirSync(tmpDir)
-    .filter((n) => n.startsWith('chunk_'))
-    .sort((a, b) => parseInt(a.split('_')[1], 10) - parseInt(b.split('_')[1], 10))
-  if (!chunks.length) return res.status(400).json({ error: 'no_chunks' })
-
-  const parsedChunks = chunks.map((name) => ({
-    name,
-    index: parseInt(name.split('_')[1], 10),
-  }))
-  if (parsedChunks.some((entry) => !Number.isInteger(entry.index) || entry.index < 0))
-    return res.status(400).json({ error: 'bad_chunk_index' })
-  for (let expected = 0; expected < parsedChunks.length; expected += 1) {
-    if (parsedChunks[expected].index !== expected) {
-      return res.status(400).json({ error: 'chunk_order' })
-    }
-  }
-
-  const originalName = sanitizeDownloadFilename(meta.originalName || FALLBACK_DOWNLOAD_NAME)
-  const safeName = meta.safeName || sanitizeDiskFilename(originalName)
-  const finalMime = determineStoredMime(meta.mime, originalName)
-  const finalId = uuidv4()
-  const finalPath = path.join(UPLOAD_DIR, `${finalId}_${safeName}`)
-  const expectedSize = Number(meta.size) || 0
-  const { cipher, iv } = createFileCipher()
-  let authTagBase64 = ''
-  let plaintextSize = 0
-  let fd
-  try {
-    fd = fs.openSync(finalPath, 'w')
-    for (const chunkEntry of parsedChunks) {
-      const chunkPath = path.join(tmpDir, chunkEntry.name)
-      const data = fs.readFileSync(chunkPath)
-      plaintextSize += data.length
-      const encryptedPart = cipher.update(data)
-      if (encryptedPart.length) fs.writeSync(fd, encryptedPart)
-    }
-    const finalEncrypted = cipher.final()
-    if (finalEncrypted.length) fs.writeSync(fd, finalEncrypted)
-    authTagBase64 = cipher.getAuthTag().toString('base64')
-  } catch (err) {
-    warn('[UPLOAD] encryption failed', err.message)
-    try {
-      if (fd) fs.closeSync(fd)
-    } catch (_) {}
-    try {
-      fs.unlinkSync(finalPath)
-    } catch (_) {}
-    fs.rmSync(tmpDir, { recursive: true, force: true })
-    return res.status(500).json({ error: 'merge_failed' })
-  } finally {
-    try {
-      if (fd) fs.closeSync(fd)
-    } catch (_) {}
-    fs.rmSync(tmpDir, { recursive: true, force: true })
-  }
-
-  if (expectedSize && plaintextSize !== expectedSize) {
-    warn('[UPLOAD] size_mismatch', 'upload=' + uploadId, 'expected=' + expectedSize, 'actual=' + plaintextSize)
-    try {
-      fs.unlinkSync(finalPath)
-    } catch (_) {}
-    return res.status(400).json({ error: 'size_mismatch' })
-  }
-
-  db.prepare(
-    'INSERT INTO files (id,uploader_id,original_name,mime,size,path,created_at,iv,auth_tag,channel_id) VALUES (?,?,?,?,?,?,?,?,?,?)',
-  ).run(
-    finalId,
-    req.user.id,
-    originalName,
-    finalMime,
-    plaintextSize,
-    finalPath,
-    Date.now(),
-    iv.toString('base64'),
-    authTagBase64,
-    meta.channelId || '',
-  )
-  log(
-    '[UPLOAD] complete',
-    'user=' + req.user.id,
-    'upload=' + uploadId,
-    'file=' + finalId,
-    'name=' + originalName,
-    'size=' + plaintextSize,
-    'channel=' + (meta.channelId || 'none'),
-  )
-  res.json({ file: { id: finalId, name: originalName, mime: finalMime, size: plaintextSize } })
-})
-
-app.get('/api/files/:id/meta', auth, (req, res) => {
-  const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
-  if (!file) return res.status(404).json({ error: 'not_found' })
-  log('[FILES] meta', 'user=' + req.user.id, 'file=' + req.params.id)
-  res.json({ file: fileMeta(file) })
-})
-
-app.get('/api/files/:id', auth, (req, res) => {
-  const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
-  if (!file) return res.status(404).json({ error: 'not_found' })
-  if (!file.path || !fs.existsSync(file.path)) return res.status(404).json({ error: 'missing_file' })
-  if (!canAccessFile(file, req.user)) return res.status(403).json({ error: 'forbidden' })
-  log('[FILES] download', 'user=' + req.user.id, 'file=' + req.params.id, 'name=' + file.original_name)
-  const mimeType = resolveFileMime(file)
-  res.setHeader('Content-Type', mimeType)
-  res.setHeader('Content-Disposition', buildContentDisposition(file.original_name, { inline: false }))
-  if (typeof file.size === 'number' && Number.isFinite(file.size)) res.setHeader('Content-Length', file.size)
-  pipeFileToResponse(file, res)
-})
-
-app.get('/api/files/:id/view', auth, (req, res) => {
-  const file = db.prepare('SELECT * FROM files WHERE id=?').get(req.params.id)
-  if (!file) return res.status(404).json({ error: 'not_found' })
-  if (!file.path || !fs.existsSync(file.path)) return res.status(404).json({ error: 'missing_file' })
-  if (!canAccessFile(file, req.user)) return res.status(403).json({ error: 'forbidden' })
-  log('[FILES] inline', 'user=' + req.user.id, 'file=' + req.params.id, 'name=' + file.original_name)
-  const mimeType = resolveInlineMimeType(resolveFileMime(file))
-  res.setHeader('Content-Type', mimeType)
-  res.setHeader('Content-Disposition', buildContentDisposition(file.original_name, { inline: mimeType !== 'application/octet-stream' }))
-  if (typeof file.size === 'number' && Number.isFinite(file.size)) res.setHeader('Content-Length', file.size)
-  pipeFileToResponse(file, res)
 })
 
 app.delete('/api/messages/:id', auth, (req, res) => {
@@ -2071,131 +1642,7 @@ const insertMessage = (() => {
   }
 })()
 
-const voiceParticipants = new Map()
 const typingState = new Map()
-
-const buildLivekitSession = async (roomId, user) => {
-  if (!LIVEKIT_ENABLED) return null
-  if (!roomId || !user?.id) return null
-  try {
-    const identity = String(user.id)
-    const displayName = (user.username || identity || '').slice(0, 128)
-    const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
-      identity,
-      name: displayName,
-    })
-    token.addGrant({
-      roomJoin: true,
-      room: roomId,
-      canPublish: true,
-      canPublishSources: ['microphone'],
-      canSubscribe: true,
-      canPublishData: true,
-    })
-    const jwt = await token.toJwt()
-    return { url: LIVEKIT_URL, token: jwt }
-  } catch (err) {
-    warn('[VOICE] livekit token failed', err?.message || err)
-    return null
-  }
-}
-
-const getVoiceRoomState = (roomId) => {
-  const participants = voiceParticipants.get(roomId) || new Map()
-  return Array.from(participants.values()).map((entry) => ({
-    socketId: entry.socketId,
-    userId: entry.userId,
-    username: entry.username,
-  }))
-}
-
-const normalizeVoiceRoomMembers = (roomId) =>
-  listVoiceRoomMembersStmt.all(roomId).map((member) => ({
-    userId: member.user_id,
-    username: member.username || '',
-    role: member.role,
-    addedAt: member.added_at,
-  }))
-
-const normalizeVoiceRoomRow = (room) => {
-  if (!room) return null
-  const avatarPath = room.avatar_url ?? room.avatarUrl ?? ''
-  const avatarUpdatedAt = room.avatar_updated_at ?? room.avatarUpdatedAt ?? 0
-  return {
-    id: room.id,
-    name: room.name,
-    createdAt: room.created_at,
-    createdBy: room.created_by || '',
-    membershipRole: room.membership_role || room.membershipRole || '',
-    participantCount: room.participant_count ?? room.participantCount ?? 0,
-    avatarUrl: avatarPath ? `/api/voice-rooms/${room.id}/avatar` : '',
-    avatarUpdatedAt,
-    members: room.members,
-  }
-}
-
-const publicVoiceRoom = (room, viewer, extras = {}) => {
-  if (!room) return null
-  const normalized = room && typeof room.createdAt !== 'undefined' && typeof room.membershipRole !== 'undefined'
-    ? room
-    : normalizeVoiceRoomRow(room)
-  if (!normalized) return null
-  const baseRole = normalized.membershipRole || (viewer?.id && normalized.createdBy === viewer.id ? 'owner' : '')
-  const membershipRole = viewer?.role === 'admin' && !baseRole ? 'admin' : baseRole
-  const participantCount =
-    typeof extras.participantCount === 'number'
-      ? extras.participantCount
-      : normalized.participantCount || voiceParticipants.get(normalized.id)?.size || 0
-  const payload = {
-    id: normalized.id,
-    name: normalized.name,
-    createdAt: normalized.createdAt,
-    createdBy: normalized.createdBy,
-    participantCount,
-    membershipRole: membershipRole || '',
-    avatarUrl: normalized.avatarUrl,
-    avatarUpdatedAt: normalized.avatarUpdatedAt,
-  }
-  if (Array.isArray(normalized.members)) {
-    payload.members = normalized.members
-  } else if (membershipRole === 'owner' || membershipRole === 'admin') {
-    payload.members = normalizeVoiceRoomMembers(normalized.id)
-  }
-  return payload
-}
-
-const getVoiceRoomsForUser = (user) => {
-  if (!user) return []
-  if (user.role === 'admin') {
-    return listVoiceRoomsStmt.all().map((room) => ({ ...room, membership_role: 'admin' }))
-  }
-  return listVoiceRoomsForUserStmt.all(user.id, user.id, user.id)
-}
-
-const hasVoiceRoomAccess = (user, room) => {
-  if (!user || !room) return false
-  if (user.role === 'admin') return true
-  if (room.created_by === user.id) return true
-  const membership = selectVoiceRoomMemberStmt.get(room.id, user.id)
-  return Boolean(membership)
-}
-
-const canManageVoiceRoom = (user, room) => {
-  if (!user || !room) return false
-  if (user.role === 'admin') return true
-  if (room.created_by === user.id) return true
-  const membership = selectVoiceRoomMemberStmt.get(room.id, user.id)
-  return membership?.role === 'admin'
-}
-
-const emitVoiceRoomsUpdate = () => {
-  cachedVoiceRooms = listVoiceRoomsStmt.all()
-  for (const socket of io.sockets.sockets.values()) {
-    if (!socket.user) continue
-    const rooms = getVoiceRoomsForUser(socket.user)
-    socket.emit('voice:rooms:update', { rooms: rooms.map((room) => publicVoiceRoom(room, socket.user)) })
-  }
-}
 
 const generateInviteCode = (length = INVITE_CODE_LENGTH) => {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -2237,32 +1684,6 @@ const formatInvite = (invite) => ({
   status: getInviteStatus(invite),
 })
 
-const broadcastVoiceState = (roomId) => {
-  const state = getVoiceRoomState(roomId)
-  io.emit('voice:state', { roomId, participants: state })
-}
-
-const leaveVoiceRoom = (socket, { silent } = {}) => {
-  const roomId = socket.voiceRoomId
-  if (!roomId) return
-  const participants = voiceParticipants.get(roomId)
-  if (participants) {
-    participants.delete(socket.id)
-    if (!participants.size) voiceParticipants.delete(roomId)
-  }
-  socket.leave(`voice:${roomId}`)
-  socket.voiceRoomId = null
-  if (!silent) {
-    socket.to(`voice:${roomId}`).emit('voice:user-left', {
-      roomId,
-      socketId: socket.id,
-      userId: socket.user.id,
-      username: socket.user.username,
-    })
-    try { console.log('[voice] user left', { user: socket.user.id, socket: socket.id, roomId }) } catch (e) {}
-  }
-  broadcastVoiceState(roomId)
-}
 
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token
@@ -2297,65 +1718,8 @@ io.on('connection', (socket) => {
   const leaveMessageRooms = () => {
     for (const room of socket.rooms) {
       if (room === socket.id) continue
-      if (room.startsWith('voice:')) continue
       socket.leave(room)
     }
-  }
-
-  const joinVoiceRoom = async (roomId) => {
-    if (!roomId) return
-    if (!LIVEKIT_ENABLED) {
-      warn('[VOICE] join rejected, LiveKit disabled', 'user=' + socket.user.id, 'room=' + roomId)
-      socket.emit('voice:error', { error: 'voice_unconfigured' })
-      return
-    }
-    const room = selectVoiceRoomStmt.get(roomId)
-    if (!room) {
-      socket.emit('voice:error', { error: 'not_found' })
-      return
-    }
-    if (!hasVoiceRoomAccess(socket.user, room)) {
-      socket.emit('voice:error', { error: 'forbidden' })
-      return
-    }
-    const livekitSession = await buildLivekitSession(roomId, socket.user)
-    if (!livekitSession) {
-      socket.emit('voice:error', { error: 'livekit_failed' })
-      return
-    }
-    if (socket.voiceRoomId === roomId) {
-      const participants = getVoiceRoomState(roomId)
-      socket.emit('voice:participants', { roomId, participants })
-      const selfParticipant =
-        voiceParticipants.get(roomId)?.get(socket.id) || {
-          socketId: socket.id,
-          userId: socket.user.id,
-          username: socket.user.username,
-        }
-      socket.emit('voice:joined', { roomId, participant: selfParticipant, livekit: livekitSession })
-      return
-    }
-    if (socket.voiceRoomId) leaveVoiceRoom(socket)
-    let participants = voiceParticipants.get(roomId)
-    if (!participants) {
-      participants = new Map()
-      voiceParticipants.set(roomId, participants)
-    }
-    const initialState = getVoiceRoomState(roomId)
-    socket.join(`voice:${roomId}`)
-    socket.voiceRoomId = roomId
-    const participant = {
-      socketId: socket.id,
-      userId: socket.user.id,
-      username: socket.user.username,
-    }
-    participants.set(socket.id, participant)
-    socket.emit('voice:participants', { roomId, participants: initialState })
-    socket.emit('voice:joined', { roomId, participant, livekit: livekitSession })
-    socket.to(`voice:${roomId}`).emit('voice:user-joined', { roomId, participant })
-    // diagnostic
-    try { console.log('[voice] user joined', { user: socket.user.id, socket: socket.id, roomId }) } catch (e) {}
-    broadcastVoiceState(roomId)
   }
 
   let currentChannelId = null
@@ -2375,12 +1739,14 @@ io.on('connection', (socket) => {
 
   const sendTypingUpdate = (channelId, typing) => {
     const latestUser = loadUser() || userRecord
-    const payload = {
-      channelId,
-      userId,
-      username: latestUser?.username || socket.user.username || 'user',
-      typing: Boolean(typing),
-    }
+  const payload = {
+    channelId,
+    userId,
+    username: latestUser?.username || socket.user.username || 'user',
+    displayName: latestUser?.display_name || latestUser?.displayName || '',
+    nameStyle: normalizeNameStyle(latestUser?.name_style ?? latestUser?.nameStyle ?? ''),
+    typing: Boolean(typing),
+  }
     socket.to(channelId).emit('typing:update', payload)
     if (channelId.startsWith('dm:')) {
       const participants = parseDirectChannelId(channelId)
@@ -2427,7 +1793,7 @@ io.on('connection', (socket) => {
     log('[SOCKET] channel:switch', 'user=' + userId, 'channel=' + channelId)
     clearTypingForChannel(currentChannelId)
     if (channelId.startsWith('dm:')) {
-      if (!isMemberOfDirectChannel(channelId, userId)) return
+      if (!canAccessDirectChannel(channelId, userId)) return
       const normalized = normalizeDirectChannelId(channelId)
       if (!normalized) return
       ensureChannelJoined(normalized)
@@ -2448,7 +1814,7 @@ io.on('connection', (socket) => {
     let targetChannel = channelId
     let directParticipants = null
     if (channelId.startsWith('dm:')) {
-      if (!isMemberOfDirectChannel(channelId, userId)) return
+      if (!canAccessDirectChannel(channelId, userId)) return
       const normalized = normalizeDirectChannelId(channelId)
       if (!normalized) return
       targetChannel = normalized
@@ -2497,7 +1863,7 @@ io.on('connection', (socket) => {
     log('[SOCKET] messages:load', 'user=' + userId, 'channel=' + channelId, 'limit=' + limit, 'offset=' + offset)
     let targetChannel = channelId
     if (channelId.startsWith('dm:')) {
-      if (!isMemberOfDirectChannel(channelId, userId)) return
+      if (!canAccessDirectChannel(channelId, userId)) return
       const normalized = normalizeDirectChannelId(channelId)
       if (!normalized) return
       targetChannel = normalized
@@ -2515,7 +1881,7 @@ io.on('connection', (socket) => {
     if (!channelId) return
     let targetChannel = channelId
     if (channelId.startsWith('dm:')) {
-      if (!isMemberOfDirectChannel(channelId, userId)) return
+      if (!canAccessDirectChannel(channelId, userId)) return
       const normalized = normalizeDirectChannelId(channelId)
       if (!normalized) return
       targetChannel = normalized
@@ -2536,7 +1902,6 @@ io.on('connection', (socket) => {
   })
 
   socket.on('disconnect', () => {
-    leaveVoiceRoom(socket)
     onlineUsers.delete(userId)
     const keysToClear = []
     typingState.forEach((_, key) => {
@@ -2550,15 +1915,6 @@ io.on('connection', (socket) => {
     io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
     log('[SOCKET] disconnected', 'user=' + userId, 'socket=' + socket.id)
   })
-
-  socket.on('voice:join', ({ roomId }) =>
-    joinVoiceRoom(roomId).catch((err) => {
-      warn('[VOICE] join failed', err?.message || err)
-      socket.emit('voice:error', { error: 'internal_error' })
-    }),
-  )
-  socket.on('voice:leave', () => leaveVoiceRoom(socket))
-  socket.on('voice:signal', () => {})
 
   emitChannelListForUser(userId)
 })

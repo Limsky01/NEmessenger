@@ -1,14 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import useStore, { buildDirectChannelId } from '../state/store.js'
+import useStore, { buildDirectChannelId, buildNameStyle } from '../state/store.js'
 import AvatarImage from './AvatarImage.jsx'
 
 function StatusDot({ online }) {
-  return <span className={`w-2 h-2 rounded-full ${online ? 'bg-emerald-400' : 'bg-white/30'}`} />
+  return <span className={`w-2 h-2 rounded-full ${online ? 'bg-sky-400' : 'bg-white/30'}`} />
 }
 
 const DEFAULT_SIDEBAR_WIDTH = 320
-const MIN_SIDEBAR_WIDTH = 260
-const MAX_SIDEBAR_WIDTH = 480
+const MIN_SIDEBAR_WIDTH = 240
+const MAX_SIDEBAR_WIDTH = 820
 const SIDEBAR_WIDTH_STORAGE_KEY = 'nemessenger.sidebarWidth'
 
 function clampSidebarWidth(value) {
@@ -21,69 +21,82 @@ export default function Sidebar() {
   const activeChannelId = useStore((s) => s.activeChannelId)
   const switchChannel = useStore((s) => s.switchChannel)
   const unread = useStore((s) => s.unread)
-  const users = useStore((s) => s.users)
-  const me = useStore((s) => s.user)
-  const onlineUserIds = useStore((s) => s.onlineUserIds)
-  const openProfile = useStore((s) => s.openProfile)
-  const openSettings = useStore((s) => s.openSettings)
-  const openAdmin = useStore((s) => s.openAdmin)
-  const view = useStore((s) => s.view)
+  const friends = useStore((s) => s.friends)
+  const friendRequests = useStore((s) => s.friendRequests)
   const openDirectChat = useStore((s) => s.openDirectChat)
-  const directPeers = useStore((s) => s.directPeers)
+  const me = useStore((s) => s.user)
+  const messagesMap = useStore((s) => s.messages)
+  const userStatus = useStore((s) => s.userStatus)
+  const setUserStatus = useStore((s) => s.setUserStatus)
+  const profileStatus = useStore((s) => s.profileStatus)
+  const nameStyleValue = useStore((s) => s.nameStyle)
+  const onlineUserIds = useStore((s) => s.onlineUserIds)
+  const openSettings = useStore((s) => s.openSettings)
+  const view = useStore((s) => s.view)
   const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
   const buildChannelAvatarUrl = useStore((s) => s.buildChannelAvatarUrl)
-  const voiceRooms = useStore((s) => s.voiceRooms)
-  const activeVoiceRoomId = useStore((s) => s.activeVoiceRoomId)
-  const voiceParticipants = useStore((s) => s.voiceParticipants)
-  const joinVoiceRoom = useStore((s) => s.joinVoiceRoom)
-  const leaveVoiceRoom = useStore((s) => s.leaveVoiceRoom)
-  const createVoiceRoom = useStore((s) => s.createVoiceRoom)
-  const deleteVoiceRoom = useStore((s) => s.deleteVoiceRoom)
-  const uploadChannelAvatar = useStore((s) => s.uploadChannelAvatar)
-  const uploadVoiceRoomAvatar = useStore((s) => s.uploadVoiceRoomAvatar)
-  const deleteVoiceRoomAvatar = useStore((s) => s.deleteVoiceRoomAvatar)
-  const buildVoiceRoomAvatarUrl = useStore((s) => s.buildVoiceRoomAvatarUrl)
-  const voiceStatus = useStore((s) => s.voiceStatus)
+  const profileBackground = useStore((s) => s.profileBackground)
+  const sendFriendRequest = useStore((s) => s.sendFriendRequest)
+  const respondFriendRequest = useStore((s) => s.respondFriendRequest)
   const createPrivateChannel = useStore((s) => s.createPrivateChannel)
-  const voicePeerStates = useStore((s) => s.voicePeerStates)
-  const voiceSpeaking = useStore((s) => s.voiceSpeaking)
-  const voiceSelfSocketId = useStore((s) => s.voiceSelfSocketId)
-  const updateVoiceRoomMembers = useStore((s) => s.updateVoiceRoomMembers)
-
-  const navButtonClass = (active) =>
-    `w-9 h-9 flex items-center justify-center rounded-xl transition button-press ${
-      active ? 'bg-white/25 text-white' : 'bg-white/10 text-white/70 hover:bg-white/20 hover:text-white'
-    }`
+  const uploadChannelAvatar = useStore((s) => s.uploadChannelAvatar)
 
   const [searchTerm, setSearchTerm] = useState('')
-
-  const onlineSet = useMemo(() => new Set(onlineUserIds), [onlineUserIds])
-  const otherUsers = useMemo(() => users.filter((u) => u.id !== me?.id), [users, me])
-  const publicChannels = useMemo(() => channels.filter((channel) => !channel.isPrivate), [channels])
-  const privateChannels = useMemo(() => channels.filter((channel) => channel.isPrivate), [channels])
-  const voiceParticipantsCount = (roomId) => (voiceParticipants[roomId] || []).length
-  const normalizedSearch = useMemo(() => searchTerm.trim().toLowerCase(), [searchTerm])
-  const filteredPublicChannels = useMemo(() => {
-    if (!normalizedSearch) return publicChannels
-    return publicChannels.filter((channel) => channel.name.toLowerCase().includes(normalizedSearch))
-  }, [publicChannels, normalizedSearch])
-  const filteredPrivateChannels = useMemo(() => {
-    if (!normalizedSearch) return privateChannels
-    return privateChannels.filter((channel) => channel.name.toLowerCase().includes(normalizedSearch))
-  }, [privateChannels, normalizedSearch])
-  const filteredUsers = useMemo(() => {
-    if (!normalizedSearch) return otherUsers
-    return otherUsers.filter((user) => user.username.toLowerCase().includes(normalizedSearch))
-  }, [otherUsers, normalizedSearch])
-  const filteredVoiceRooms = useMemo(() => {
-    if (!normalizedSearch) return voiceRooms
-    return voiceRooms.filter((room) => room.name.toLowerCase().includes(normalizedSearch))
-  }, [voiceRooms, normalizedSearch])
-
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH)
   const [isResizing, setIsResizing] = useState(false)
   const [sidebarWidthLoaded, setSidebarWidthLoaded] = useState(false)
   const resizeStateRef = useRef({ startX: 0, width: DEFAULT_SIDEBAR_WIDTH })
+
+  const [addFriendName, setAddFriendName] = useState('')
+  const [friendError, setFriendError] = useState('')
+  const [friendBusy, setFriendBusy] = useState(false)
+  const [addFriendOpen, setAddFriendOpen] = useState(false)
+  const [selfProfileOpen, setSelfProfileOpen] = useState(false)
+  const [statusMenuOpen, setStatusMenuOpen] = useState(false)
+
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [channelName, setChannelName] = useState('')
+  const [selectedIds, setSelectedIds] = useState([])
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState(null)
+  const [channelAvatarFile, setChannelAvatarFile] = useState(null)
+  const [channelAvatarPreview, setChannelAvatarPreview] = useState('')
+
+  const profileBannerStyle = profileBackground
+    ? { backgroundImage: `url(${profileBackground})` }
+    : undefined
+  const meNameStyle = buildNameStyle(nameStyleValue)
+  const getUserNameStyle = (user) => buildNameStyle(user?.nameStyle)
+
+  const onlineSet = useMemo(() => new Set(onlineUserIds), [onlineUserIds])
+  const normalizedSearch = useMemo(() => searchTerm.trim().toLowerCase(), [searchTerm])
+  const filteredFriends = useMemo(() => {
+    if (!normalizedSearch) return friends
+    return friends.filter((user) => {
+      const haystack = `${user.displayName || ''} ${user.username || ''}`.toLowerCase()
+      return haystack.includes(normalizedSearch)
+    })
+  }, [friends, normalizedSearch])
+  const filteredGroups = useMemo(() => {
+    if (!normalizedSearch) return channels
+    return channels.filter((channel) => channel.name.toLowerCase().includes(normalizedSearch))
+  }, [channels, normalizedSearch])
+  const combinedChats = useMemo(() => {
+    const directItems = filteredFriends.map((user) => ({
+      type: 'dm',
+      id: user.id,
+      label: `@${user.username}`,
+      user,
+    }))
+    const groupItems = filteredGroups.map((channel) => ({
+      type: 'group',
+      id: channel.id,
+      label: `#${channel.name}`,
+      channel,
+    }))
+    return [...directItems, ...groupItems]
+  }, [filteredFriends, filteredGroups])
+  const activeGroup = channels.find((channel) => channel.id === activeChannelId)
 
   const sidebarStyle = useMemo(
     () => ({
@@ -92,21 +105,8 @@ export default function Sidebar() {
       maxWidth: MAX_SIDEBAR_WIDTH,
       flexBasis: sidebarWidth,
     }),
-    [sidebarWidth]
+    [sidebarWidth],
   )
-
-  const handleResizePointerDown = (event) => {
-    if (event.button !== 0 && event.pointerType !== 'touch') return
-    event.preventDefault()
-    event.stopPropagation()
-    if (!Number.isFinite(event.clientX)) return
-    resizeStateRef.current = { startX: event.clientX, width: sidebarWidth }
-    setIsResizing(true)
-  }
-
-  const handleResizeDoubleClick = () => {
-    setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)
-  }
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -145,7 +145,7 @@ export default function Sidebar() {
         return
       }
       const nextWidth = clampSidebarWidth(
-        resizeStateRef.current.width + (event.clientX - resizeStateRef.current.startX)
+        resizeStateRef.current.width + (event.clientX - resizeStateRef.current.startX),
       )
       setSidebarWidth((current) => (current === nextWidth ? current : nextWidth))
     }
@@ -178,46 +178,25 @@ export default function Sidebar() {
     }
   }, [isResizing])
 
-  const [createDialogOpen, setCreateDialogOpen] = useState(false)
-  const [channelName, setChannelName] = useState('')
-  const [selectedIds, setSelectedIds] = useState([])
-  const [creating, setCreating] = useState(false)
-  const [createError, setCreateError] = useState(null)
-  const [voiceDialogOpen, setVoiceDialogOpen] = useState(false)
-  const [voiceName, setVoiceName] = useState('')
-  const [voiceSelectedIds, setVoiceSelectedIds] = useState([])
-  const [voiceModeratorIds, setVoiceModeratorIds] = useState([])
-  const [voiceSaving, setVoiceSaving] = useState(false)
-  const [voiceError, setVoiceError] = useState(null)
-  const [editingRoom, setEditingRoom] = useState(null)
-  const [showPublic, setShowPublic] = useState(true)
-  const [showPrivate, setShowPrivate] = useState(true)
-  const [showUsers, setShowUsers] = useState(true)
-  const [showVoice, setShowVoice] = useState(true)
-  const [channelAvatarFile, setChannelAvatarFile] = useState(null)
-  const [channelAvatarPreview, setChannelAvatarPreview] = useState('')
-  const [channelAvatarError, setChannelAvatarError] = useState(null)
-  const [voiceAvatarFile, setVoiceAvatarFile] = useState(null)
-  const [voiceAvatarPreview, setVoiceAvatarPreview] = useState('')
-  const [voiceAvatarError, setVoiceAvatarError] = useState(null)
-  const [voiceAvatarRemove, setVoiceAvatarRemove] = useState(false)
-
-  const editingCount =
-    editingRoom?.participantCount ??
-    (editingRoom ? voiceParticipantsCount(editingRoom.id) : undefined)
-  const editingActive = editingRoom ? activeVoiceRoomId === editingRoom.id : false
-
   useEffect(() => () => {
     if (channelAvatarPreview && channelAvatarPreview.startsWith('blob:')) {
       URL.revokeObjectURL(channelAvatarPreview)
     }
   }, [channelAvatarPreview])
 
-  useEffect(() => () => {
-    if (voiceAvatarPreview && voiceAvatarPreview.startsWith('blob:')) {
-      URL.revokeObjectURL(voiceAvatarPreview)
+  const handleResizePointerDown = (event) => {
+    if (event.button !== 0 && event.pointerType !== 'touch') return
+    resizeStateRef.current.startX = event.clientX
+    resizeStateRef.current.width = sidebarWidth
+    setIsResizing(true)
+    if (event.currentTarget?.setPointerCapture) {
+      event.currentTarget.setPointerCapture(event.pointerId)
     }
-  }, [voiceAvatarPreview])
+  }
+
+  const handleResizeDoubleClick = () => {
+    setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)
+  }
 
   const toggleSelection = (userId) => {
     setSelectedIds((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
@@ -225,7 +204,6 @@ export default function Sidebar() {
 
   const handleChannelAvatarChange = (event) => {
     const file = event.target.files?.[0]
-    setChannelAvatarError(null)
     if (file) {
       setChannelAvatarFile(file)
       setChannelAvatarPreview(URL.createObjectURL(file))
@@ -238,7 +216,6 @@ export default function Sidebar() {
   const clearChannelAvatarSelection = () => {
     setChannelAvatarFile(null)
     setChannelAvatarPreview('')
-    setChannelAvatarError(null)
   }
 
   const closeCreateDialog = () => {
@@ -250,10 +227,10 @@ export default function Sidebar() {
     clearChannelAvatarSelection()
   }
 
-  const handleCreatePrivateChannel = async () => {
+  const handleCreateGroup = async () => {
     if (creating) return
     if (!channelName.trim()) {
-      setCreateError('Введите название канала')
+      setCreateError('Введите название группы')
       return
     }
     setCreating(true)
@@ -265,7 +242,7 @@ export default function Sidebar() {
           await uploadChannelAvatar(channel.id, channelAvatarFile)
         } catch (err) {
           console.error('channel avatar upload failed', err)
-          setCreateError('Не удалось загрузить аватар канала')
+          setCreateError('Не удалось загрузить аватар')
           setCreating(false)
           return
         }
@@ -273,520 +250,356 @@ export default function Sidebar() {
       if (channel?.id) switchChannel(channel.id)
       closeCreateDialog()
     } catch (err) {
-      console.error('create private channel failed', err)
-      setCreateError('Не удалось создать канал')
+      console.error('create group failed', err)
+      setCreateError('Не удалось создать группу')
     } finally {
       setCreating(false)
     }
   }
 
-  const resetVoiceDialog = () => {
-    setVoiceDialogOpen(false)
-    setVoiceName('')
-    setVoiceSelectedIds([])
-    setVoiceModeratorIds([])
-    setVoiceError(null)
-    setEditingRoom(null)
-    clearVoiceAvatarSelection()
-    setVoiceAvatarRemove(false)
-  }
-
-  const closeVoiceDialog = () => {
-    if (voiceSaving) return
-    resetVoiceDialog()
-  }
-
-  const toggleVoiceSelection = (userId) => {
-    setVoiceSelectedIds((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
-    setVoiceModeratorIds((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : current))
-  }
-
-  const handleVoiceAvatarChange = (event) => {
-    const file = event.target.files?.[0]
-    setVoiceAvatarError(null)
-    if (file) {
-      setVoiceAvatarFile(file)
-      setVoiceAvatarPreview(URL.createObjectURL(file))
-      setVoiceAvatarRemove(false)
-    } else {
-      setVoiceAvatarFile(null)
-      setVoiceAvatarPreview('')
-    }
-  }
-
-  const clearVoiceAvatarSelection = () => {
-    setVoiceAvatarFile(null)
-    setVoiceAvatarPreview('')
-    setVoiceAvatarError(null)
-    setVoiceAvatarRemove(false)
-  }
-
-  const markVoiceAvatarRemoval = () => {
-    setVoiceAvatarFile(null)
-    setVoiceAvatarPreview('')
-    setVoiceAvatarRemove(true)
-    setVoiceAvatarError(null)
-  }
-
-  const toggleVoiceModerator = (userId) => {
-    setVoiceModeratorIds((current) => (current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId]))
-  }
-
-  const handleSubmitVoiceRoom = async () => {
-    if (voiceSaving) return
-    if (!editingRoom && !voiceName.trim()) {
-      setVoiceError('Укажите название комнаты')
-      return
-    }
-    setVoiceSaving(true)
-    setVoiceError(null)
-    setVoiceAvatarError(null)
+  const handleAddFriend = async () => {
+    if (!addFriendName.trim()) return
+    setFriendBusy(true)
+    setFriendError('')
     try {
-      let targetRoom = editingRoom || null
-      if (editingRoom) {
-        const baseMembers = (editingRoom.members || []).filter((m) => m.userId !== editingRoom.createdBy)
-        const selectedSet = new Set(voiceSelectedIds)
-        const remove = baseMembers.filter((member) => !selectedSet.has(member.userId)).map((member) => member.userId)
-        const upserts = Array.from(selectedSet).map((userId) => {
-          const role = voiceModeratorIds.includes(userId) ? 'admin' : 'member'
-          const existing = baseMembers.find((m) => m.userId === userId)
-          if (existing && existing.role === role) return null
-          return { userId, role }
-        })
-        const filtered = upserts.filter(Boolean)
-        const updated = await updateVoiceRoomMembers(editingRoom.id, { upserts: filtered, remove })
-        if (updated) {
-          targetRoom = updated
-        }
-      } else {
-        const created = await createVoiceRoom(voiceName, { members: voiceSelectedIds, admins: voiceModeratorIds })
-        if (created) {
-          targetRoom = created
-          setEditingRoom(created)
-          const members = created.members || []
-          setVoiceSelectedIds(members.map((m) => m.userId).filter((id) => id !== created.createdBy))
-          setVoiceModeratorIds(members.filter((m) => m.role === 'admin').map((m) => m.userId))
-        }
-      }
-      if (targetRoom?.id) {
-        if (voiceAvatarRemove) {
-          try {
-            await deleteVoiceRoomAvatar(targetRoom.id)
-          } catch (err) {
-            console.error('voice room avatar delete failed', err)
-            setVoiceAvatarError('Не удалось удалить аватар')
-            return
-          }
-        }
-        if (voiceAvatarFile) {
-          try {
-            await uploadVoiceRoomAvatar(targetRoom.id, voiceAvatarFile)
-          } catch (err) {
-            console.error('voice room avatar upload failed', err)
-            setVoiceAvatarError('Не удалось загрузить аватар')
-            return
-          }
-        }
-      }
-      resetVoiceDialog()
+      await sendFriendRequest(addFriendName.trim())
+      setAddFriendName('')
+      setAddFriendOpen(false)
     } catch (err) {
-      console.error('voice room submit failed', err)
-      setVoiceError(editingRoom ? 'Не удалось обновить участников' : 'Не удалось создать комнату')
+      console.error('friend request failed', err)
+      setFriendError('Не удалось отправить запрос')
     } finally {
-      setVoiceSaving(false)
+      setFriendBusy(false)
     }
+  }
 
+  const incomingRequests = friendRequests?.incoming || []
+  const outgoingRequests = friendRequests?.outgoing || []
+  const statusOptions = [
+    { id: 'online', label: 'В сети', color: 'bg-emerald-400' },
+    { id: 'idle', label: 'Неактивен', color: 'bg-yellow-400' },
+    { id: 'dnd', label: 'Не беспокоить', color: 'bg-red-500' },
+    { id: 'invisible', label: 'Невидимый', color: 'bg-white/40' },
+  ]
+  const currentStatus = statusOptions.find((option) => option.id === userStatus) || statusOptions[0]
+
+  const getLastMessagePreview = (channelId) => {
+    const list = messagesMap[channelId]
+    if (!Array.isArray(list) || list.length === 0) return ''
+    const last = list[list.length - 1]
+    const raw = last?.content
+    if (typeof raw !== 'string') return 'Вложение'
+    const trimmed = raw.replace(/\s+/g, ' ').trim()
+    if (!trimmed) return 'Без текста'
+    return trimmed.length > 60 ? `${trimmed.slice(0, 57)}...` : trimmed
   }
 
   return (
-    <div className="relative group flex-shrink-0 border-r border-white/10 h-full flex flex-col bg-white/5 backdrop-blur-md" style={sidebarStyle}>
-      <div className="p-4 panel sticky top-0 space-y-3 z-10">
-        <div className="flex items-center justify-between gap-2">
-          <div>
-            <div className="text-sm font-medium">@{me?.username || 'user'}</div>
-            <div className="text-[11px] text-white/40">ID: {me?.id}</div>
+    <div className="relative group flex-shrink-0 border-r border-white/10 h-full flex flex-col bg-[#0f1720]" style={sidebarStyle}>
+      <div className="p-4 sticky top-0 space-y-3 z-10 bg-[#0f1720]">
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-medium">Чаты</div>
+          <button type="button" onClick={() => setAddFriendOpen(true)} className="tg-button text-xs">
+            Добавить друга
+          </button>
+        </div>
+        <input
+          type="search"
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          placeholder="Поиск чатов..."
+          className="tg-input text-xs placeholder:text-white/40"
+        />
+      </div>
+
+      <div className="px-3 pt-3 pb-6 overflow-y-auto scroll-thin space-y-5 flex-1">
+        {(incomingRequests.length > 0 || outgoingRequests.length > 0) && (
+          <div className="space-y-2">
+            <div className="px-2 text-xs uppercase tracking-[0.2em] text-white/40">Запросы</div>
+            {incomingRequests.map((req) => (
+              <div key={req.id} className="panel rounded-2xl px-3 py-2 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <AvatarImage user={req.fromUser} size={28} src={buildAvatarUrl?.(req.fromUser)} />
+                  <div className="text-xs text-white/80" style={getUserNameStyle(req.fromUser)}>
+                    {req.fromUser.displayName || req.fromUser.username}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => respondFriendRequest(req.id, true)}
+                    className="text-xs text-sky-300 hover:text-sky-200"
+                  >
+                    Принять
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => respondFriendRequest(req.id, false)}
+                    className="text-xs text-red-300 hover:text-red-200"
+                  >
+                    Отклонить
+                  </button>
+                </div>
+              </div>
+            ))}
+            {outgoingRequests.map((req) => (
+              <div key={req.id} className="panel rounded-2xl px-3 py-2 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <AvatarImage user={req.toUser} size={28} src={buildAvatarUrl?.(req.toUser)} />
+                  <div className="text-xs text-white/70" style={getUserNameStyle(req.toUser)}>
+                    {req.toUser.displayName || req.toUser.username}
+                  </div>
+                </div>
+                <div className="text-[11px] text-white/40">Отправлено</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="space-y-2">
+          <div className="px-2 text-[11px] uppercase tracking-[0.2em] text-white/40 flex items-center justify-between">
+            <span>Чаты</span>
+            <button
+              type="button"
+              onClick={() => setCreateDialogOpen(true)}
+              className="rounded-full w-6 h-6 flex items-center justify-center bg-white/10 hover:bg-white/20 transition"
+              title="Создать группу"
+            >
+              +
+            </button>
+          </div>
+          {combinedChats.length > 0 ? (
+            combinedChats.map((item) => {
+              if (item.type === 'dm') {
+                const user = item.user
+                const isOnline = onlineSet.has(user.id)
+                const directId = buildDirectChannelId(me?.id || '', user.id)
+                const active = directId && directId === activeChannelId
+                const unreadCount = directId ? unread[directId] || 0 : 0
+                const lastMessage = directId ? getLastMessagePreview(directId) : ''
+                return (
+                  <button
+                    key={`dm-${user.id}`}
+                    type="button"
+                    onClick={() => openDirectChat(user.id)}
+                    className={`w-full flex items-center justify-between px-3 py-2 rounded-2xl overflow-hidden transition-colors ${active ? 'panel' : 'panel hover:bg-white/10'}`}
+                  >
+                    <div className="flex items-center gap-3 min-w-0 flex-1">
+                      <div className="relative flex-shrink-0">
+                        <AvatarImage user={user} size={32} src={buildAvatarUrl?.(user)} />
+                        {isOnline ? <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-400 border-2 border-[#101822]" /> : null}
+                      </div>
+                      <div className="min-w-0 text-left">
+                        <div className="text-sm font-medium" style={getUserNameStyle(user)}>
+                          {user.displayName || user.username}
+                        </div>
+                        <div className="text-xs text-white/60 truncate">{lastMessage || 'Нет сообщений'}</div>
+                      </div>
+                    </div>
+                    {unreadCount > 0 && (
+                      <div className="flex items-center gap-2">
+                        <span className="badge">{unreadCount}</span>
+                      </div>
+                    )}
+                  </button>
+                )
+              }
+              const channel = item.channel
+              const active = channel.id === activeChannelId
+              const unreadCount = unread[channel.id] || 0
+              const lastMessage = getLastMessagePreview(channel.id)
+              return (
+                  <button
+                    key={`group-${channel.id}`}
+                    type="button"
+                    onClick={() => switchChannel(channel.id)}
+                    className={`w-full flex items-center justify-between px-3 py-2 rounded-2xl overflow-hidden transition-colors ${active ? 'panel' : 'panel hover:bg-white/10'}`}
+                  >
+                  <div className="flex items-center gap-3 min-w-0 flex-1">
+                    <span className="text-base">#</span>
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">{channel.name}</div>
+                      <div className="text-xs text-white/60 truncate">{lastMessage || 'Нет сообщений'}</div>
+                    </div>
+                  </div>
+                  {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
+                </button>
+              )
+            })
+          ) : (
+            <div className="text-sm text-white/40 px-2">Чатов пока нет</div>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-auto border-t border-white/10 px-3 py-3 bg-[#101822]">
+        <div className="flex items-center justify-between gap-3 rounded-2xl px-3 py-2 panel">
+          <div className="flex items-center gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={() => setSelfProfileOpen((current) => !current)}
+              className="flex items-center justify-center"
+              title="Профиль"
+            >
+              <div className="relative">
+                <AvatarImage user={me} size={36} src={buildAvatarUrl?.(me)} className="flex-shrink-0" />
+                <span className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-[#101822] ${currentStatus.color}`} />
+              </div>
+            </button>
+            <div className="min-w-0">
+              <div className="text-sm font-medium truncate" style={meNameStyle}>
+                {me?.displayName || me?.username || 'user'}
+              </div>
+              <div className="text-[11px] text-white/50 truncate">
+                {profileStatus || currentStatus.label}
+              </div>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={openSettings}
-              className={navButtonClass(view === 'settings')}
-              aria-label="Настройки"
-              title="Настройки"
+              className={`w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 transition ${view === 'settings' ? 'text-white' : 'text-white/70'}`}
+              title="Профиль и настройки"
             >
-              <span aria-hidden>&#9881;</span>
-              <span className="sr-only">Настройки</span>
-            </button>
-            {me?.role === 'admin' && (
-              <button
-                type="button"
-                onClick={openAdmin}
-                className={navButtonClass(view === 'admin')}
-                aria-label="Админ"
-                title="Админ"
-              >
-                <span aria-hidden>&#128296;</span>
-                <span className="sr-only">Админ</span>
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={openProfile}
-              className={navButtonClass(view === 'profile')}
-              aria-label="Профиль"
-              title="Профиль"
-            >
-              <span aria-hidden>&#128100;</span>
-              <span className="sr-only">Профиль</span>
+              ⚙
             </button>
           </div>
-        </div>
-        <div className="flex items-center justify-between text-xs text-white/60">
-          <span>Каналы</span>
-          <span>({channels.length})</span>
-        </div>
-        <div>
-          <input
-            type="search"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="Поиск каналов, пользователей..."
-            className="w-full bg-white/10 rounded-2xl px-4 py-2 text-xs text-white placeholder:text-white/40 focus:outline-none focus:ring-2 focus:ring-white/30"
-          />
         </div>
       </div>
 
-      <div className="px-3 pt-3 pb-6 overflow-y-auto scroll-thin space-y-6 flex-1">
-        <div className="space-y-2">
-          <div className="px-2 text-xs uppercase tracking-[0.2em] text-white/40 flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => setShowPublic((value) => !value)}
-              className="flex items-center gap-2 text-white/60 hover:text-white/90 transition"
-            >
-              <span className="text-base leading-none">{showPublic ? '−' : '+'}</span>
-              <span>Общие каналы</span>
-            </button>
-            <span className="text-white/30 text-[11px]">{filteredPublicChannels.length}</span>
-          </div>
-          {showPublic ? (
-            filteredPublicChannels.length > 0 ? (
-              filteredPublicChannels.map((channel) => {
-                const active = channel.id === activeChannelId
-                const unreadCount = unread[channel.id] || 0
-                const avatarSrc = buildChannelAvatarUrl?.(channel)
-                return (
-                  <button
-                    key={channel.id}
-                    type="button"
-                    onClick={() => switchChannel(channel.id)}
-                    className={`w-full flex items-center justify-between px-3 py-3 rounded-2xl transition-colors ${active ? 'panel' : 'glass hover:bg-white/10'}`}
-                  >
-                    <div className="flex items-center gap-3">
-                      <AvatarImage
-                        user={{ username: channel.name }}
-                        src={avatarSrc}
-                        fallback={channel.name}
-                      />
-                      <div>
-                        <div className="text-sm font-medium">#{channel.name}</div>
-                        <div className="text-xs text-white/60">Общий канал</div>
-                      </div>
-                    </div>
-                    {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
-                  </button>
-                )
-              })
-            ) : (
-              <div className="text-sm text-white/40 px-2">Общих каналов пока нет</div>
-            )
-          ) : (
-            <div className="text-xs text-white/30 px-2">Секция скрыта</div>
-          )}
-        </div>
-
-        <div className="space-y-2">
-          <div className="px-2 text-xs uppercase tracking-[0.2em] text-white/40 flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => setShowPrivate((value) => !value)}
-              className="flex items-center gap-2 text-white/60 hover:text-white/90 transition"
-            >
-              <span className="text-base leading-none">{showPrivate ? '−' : '+'}</span>
-              <span>Приватные комнаты</span>
-            </button>
-            <div className="flex items-center gap-3">
-              <span className="text-white/30 text-[11px]">{filteredPrivateChannels.length}</span>
+      {addFriendOpen && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6" onClick={() => setAddFriendOpen(false)}>
+          <div className="panel w-full max-w-md rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
+              <div>
+                <div className="text-lg font-semibold text-white/90">Добавить друга</div>
+                <div className="text-xs text-white/60">Введите никнейм пользователя</div>
+              </div>
+              <button type="button" onClick={() => setAddFriendOpen(false)} className="text-white/40 hover:text-white/80 transition">
+                x
+              </button>
+            </div>
+            <div className="px-5 py-4 space-y-3">
+              <input
+                value={addFriendName}
+                onChange={(e) => setAddFriendName(e.target.value)}
+                placeholder="Никнейм"
+                className="tg-input text-sm placeholder:text-white/40"
+                disabled={friendBusy}
+              />
+              {friendError && <div className="text-xs text-red-300">{friendError}</div>}
+            </div>
+            <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
               <button
                 type="button"
-                onClick={() => {
-                  setCreateError(null)
-                  clearChannelAvatarSelection()
-                  setCreateDialogOpen(true)
-                }}
-                className="text-white/40 hover:text-white/80 transition text-lg leading-none"
-                title="Создать приватный канал"
+                onClick={() => setAddFriendOpen(false)}
+                className="tg-button text-sm"
+                disabled={friendBusy}
               >
-                +
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={handleAddFriend}
+                className="tg-button tg-button--primary text-sm disabled:opacity-50"
+                disabled={friendBusy}
+              >
+                Добавить
               </button>
             </div>
           </div>
-          {showPrivate ? (
-            filteredPrivateChannels.length > 0 ? (
-              filteredPrivateChannels.map((channel) => {
-                const active = channel.id === activeChannelId
-                const unreadCount = unread[channel.id] || 0
-                const role =
-                  channel.membershipRole === 'owner'
-                    ? 'Создатель'
-                    : channel.membershipRole === 'admin'
-                      ? 'Админ'
-                      : 'Участник'
-                const avatarSrc = buildChannelAvatarUrl?.(channel)
-                return (
+        </div>
+      )}
+
+      {selfProfileOpen && (
+        <div
+          className="absolute inset-0 z-40"
+          onClick={() => {
+            setSelfProfileOpen(false)
+            setStatusMenuOpen(false)
+          }}
+        >
+          <div
+            className="absolute bottom-20 left-3 w-[320px] panel rounded-3xl overflow-visible shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div
+              className={`relative z-0 h-20 rounded-t-3xl overflow-hidden ${profileBackground ? 'bg-center bg-cover' : 'bg-gradient-to-r from-slate-900 to-slate-800'}`}
+              style={profileBannerStyle}
+            >
+              {profileBackground && <div className="pointer-events-none absolute inset-0 z-0 bg-black/35" />}
+            </div>
+            <div className="relative z-10 px-4 pb-4 -mt-8 space-y-3">
+              <div className="flex items-center gap-3">
+                <div className="relative">
+                  <AvatarImage user={me} size={56} src={buildAvatarUrl?.(me)} className="flex-shrink-0 border border-white/10" />
+                  <span className={`absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full border-2 border-[#101822] ${currentStatus.color}`} />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold truncate" style={meNameStyle}>
+                    {me?.displayName || me?.username || 'user'}
+                  </div>
+                  <div className="text-xs text-white/60 truncate">
+                    {profileStatus || currentStatus.label}
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={openSettings}
+                  className="tg-button text-sm w-full"
+                >
+                  Редактировать профиль
+                </button>
+                <div className="relative">
                   <button
-                    key={channel.id}
                     type="button"
-                    onClick={() => switchChannel(channel.id)}
-                    className={`w-full flex items-center justify-between px-3 py-3 rounded-2xl transition-colors ${active ? 'panel' : 'glass hover:bg-white/10'}`}
+                    onClick={() => setStatusMenuOpen((current) => !current)}
+                    className="tg-button text-sm w-full flex items-center justify-between"
                   >
-                    <div className="flex items-center gap-3">
-                      <AvatarImage
-                        user={{ username: channel.name }}
-                        src={avatarSrc}
-                        fallback={channel.name}
-                      />
-                      <div>
-                        <div className="text-sm font-medium">{channel.name}</div>
-                        <div className="text-xs text-white/60 flex items-center gap-2">
-                          <span>🔒 {role}</span>
-                          <span>•</span>
-                          <span>{channel.memberCount} участн.</span>
-                        </div>
-                      </div>
-                    </div>
-                    {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
+                    <span className="flex items-center gap-2">
+                      <span className={`w-2.5 h-2.5 rounded-full ${currentStatus.color}`} />
+                      {currentStatus.label}
+                    </span>
+                    <span className="text-white/50">›</span>
                   </button>
-                )
-              })
-            ) : (
-              <div className="text-sm text-white/40 px-2">Приватных комнат пока нет</div>
-            )
-          ) : (
-            <div className="text-xs text-white/30 px-2">Секция скрыта</div>
-          )}
-        </div>
-
-        <div>
-          <div className="px-2 text-xs uppercase tracking-[0.2em] text-white/40 mb-2 flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => setShowUsers((value) => !value)}
-              className="flex items-center gap-2 text-white/60 hover:text-white/90 transition"
-            >
-              <span className="text-base leading-none">{showUsers ? '−' : '+'}</span>
-              <span>Пользователи</span>
-            </button>
-            <span className="text-white/30 text-[11px]">{filteredUsers.length}</span>
-          </div>
-          <div className="space-y-2">
-            {showUsers ? (
-              filteredUsers.length > 0 ? (
-                filteredUsers.map((u) => {
-                  const channelId = buildDirectChannelId(me?.id, u.id)
-                  const active = activeChannelId === channelId
-                  const unreadCount = unread[channelId] || 0
-                  const peerId = directPeers[channelId]
-                  const label = peerId ? users.find((user) => user.id === peerId)?.username || u.username : u.username
-                  const isOnline = onlineSet.has(u.id)
-                  const avatarSrc = buildAvatarUrl?.(u)
-                  return (
-                    <button
-                      key={u.id}
-                      type="button"
-                      onClick={() => openDirectChat(u.id)}
-                      className={`w-full flex items-center justify-between px-3 py-3 rounded-2xl ${active ? 'panel' : 'glass hover:bg-white/10'} transition`}
-                    >
-                      <div className="flex items-center gap-3">
-                        <AvatarImage user={u} src={avatarSrc} />
-                        <div>
-                          <div className="text-sm font-medium">@{label}</div>
-                          <div className="text-[11px] text-white/50 flex items-center gap-2">
-                            <StatusDot online={isOnline} />
-                            <span>{isOnline ? 'онлайн' : 'офлайн'}</span>
-                          </div>
-                        </div>
-                      </div>
-                      {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
-                    </button>
-                  )
-                })
-              ) : (
-                <div className="text-sm text-white/40 px-2">Пользователей пока нет</div>
-              )
-            ) : (
-              <div className="text-xs text-white/30 px-2">Секция скрыта</div>
-            )}
-          </div>
-        </div>
-
-        <div className="space-y-2">
-          <div className="px-2 text-xs uppercase tracking-[0.2em] text-white/40 mb-2 flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => setShowVoice((value) => !value)}
-              className="flex items-center gap-2 text-white/60 hover:text-white/90 transition"
-            >
-              <span className="text-base leading-none">{showVoice ? '−' : '+'}</span>
-              <span>Голосовые комнаты</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setEditingRoom(null)
-                setVoiceName('')
-                setVoiceSelectedIds([])
-                setVoiceModeratorIds([])
-                setVoiceError(null)
-                clearVoiceAvatarSelection()
-                setVoiceAvatarRemove(false)
-                setVoiceDialogOpen(true)
-              }}
-              className="text-white/40 hover:text-white/80 transition text-lg leading-none"
-            >
-              +
-            </button>
-          </div>
-          {showVoice ? (
-            filteredVoiceRooms.length > 0 ? (
-              filteredVoiceRooms.map((room) => {
-                const active = activeVoiceRoomId === room.id
-                const count = room.participantCount ?? voiceParticipantsCount(room.id)
-                const participants = voiceParticipants[room.id] || []
-                const canManage = room.membershipRole === 'owner' || room.membershipRole === 'admin'
-                return (
-                  <div key={room.id} className={`rounded-2xl border border-white/10 px-4 py-3 space-y-3 ${active ? 'panel' : 'glass hover:bg-white/10 transition'}`}>
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="flex items-center gap-3">
-                        <AvatarImage
-                          user={{ username: room.name }}
-                          src={buildVoiceRoomAvatarUrl?.(room)}
-                          fallback={room.name}
-                          size={40}
-                        />
-                        <div>
-                          <div className="text-sm font-medium">{room.name}</div>
-                          <div className="text-xs text-white/50">В голосе: {count}</div>
-                          {active && voiceStatus && (
-                            <div className="text-[11px] text-white/40">
-                              {voiceStatus === 'connecting'
-                                ? 'Подключение...'
-                                : voiceStatus === 'error'
-                                ? 'Ошибка соединения'
-                                : voiceStatus === 'room_closed'
-                                ? 'Комната закрыта'
-                                : 'Подключено'}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => (active ? leaveVoiceRoom() : joinVoiceRoom(room.id))}
-                        className={`px-3 py-1.5 text-xs rounded-xl transition ${active ? 'bg-red-500/30 hover:bg-red-500/40 text-red-200' : 'bg-white/10 hover:bg-white/20 text-white/80'}`}
-                      >
-                        {active ? 'Выйти' : 'Подключиться'}
-                      </button>
-                    </div>
-                    {participants.length > 0 && (
-                      <div className="flex flex-wrap gap-3 pl-1">
-                        {participants.map((p) => {
-                          const speaking = voiceSpeaking[p.socketId]
-                          const state = voicePeerStates[p.socketId]
-                          const user = users.find((u) => u.id === p.userId)
-                          const avatarSrc = buildAvatarUrl?.(user)
-                          const isSelf = p.socketId === voiceSelfSocketId
-                          const badge =
-                            state === 'connecting'
-                              ? 'Подключение'
-                              : state === 'failed'
-                              ? 'Ошибка'
-                              : state === 'disconnected'
-                              ? 'Отключен'
-                              : isSelf
-                              ? 'Вы'
-                              : ''
-                          return (
-                            <div
-                              key={p.socketId}
-                              className={`flex items-center gap-2 px-3 py-2 rounded-2xl bg-white/5 border border-white/10 ${speaking ? 'shadow-[0_0_0_2px_rgba(16,185,129,0.6)]' : ''}`}
-                            >
-                              <div className={`relative w-8 h-8 rounded-full overflow-hidden ${speaking ? 'ring-2 ring-emerald-400/80 ring-offset-2 ring-offset-black/20 transition-all' : 'ring-0'}`}>
-                                <AvatarImage user={user || { username: p.username }} size={32} src={avatarSrc} />
-                              </div>
-                              <div>
-                                <div className="text-xs text-white/90">@{p.username || p.userId}</div>
-                                {badge && <div className="text-[10px] text-white/40">{badge}</div>}
-                              </div>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    )}
-                    {canManage && (
-                      <div className="flex items-center justify-between text-[11px] text-white/40">
-                        <div>Роль: {room.membershipRole === 'owner' ? 'Создатель' : 'Администратор'}</div>
+                  {statusMenuOpen && (
+                    <div className="absolute left-full top-0 ml-3 w-52 panel rounded-2xl overflow-hidden z-20">
+                      {statusOptions.map((option) => (
                         <button
+                          key={option.id}
                           type="button"
                           onClick={() => {
-                            setEditingRoom(room)
-                            setVoiceName(room.name)
-                            const members = room.members || []
-                            setVoiceSelectedIds(members.map((m) => m.userId).filter((id) => id !== room.createdBy))
-                            setVoiceModeratorIds(members.filter((m) => m.role === 'admin').map((m) => m.userId))
-                            setVoiceAvatarFile(null)
-                            setVoiceAvatarPreview(buildVoiceRoomAvatarUrl?.(room) || '')
-                            setVoiceAvatarRemove(false)
-                            setVoiceAvatarError(null)
-                            setVoiceDialogOpen(true)
+                            setUserStatus(option.id)
+                            setStatusMenuOpen(false)
                           }}
-                          className="text-white/50 hover:text-white/80 transition"
+                          className="w-full px-4 py-2 text-sm flex items-center gap-3 hover:bg-white/10 transition"
                         >
-                          Управлять
+                          <span className={`w-2.5 h-2.5 rounded-full ${option.color}`} />
+                          <span>{option.label}</span>
                         </button>
-                      </div>
-                    )}
-                    {me?.id === room.createdBy && !active && (
-                      <button
-                        type="button"
-                        onClick={() => deleteVoiceRoom(room.id).catch((err) => console.error('delete voice room failed', err))}
-                        className="text-xs text-white/40 hover:text-red-300 transition"
-                      >
-                        Удалить
-                      </button>
-                    )}
-                  </div>
-                )
-              })
-            ) : (
-              <div className="text-sm text-white/40 px-2">Голосовые комнаты отсутствуют</div>
-            )
-          ) : (
-            <div className="text-xs text-white/30 px-2">Секция скрыта</div>
-          )}
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
 
       {createDialogOpen && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6" onClick={closeCreateDialog}>
           <div className="panel w-full max-w-lg rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
               <div>
-                <div className="text-lg font-semibold text-white/90">Новая приватная комната</div>
-                <div className="text-xs text-white/60">Выберите название и участников</div>
+                <div className="text-lg font-semibold text-white/90">Новая группа</div>
+                <div className="text-xs text-white/60">Выберите название и друзей</div>
               </div>
               <button type="button" onClick={closeCreateDialog} className="text-white/40 hover:text-white/80 transition">
-                ✕
+                x
               </button>
             </div>
             {createError && <div className="px-5 py-3 text-sm text-red-300 bg-red-500/10">{createError}</div>}
@@ -800,43 +613,45 @@ export default function Sidebar() {
                   type="text"
                   value={channelName}
                   onChange={(e) => setChannelName(e.target.value)}
-                  className="w-full bg-white/10 rounded-2xl px-4 py-2 text-sm text-white placeholder:text-white/40 focus:outline-none focus:ring-2 focus:ring-white/40"
-                  placeholder="Например, Проект А"
+                  className="tg-input text-sm placeholder:text-white/40"
+                  placeholder="Например, Команда"
                   disabled={creating}
                 />
               </div>
               <div className="space-y-2">
                 <div className="text-xs uppercase tracking-[0.2em] text-white/40">Участники</div>
                 <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                  {otherUsers.map((user) => {
+                  {friends.map((user) => {
                     const checked = selectedIds.includes(user.id)
                     return (
                       <label
                         key={user.id}
-                        className="flex items-center justify-between gap-3 bg-white/5 hover:bg-white/10 transition px-3 py-2 rounded-2xl"
+                        className="flex items-center justify-between gap-3 panel hover:bg-white/10 transition px-3 py-2 rounded-2xl"
                       >
                         <div className="flex items-center gap-3">
                           <AvatarImage user={user} size={28} src={buildAvatarUrl?.(user)} />
-                          <div className="text-sm text-white/80">@{user.username}</div>
+                          <div className="text-sm text-white/80" style={getUserNameStyle(user)}>
+                            {user.displayName || user.username}
+                          </div>
                         </div>
                         <input type="checkbox" checked={checked} onChange={() => toggleSelection(user.id)} disabled={creating} />
                       </label>
                     )
                   })}
-                  {otherUsers.length === 0 && <div className="text-sm text-white/40">Больше нет пользователей</div>}
+                  {friends.length === 0 && <div className="text-sm text-white/40">Пока нет друзей</div>}
                 </div>
               </div>
               <div className="space-y-2">
                 <div className="text-xs uppercase tracking-[0.2em] text-white/40">Аватар</div>
                 <div className="flex items-center gap-3">
                   <AvatarImage
-                    user={{ username: channelName || 'channel' }}
+                    user={{ username: channelName || 'group' }}
                     size={48}
                     src={channelAvatarPreview || undefined}
-                    fallback={channelName || 'Канал'}
+                    fallback={channelName || 'Группа'}
                   />
                   <div className="flex flex-col gap-2 text-xs">
-                    <label className="cursor-pointer px-3 py-1.5 rounded-2xl bg-white/10 hover:bg-white/20 transition">
+                    <label className="cursor-pointer tg-button text-xs">
                       Выбрать файл
                       <input type="file" accept="image/*" className="hidden" onChange={handleChannelAvatarChange} disabled={creating} />
                     </label>
@@ -847,198 +662,30 @@ export default function Sidebar() {
                     )}
                   </div>
                 </div>
-                {channelAvatarError && <div className="text-xs text-red-300">{channelAvatarError}</div>}
               </div>
             </div>
             <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
-              <button
-                type="button"
-                onClick={closeCreateDialog}
-                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
-                disabled={creating}
-              >
-                Отмена
-              </button>
-              <button
-                type="button"
-                onClick={handleCreatePrivateChannel}
-                className="px-4 py-2 rounded-2xl bg-white/80 text-black hover:bg-white disabled:bg-white/30 disabled:text-white/40 text-sm"
-                disabled={creating}
-              >
-                {creating ? 'Создание...' : 'Создать'}
-              </button>
+                <button
+                  type="button"
+                  onClick={closeCreateDialog}
+                  className="tg-button text-sm"
+                  disabled={creating}
+                >
+                  Отмена
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCreateGroup}
+                  className="tg-button tg-button--primary text-sm disabled:opacity-40"
+                  disabled={creating}
+                >
+                  {creating ? 'Создание...' : 'Создать'}
+                </button>
             </div>
           </div>
         </div>
       )}
 
-      {voiceDialogOpen && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6" onClick={closeVoiceDialog}>
-          <div className="panel w-full max-w-xl rounded-3xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
-              <div>
-                <div className="text-lg font-semibold text-white/90">
-                  {editingRoom ? 'Участники голосовой комнаты' : 'Новая голосовая комната'}
-                </div>
-                <div className="text-xs text-white/60">
-                  {editingRoom ? 'Добавьте или удалите участников и назначьте модераторов' : 'Выберите название и участников'}
-                </div>
-              </div>
-              <button type="button" onClick={closeVoiceDialog} className="text-white/40 hover:text-white/80 transition">
-                ✕
-              </button>
-            </div>
-            {voiceError && <div className="px-5 py-3 text-sm text-red-300 bg-red-500/10">{voiceError}</div>}
-            <div className="px-5 py-4 space-y-5 max-h-[70vh] overflow-y-auto">
-              {!editingRoom && (
-                <div className="space-y-2">
-                  <label className="text-sm text-white/70" htmlFor="voice-name">
-                    Название
-                  </label>
-                  <input
-                    id="voice-name"
-                    type="text"
-                    value={voiceName}
-                    onChange={(e) => setVoiceName(e.target.value)}
-                    className="w-full bg-white/10 rounded-2xl px-4 py-2 text-sm text-white placeholder:text-white/40 focus:outline-none focus:ring-2 focus:ring-white/40"
-                    placeholder="Например, Голосовой проект"
-                    disabled={voiceSaving}
-                  />
-                </div>
-              )}
-              {editingRoom && (
-                <div className="flex items-center gap-3 bg-white/5 px-4 py-3 rounded-2xl">
-                  <span className="text-xs uppercase tracking-[0.2em] text-white/30">Комната</span>
-                  <span className="text-sm text-white/80">{editingRoom.name}</span>
-                </div>
-              )}
-              {editingRoom && (
-                <div className="space-y-2">
-                  <div className="text-xs uppercase tracking-[0.2em] text-white/40">Создатель</div>
-                <div className="flex items-center gap-3 bg-white/5 rounded-2xl px-3 py-2">
-                  <AvatarImage user={users.find((u) => u.id === editingRoom.createdBy)} size={28} src={buildAvatarUrl?.(users.find((u) => u.id === editingRoom.createdBy))} />
-                  <div className="text-sm text-white/80">
-                    @{users.find((u) => u.id === editingRoom.createdBy)?.username || editingRoom.createdBy}
-                  </div>
-
-                  <span className="text-[11px] text-white/40">Создатель</span>
-
-                  <div className="text-xs text-white/50">В голосе: {editingCount ?? 0}</div>
-                  {editingActive && voiceStatus && (
-                    <div className="text-[11px] text-white/40">
-                      {voiceStatus === 'connecting'
-                        ? 'Подключение...'
-                        : voiceStatus === 'error'
-                          ? 'Ошибка соединения'
-                          : voiceStatus === 'room_closed'
-                          ? 'Комната закрыта'
-                          : 'Подключено'}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-              <div className="space-y-2">
-                <div className="text-xs uppercase tracking-[0.2em] text-white/40">Аватар</div>
-                <div className="flex items-center gap-3">
-                  <AvatarImage
-                    user={{ username: editingRoom?.name || voiceName || 'voice' }}
-                    size={48}
-                    src={voiceAvatarPreview || undefined}
-                    fallback={editingRoom?.name || voiceName || 'Комната'}
-                  />
-                  <div className="flex flex-col gap-2 text-xs">
-                    <label className="cursor-pointer px-3 py-1.5 rounded-2xl bg-white/10 hover:bg-white/20 transition">
-                      Выбрать файл
-                      <input type="file" accept="image/*" className="hidden" onChange={handleVoiceAvatarChange} disabled={voiceSaving} />
-                    </label>
-                    {(voiceAvatarPreview || voiceAvatarFile) && (
-                      <button
-                        type="button"
-                        onClick={clearVoiceAvatarSelection}
-                        className="text-white/50 hover:text-white/80 transition"
-                        disabled={voiceSaving}
-                      >
-                        Сбросить
-                      </button>
-                    )}
-                    {editingRoom?.avatarUrl && !voiceAvatarFile && !voiceAvatarRemove && (
-                      <button
-                        type="button"
-                        onClick={markVoiceAvatarRemoval}
-                        className="text-white/50 hover:text-white/80 transition"
-                        disabled={voiceSaving}
-                      >
-                        Удалить текущий
-                      </button>
-                    )}
-                    {voiceAvatarRemove && !voiceAvatarFile && (
-                      <div className="text-[11px] text-white/50">Аватар будет удалён</div>
-                    )}
-                  </div>
-                </div>
-                {voiceAvatarError && <div className="text-xs text-red-300">{voiceAvatarError}</div>}
-              </div>
-              <div className="space-y-3">
-                <div className="text-xs uppercase tracking-[0.2em] text-white/40">Участники</div>
-                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
-                  {otherUsers.map((user) => {
-                    const checked = voiceSelectedIds.includes(user.id)
-                    const moderator = voiceModeratorIds.includes(user.id)
-                    const isLocked = editingRoom?.createdBy === user.id
-                    return (
-                      <div key={user.id} className="rounded-2xl bg-white/5 hover:bg-white/10 transition p-3 space-y-2">
-                        <label className="flex items-center justify-between gap-3 cursor-pointer">
-                          <div className="flex items-center gap-3">
-                            <AvatarImage user={user} size={32} src={buildAvatarUrl?.(user)} />
-                            <div className="text-sm text-white/80">@{user.username}</div>
-                          </div>
-                          <input
-                            type="checkbox"
-                            checked={checked || isLocked}
-                            onChange={() => toggleVoiceSelection(user.id)}
-                            disabled={voiceSaving || isLocked}
-                          />
-                        </label>
-                        {(checked || isLocked) && (
-                          <label className="flex items-center gap-2 text-xs text-white/60 pl-10">
-                            <input
-                              type="checkbox"
-                              checked={isLocked ? true : moderator}
-                              onChange={() => toggleVoiceModerator(user.id)}
-                              disabled={voiceSaving || isLocked}
-                            />
-                            {isLocked ? 'Администратор' : 'Назначить модератором'}
-                          </label>
-                        )}
-                      </div>
-                    )
-                  })}
-                  {otherUsers.length === 0 && <div className="text-sm text-white/40">Других пользователей пока нет</div>}
-                </div>
-              </div>
-            </div>
-            <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
-              <button
-                type="button"
-                onClick={closeVoiceDialog}
-                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition text-sm"
-                disabled={voiceSaving}
-              >
-                Отмена
-              </button>
-              <button
-                type="button"
-                onClick={handleSubmitVoiceRoom}
-                className="px-4 py-2 rounded-2xl bg-white/80 text-black hover:bg-white disabled:bg-white/30 disabled:text-white/40 text-sm"
-                disabled={voiceSaving}
-              >
-                {voiceSaving ? 'Сохранение…' : editingRoom ? 'Сохранить' : 'Создать'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
       <div
         role="separator"
         aria-label="Изменить ширину боковой панели"

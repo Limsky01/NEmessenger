@@ -10,7 +10,10 @@ const fallbackInitials = (value) => {
 export default function AvatarImage({ user, size = 36, className = '', src, fallback }) {
   const [broken, setBroken] = useState(false)
 
-  const displayName = useMemo(() => fallback || user?.username || '', [fallback, user?.username])
+  const displayName = useMemo(
+    () => fallback || user?.displayName || user?.username || '',
+    [fallback, user?.displayName, user?.username],
+  )
   const initials = useMemo(() => fallbackInitials(displayName), [displayName])
   const imageSrc = useMemo(() => {
     if (broken) return null

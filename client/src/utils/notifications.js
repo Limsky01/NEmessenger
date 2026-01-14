@@ -44,9 +44,9 @@ const shouldUseBrowserNotifications = () => {
 }
 
 const buildPreview = (content) => {
-  if (typeof content !== 'string') return 'Новое сообщение'
+  if (typeof content !== 'string') return 'Нет содержимого'
   const trimmed = content.trim()
-  if (!trimmed.length) return 'Новое сообщение'
+  if (!trimmed.length) return 'Нет содержимого'
   if (trimmed.length > MAX_BODY_LENGTH) return `${trimmed.slice(0, MAX_BODY_LENGTH - 3)}...`
   return trimmed
 }

@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import useStore from '../state/store.js'
 
 const api = typeof window !== 'undefined' ? window.electronAPI : undefined
 
-const baseBtn = 'w-8 h-8 rounded-xl flex items-center justify-center transition button-press pointer-auto no-drag'
+const baseBtn = 'w-8 h-8 rounded-lg flex items-center justify-center transition button-press pointer-auto no-drag border border-white/10'
 const hoverMap = {
-  default: ' bg-white/10 hover:bg-white/20',
-  danger: ' bg-white/10 hover:bg-red-500/80',
+  default: ' bg-white/5 hover:bg-white/10',
+  danger: ' bg-white/5 hover:bg-red-500/80',
 }
 
 function TitleButton({ onClick, title, children, variant = 'default', disabled }) {
@@ -57,7 +58,59 @@ function MaximizeIcon({ isMaximized }) {
 
 export default function Titlebar() {
   const [windowState, setWindowState] = useState({ maximized: false, fullscreen: false })
+  const token = useStore((s) => s.token)
+  const socketConnected = useStore((s) => s.socket?.connected ?? false)
+  const connectionStatus = useStore((s) => s.connectionStatus)
+  const serverUrl = useStore((s) => s.serverUrl)
+  const setServerUrl = useStore((s) => s.setServerUrl)
+  const openAdmin = useStore((s) => s.openAdmin)
   const noclickStyle = useMemo(() => ({ WebkitAppRegion: 'no-drag' }), [])
+  const [serverModalOpen, setServerModalOpen] = useState(false)
+  const [serverDraft, setServerDraft] = useState('')
+  const [serverError, setServerError] = useState('')
+
+  const connectionLabel = useMemo(() => {
+    if (!token) return 'Нет входа'
+    if (connectionStatus === 'connected' && socketConnected) return 'В сети'
+    if (connectionStatus === 'retrying') return 'Переподключение'
+    if (connectionStatus === 'awaiting_manual') return 'Нет соединения'
+    return 'Подключение'
+  }, [token, connectionStatus, socketConnected])
+
+  const connectionDotClass = useMemo(() => {
+    if (!token) return 'bg-white/30'
+    if (connectionStatus === 'connected' && socketConnected) return 'bg-emerald-400'
+    if (connectionStatus === 'retrying') return 'bg-yellow-400'
+    if (connectionStatus === 'awaiting_manual') return 'bg-red-500'
+    return 'bg-sky-400'
+  }, [token, connectionStatus, socketConnected])
+
+  const canConfigureServer = !token || connectionStatus !== 'connected' || !socketConnected
+
+  useEffect(() => {
+    if (!serverModalOpen) return
+    setServerDraft(serverUrl || '')
+    setServerError('')
+  }, [serverModalOpen, serverUrl])
+
+  const handleStatusClick = () => {
+    if (canConfigureServer) {
+      setServerModalOpen(true)
+      return
+    }
+    if (token && connectionStatus === 'connected' && socketConnected) {
+      openAdmin()
+    }
+  }
+
+  const handleSaveServer = () => {
+    const ok = setServerUrl(serverDraft, { reconnect: true })
+    if (!ok) {
+      setServerError('Введите адрес сервера')
+      return
+    }
+    setServerModalOpen(false)
+  }
 
   useEffect(() => {
     if (!api) return undefined
@@ -104,14 +157,25 @@ export default function Titlebar() {
 
   return (
     <div
-      className="drag h-12 px-4 flex items-center justify-between border-b border-white/10 panel"
+      className="drag h-12 px-4 flex items-center justify-between tg-topbar"
       onMouseDown={handleMouseDown}
       onDoubleClick={(event) => {
         event.preventDefault()
         handleToggleFullscreen()
       }}
     >
-      <div className="text-sm tracking-widest opacity-90 select-none">NE Messenger</div>
+      <div className="flex items-center gap-3">
+        <div className="text-sm tracking-widest opacity-90 select-none">NE Messenger</div>
+        <button
+          type="button"
+          onClick={handleStatusClick}
+          className={`no-drag flex items-center gap-2 text-[11px] ${canConfigureServer ? 'text-white/70 hover:text-white' : 'text-white/60'} transition`}
+          title={canConfigureServer ? 'Указать адрес сервера' : 'Открыть админ-панель'}
+        >
+          <span className={`w-2 h-2 rounded-full ${connectionDotClass}`} />
+          <span>{connectionLabel}</span>
+        </button>
+      </div>
       <div className="flex gap-2 pointer-auto" style={noclickStyle}>
         <TitleButton onClick={handleMinimize} title="Свернуть">
           <MinimizeIcon />
@@ -123,6 +187,59 @@ export default function Titlebar() {
           <CloseIcon />
         </TitleButton>
       </div>
+      {serverModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4 py-6"
+          onClick={() => setServerModalOpen(false)}
+        >
+          <div className="panel w-full max-w-md rounded-3xl overflow-hidden" onClick={(event) => event.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
+              <div>
+                <div className="text-lg font-semibold text-white/90">Адрес сервера</div>
+                <div className="text-xs text-white/60">Укажите сервер разработчика для подключения</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setServerModalOpen(false)}
+                className="text-white/40 hover:text-white/80 transition"
+              >
+                x
+              </button>
+            </div>
+            <div className="px-5 py-4 space-y-3">
+              <input
+                value={serverDraft}
+                onChange={(event) => setServerDraft(event.target.value)}
+                placeholder="http://192.168.0.10:4000"
+                className="tg-input text-sm placeholder:text-white/40"
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    handleSaveServer()
+                  }
+                }}
+              />
+              {serverError && <div className="text-xs text-red-300">{serverError}</div>}
+            </div>
+            <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setServerModalOpen(false)}
+                className="tg-button text-sm"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveServer}
+                className="tg-button tg-button--primary text-sm"
+              >
+                Подключить
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

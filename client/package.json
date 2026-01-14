@@ -1,6 +1,6 @@
 {
     "name": "NE-client",
-    "version": "0.10.7",
+    "version": "0.12.0",
     "private": true,
     "main": "electron/main.js",
     "type": "module",
@@ -16,9 +16,9 @@
         "axios": "^1.7.7",
         "electron-updater": "^6.6.2",
         "framer-motion": "^11.2.6",
-        "livekit-client": "^2.4.0",
         "react": "^18.3.1",
         "react-dom": "^18.3.1",
+        "react-easy-crop": "^5.5.6",
         "socket.io-client": "^4.7.5",
         "tweetnacl": "^1.0.3",
         "tweetnacl-util": "^0.15.1",

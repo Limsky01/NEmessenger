@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react'
-import useStore from '../state/store.js'
+import useStore, { buildNameStyle } from '../state/store.js'
 import AvatarImage from './AvatarImage.jsx'
 
 const roleLabel = (role) => (role === 'admin' ? 'Администратор' : 'Пользователь')
@@ -34,7 +34,7 @@ export default function AdminPanel() {
         <button
           type="button"
           onClick={openChat}
-          className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+          className="tg-button"
         >
           Вернуться в чат
         </button>
@@ -122,7 +122,7 @@ export default function AdminPanel() {
 
   return (
     <div className="flex-1 h-full overflow-y-auto p-10 space-y-6 text-sm">
-      <div className="flex.items-center.justify-between">
+      <div className="flex items-center justify-between">
         <div>
           <div className="text-2xl font-semibold">Админ-панель</div>
           <div className="text-white/60">Управление пользователями и сообщениями</div>
@@ -130,7 +130,7 @@ export default function AdminPanel() {
         <button
           type="button"
           onClick={openChat}
-          className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+          className="tg-button"
         >
           Вернуться в чат
         </button>
@@ -140,7 +140,7 @@ export default function AdminPanel() {
         <div
           className={
             status.type === 'success'
-              ? 'panel border border-emerald-500/30 text-emerald-300 px-4 py-3 rounded-2xl'
+              ? 'panel border border-sky-500/30 text-sky-200 px-4 py-3 rounded-2xl'
               : status.type === 'error'
               ? 'panel border border-red-500/30 text-red-300 px-4 py-3 rounded-2xl'
               : 'panel border border-white/20 text-white/80 px-4 py-3 rounded-2xl'
@@ -156,12 +156,13 @@ export default function AdminPanel() {
           {sortedUsers.map((user) => {
             const avatarSrc = buildAvatarUrl?.(user)
             const isMe = user.id === me.id
+            const nameStyle = buildNameStyle(user?.nameStyle)
             return (
-              <div key={user.id} className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 glass px-4 py-3 rounded-2xl">
+              <div key={user.id} className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 panel px-4 py-3 rounded-2xl">
                 <div className="flex items-center gap-4">
                   <AvatarImage user={user} size={52} src={avatarSrc} />
                   <div className="space-y-1">
-                    <div className="text-base font-medium">@{user.username}</div>
+                    <div className="text-base font-medium" style={nameStyle}>{user.displayName || user.username}</div>
                     <div className="text-white/50 text-xs">ID: {user.id}</div>
                     <div className="text-white/60 text-xs">Роль: {roleLabel(user.role)}</div>
                   </div>
@@ -170,7 +171,7 @@ export default function AdminPanel() {
                   <button
                     type="button"
                     onClick={() => handleRoleToggle(user)}
-                    className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+                    className="tg-button"
                     disabled={isMe && user.role === 'admin'}
                   >
                     {user.role === 'admin' ? 'Сделать пользователем' : 'Сделать админом'}
@@ -178,14 +179,14 @@ export default function AdminPanel() {
                   <button
                     type="button"
                     onClick={() => openPasswordDialog(user)}
-                    className="px-4 py-2 rounded-2xl bg-white/10 hover.bg-white/20 transition"
+                    className="tg-button"
                   >
                     Сменить пароль
                   </button>
                   <button
                     type="button"
                     onClick={() => handleAvatarDelete(user)}
-                    className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition disabled:opacity-40"
+                    className="tg-button disabled:opacity-40"
                     disabled={!user.avatarUrl}
                   >
                     Удалить аватар
@@ -225,7 +226,7 @@ export default function AdminPanel() {
                   type="password"
                   value={passwordDialog.newPassword}
                   onChange={(e) => setPasswordDialog((state) => ({ ...state, newPassword: e.target.value }))}
-                  className="w-full rounded-2xl px-4 py-2 bg-white/10 outline-none"
+                  className="tg-input"
                   placeholder="Минимум 6 символов"
                 />
               </div>
@@ -235,7 +236,7 @@ export default function AdminPanel() {
                   type="password"
                   value={passwordDialog.confirm}
                   onChange={(e) => setPasswordDialog((state) => ({ ...state, confirm: e.target.value }))}
-                  className="w-full rounded-2xl px-4 py-2.bg-white/10 outline-none"
+                  className="tg-input"
                   placeholder="Повторите пароль"
                 />
               </div>
@@ -245,7 +246,7 @@ export default function AdminPanel() {
               <button
                 type="button"
                 onClick={closePasswordDialog}
-                className="px-4 py-2 rounded-2xl bg-white/10 hover:bg-white/20 transition"
+                className="tg-button"
                 disabled={passwordDialog.loading}
               >
                 Отмена
@@ -253,7 +254,7 @@ export default function AdminPanel() {
               <button
                 type="button"
                 onClick={handlePasswordSubmit}
-                className="px-4 py-2 rounded-2xl bg-white/20 hover:bg-white/30 transition disabled:opacity-50"
+                className="tg-button tg-button--primary disabled:opacity-50"
                 disabled={passwordDialog.loading}
               >
                 {passwordDialog.loading ? 'Сохранение…' : 'Сохранить'}

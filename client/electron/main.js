@@ -168,6 +168,15 @@ const createTray = () => {
   return tray
 }
 
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    showWindow()
+  })
+}
+
 const isAutostartSupported = () => {
   if (process.platform !== 'darwin' && process.platform !== 'win32') return false
   return typeof app.getLoginItemSettings === 'function' && typeof app.setLoginItemSettings === 'function'

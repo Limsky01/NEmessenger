@@ -1,6 +1,6 @@
 {
   "name": "NE-server",
-  "version": "0.9.6",
+  "version": "1.0",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -11,7 +11,6 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "livekit-server-sdk": "^1.2.5",
     "jsonwebtoken": "^9.0.2",
     "socket.io": "^4.7.5",
     "uuid": "^9.0.1",

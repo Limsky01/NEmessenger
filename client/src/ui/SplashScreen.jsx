@@ -102,7 +102,7 @@ export default function SplashScreen({
 
             <motion.h1
               className="splash-heading"
-              animate={{ scale: [1, 1.02, 1], textShadow: ['0 0 20px rgba(167, 139, 250, .45)', '0 0 24px rgba(147, 197, 253, .7)', '0 0 20px rgba(167, 139, 250, .45)'] }}
+              animate={{ scale: [1, 1.02, 1], textShadow: ['0 0 20px rgba(56, 189, 248, .45)', '0 0 24px rgba(125, 211, 252, .7)', '0 0 20px rgba(56, 189, 248, .45)'] }}
               transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
             >
               {heading}
@@ -135,7 +135,7 @@ export default function SplashScreen({
             {secondaryActionLabel && onSecondaryAction ? (
               <button
                 type="button"
-                className="mt-4 inline-flex items-center justify-center rounded-full bg-white/10 px-5 py-2 text-sm font-medium text-white transition hover:bg-white/20 focus:outline-none focus:ring-2 focus:ring-white/60"
+                className="mt-4 tg-button"
                 onClick={onSecondaryAction}
               >
                 {secondaryActionLabel}
