@@ -7,6 +7,7 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import Database from 'better-sqlite3'
 import { v4 as uuidv4 } from 'uuid'
+import webpush from 'web-push'
 import fs from 'fs'
 import path from 'path'
 import multer from 'multer'
@@ -15,7 +16,19 @@ import crypto from 'crypto'
 
 const app = express()
 const server = http.createServer(app)
-const origins = process.env.ORIGIN ? process.env.ORIGIN.split(',').map((s) => s.trim()) : ['*']
+const normalizeOriginValue = (value) => {
+  if (!value || typeof value !== 'string') return ''
+  const cleaned = value.trim().replace(/^['"]|['"]$/g, '').replace(/\/+$/, '')
+  if (!cleaned) return ''
+  return cleaned
+}
+
+const origins = process.env.ORIGIN
+  ? process.env.ORIGIN
+      .split(',')
+      .map((s) => normalizeOriginValue(s))
+      .filter(Boolean)
+  : ['*']
 const io = new Server(server, {
   cors: { origin: origins, methods: ['GET', 'POST', 'DELETE'] },
   maxHttpBufferSize: 10 * 1024 * 1024,
@@ -36,7 +49,10 @@ const emitToUser = (userId, event, payload = {}) => {
 
 const resolveEncryptionKey = () => {
   const raw = process.env.ENCRYPTION_KEY || ''
-  if (!raw) throw new Error('ENCRYPTION_KEY environment variable is required for encryption')
+  if (!raw) {
+    warn('[ENCRYPTION] ENCRYPTION_KEY is not set; using ephemeral process key (legacy message layer only)')
+    return crypto.randomBytes(32)
+  }
   let candidate = null
   try {
     const buf = Buffer.from(raw, 'base64')
@@ -56,6 +72,22 @@ const DATA_ENCRYPTION_KEY = resolveEncryptionKey()
 const ENCRYPTED_PREFIX = 'ENC1:'
 const INVITE_CODE_LENGTH = 10
 const INVITE_DEFAULT_TTL = parseInt(process.env.INVITE_TTL_MS || '', 10) || 1000 * 60 * 60 * 24 * 7
+const PUSH_BATCH_WINDOW_MS = Math.max(2000, parseInt(process.env.PUSH_BATCH_WINDOW_MS || '', 10) || 7000)
+const VAPID_PUBLIC_KEY = (process.env.WEB_PUSH_VAPID_PUBLIC_KEY || '').trim()
+const VAPID_PRIVATE_KEY = (process.env.WEB_PUSH_VAPID_PRIVATE_KEY || '').trim()
+const VAPID_SUBJECT = (process.env.WEB_PUSH_VAPID_SUBJECT || 'mailto:admin@example.com').trim()
+const PUSH_ENABLED = Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY && VAPID_SUBJECT)
+
+if (PUSH_ENABLED) {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY)
+    log('[PUSH] web push enabled')
+  } catch (err) {
+    logError('[PUSH] vapid setup failed', err?.message || err)
+  }
+} else {
+  warn('[PUSH] disabled: missing WEB_PUSH_VAPID_PUBLIC_KEY / WEB_PUSH_VAPID_PRIVATE_KEY / WEB_PUSH_VAPID_SUBJECT')
+}
 
 const encryptText = (plain) => {
   const text = typeof plain === 'string' ? plain : String(plain ?? '')
@@ -88,13 +120,35 @@ const decryptText = (maybeEncrypted) => {
 
 
 
-app.use(cors({ origin: origins, credentials: true }))
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || origin === 'null') return callback(null, true)
+    if (origins.includes('*')) return callback(null, true)
+    const normalizedIncoming = normalizeOriginValue(origin)
+    if (origins.includes(normalizedIncoming)) return callback(null, true)
+    warn('[CORS] blocked', 'origin=' + origin, 'allowed=' + origins.join(','))
+    return callback(null, false)
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Authorization',
+    'Content-Type',
+    'ngrok-skip-browser-warning',
+    'X-Requested-With',
+  ],
+}
+
+app.use(cors(corsOptions))
+app.options('*', cors(corsOptions))
 app.use(express.json({ limit: '5mb' }))
 
 app.use((req, res, next) => {
   const start = Date.now()
-  const origin = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'
-  log('[HTTP]', req.method, req.originalUrl, 'from=' + origin)
+  const remoteAddress = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'
+  const requestOrigin = req.headers.origin || '-'
+  const userAgent = req.headers['user-agent'] || '-'
+  log('[HTTP]', req.method, req.originalUrl, 'from=' + remoteAddress, 'origin=' + requestOrigin, 'ua=' + userAgent)
   res.on('finish', () => {
     log('[HTTP:done]', req.method, req.originalUrl, 'status=' + res.statusCode, (Date.now() - start) + 'ms')
   })
@@ -106,13 +160,15 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret'
 const UPLOAD_DIR = process.env.UPLOAD_DIR || 'uploads'
 const AVATAR_DIR = path.join(UPLOAD_DIR, 'avatars')
 const CHANNEL_AVATAR_DIR = path.join(AVATAR_DIR, 'channels')
+const MEDIA_DIR = path.join(UPLOAD_DIR, 'media')
 
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true })
 if (!fs.existsSync(CHANNEL_AVATAR_DIR)) fs.mkdirSync(CHANNEL_AVATAR_DIR, { recursive: true })
+if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true })
 const UPLOADS_ROOT = path.resolve(UPLOAD_DIR)
 
-const db = new Database('messenger_v4.db')
+const db = new Database('messenger_e2e.db')
 db.pragma('journal_mode = WAL')
 
 const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -151,11 +207,13 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'user',
+  public_key TEXT DEFAULT '',
   avatar_seed TEXT DEFAULT '',
   display_name TEXT DEFAULT '',
   name_style TEXT DEFAULT '',
   profile_status TEXT DEFAULT '',
-  profile_background TEXT DEFAULT ''
+  profile_background TEXT DEFAULT '',
+  user_status TEXT DEFAULT 'online'
 );
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
@@ -205,6 +263,16 @@ CREATE TABLE IF NOT EXISTS friend_requests (
   to_user_id TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS channel_keys (
+  channel_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  wrapped_key TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  sender_id TEXT NOT NULL,
+  key_version INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (channel_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS invites (
   id TEXT PRIMARY KEY,
   code TEXT UNIQUE NOT NULL,
@@ -217,16 +285,31 @@ CREATE TABLE IF NOT EXISTS invites (
   used_at INTEGER,
   revoked_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  endpoint TEXT NOT NULL UNIQUE,
+  subscription_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL DEFAULT 0
+);
 `)
 
 ensureColumn('users', 'avatar_seed', 'TEXT DEFAULT ""')
 ensureColumn('users', 'avatar_url', 'TEXT DEFAULT ""')
 ensureColumn('users', 'avatar_updated_at', 'INTEGER DEFAULT 0')
 ensureColumn('users', 'avatar_mime', 'TEXT DEFAULT ""')
+ensureColumn('users', 'public_key', 'TEXT DEFAULT ""')
 ensureColumn('users', 'display_name', 'TEXT DEFAULT ""')
 ensureColumn('users', 'name_style', 'TEXT DEFAULT ""')
 ensureColumn('users', 'profile_status', 'TEXT DEFAULT ""')
 ensureColumn('users', 'profile_background', 'TEXT DEFAULT ""')
+ensureColumn('users', 'user_status', 'TEXT DEFAULT "online"')
+
+if (tableHasColumn('users', 'user_status')) {
+  db.prepare("UPDATE users SET user_status = 'online' WHERE user_status IS NULL OR user_status = ''").run()
+}
 ensureColumn('invites', 'claim_token', 'TEXT DEFAULT ""')
 ensureColumn('invites', 'claimed_at', 'INTEGER')
 ensureColumn('invites', 'used_by', 'TEXT')
@@ -298,12 +381,14 @@ db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username
 const selectUserById = db.prepare('SELECT * FROM users WHERE id=?')
 const selectUserByUsername = db.prepare('SELECT * FROM users WHERE username=?')
 const updateAvatarInfoStmt = db.prepare('UPDATE users SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?')
+const updatePublicKeyStmt = db.prepare('UPDATE users SET public_key=? WHERE id=?')
 const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id=?')
 const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
 const updateNameStyleStmt = db.prepare('UPDATE users SET name_style=? WHERE id=?')
 const updateDisplayNameStmt = db.prepare('UPDATE users SET display_name=? WHERE id=?')
 const updateProfileStatusStmt = db.prepare('UPDATE users SET profile_status=? WHERE id=?')
 const updateProfileBackgroundStmt = db.prepare('UPDATE users SET profile_background=? WHERE id=?')
+const updateUserStatusStmt = db.prepare('UPDATE users SET user_status=? WHERE id=?')
 const countAdminsStmt = db.prepare("SELECT COUNT(*) as count FROM users WHERE role='admin'")
 const listFriendsStmt = db.prepare(
   `SELECT u.* FROM friends f
@@ -346,6 +431,12 @@ const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, clai
 const clearInviteClaimStmt = db.prepare("UPDATE invites SET claim_token='', claimed_at=NULL WHERE id=?")
 const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='', revoked_at=NULL WHERE id=?")
 const revokeInviteStmt = db.prepare("UPDATE invites SET revoked_at=?, claim_token='' WHERE id=?")
+const upsertChannelKeyStmt = db.prepare(
+  'INSERT OR REPLACE INTO channel_keys (channel_id, user_id, wrapped_key, nonce, sender_id, key_version, updated_at) VALUES (?,?,?,?,?,?,?)',
+)
+const selectChannelKeyStmt = db.prepare(
+  'SELECT channel_id, user_id, wrapped_key, nonce, sender_id, key_version, updated_at FROM channel_keys WHERE channel_id=? AND user_id=?',
+)
 const findMessageById = hasMessageReplyColumn
   ? db.prepare('SELECT id, channel_id, sender_id, reply_to FROM messages WHERE id=?')
   : db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
@@ -402,6 +493,27 @@ const deleteChannelStmt = db.prepare('DELETE FROM channels WHERE id=?')
 const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
 const countChannelMembersStmt = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id=?')
 const listAdminsStmt = db.prepare("SELECT id FROM users WHERE role='admin'")
+const upsertPushSubscriptionStmt = db.prepare(
+  `INSERT INTO push_subscriptions (id, user_id, endpoint, subscription_json, created_at, updated_at, last_seen_at)
+   VALUES (?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(endpoint) DO UPDATE SET
+     user_id=excluded.user_id,
+     subscription_json=excluded.subscription_json,
+     updated_at=excluded.updated_at,
+     last_seen_at=excluded.last_seen_at`,
+)
+const listPushSubscriptionsByUserStmt = db.prepare(
+  'SELECT id, endpoint, subscription_json, updated_at, last_seen_at FROM push_subscriptions WHERE user_id=? ORDER BY updated_at DESC',
+)
+const deletePushSubscriptionByEndpointStmt = db.prepare(
+  'DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?',
+)
+const deletePushSubscriptionByEndpointGlobalStmt = db.prepare(
+  'DELETE FROM push_subscriptions WHERE endpoint=?',
+)
+const deletePushSubscriptionsByUserStmt = db.prepare(
+  'DELETE FROM push_subscriptions WHERE user_id=?',
+)
 
 const publicMessage = (row) => {
   if (!row || typeof row.content === 'undefined') return row
@@ -417,14 +529,14 @@ const publicMessage = (row) => {
     senderId,
     created_at: createdAt,
     createdAt,
-    content: decryptText(row.content),
+    content: row.content,
     updated_at: updatedAt,
     updatedAt,
   }
   if (hasMessageReplyColumn) {
     const replyId = row.reply_to ?? row.replyTo ?? null
     if (replyId) {
-      const replyContentRaw = typeof row.reply_content === 'undefined' ? null : decryptText(row.reply_content)
+      const replyContentRaw = typeof row.reply_content === 'undefined' ? null : row.reply_content
       const replySenderId = row.reply_sender_id ?? row.replySenderId ?? null
       const replySenderUsername = row.reply_sender_username ?? row.replySenderUsername ?? null
       const replyCreatedAt = row.reply_created_at ?? row.replyCreatedAt ?? 0
@@ -458,6 +570,28 @@ if (!defaultWs) {
   db.prepare('INSERT INTO workspaces (id,name,created_at) VALUES (?,?,?)').run(wsId, 'Home', Date.now())
   defaultWs = { id: wsId }
 }
+
+const ensureDefaultAdmin = () => {
+  const existingAdmin = db.prepare("SELECT id FROM users WHERE role='admin' LIMIT 1").get()
+  if (existingAdmin?.id) return
+  const usernameRaw = process.env.DEFAULT_ADMIN_USERNAME || 'admin'
+  const passwordRaw = process.env.DEFAULT_ADMIN_PASSWORD || 'Admin123'
+  const username = String(usernameRaw).trim() || 'admin'
+  const password = String(passwordRaw)
+  const id = uuidv4()
+  const avatarSeed = username.slice(0, 2)
+  const hash = bcrypt.hashSync(password, 10)
+  try {
+    db.prepare('INSERT INTO users (id,username,password_hash,role,avatar_seed,public_key) VALUES (?,?,?,?,?,?)')
+      .run(id, username, hash, 'admin', avatarSeed, '')
+    db.prepare('INSERT OR IGNORE INTO workspace_members (workspace_id,user_id) VALUES (?,?)').run(defaultWs.id, id)
+    log('[BOOT] seeded default admin', username)
+  } catch (err) {
+    warn('[BOOT] seed default admin failed', err.message)
+  }
+}
+
+ensureDefaultAdmin()
 
 const DEFAULT_NAME_STYLE = Object.freeze({
   font: 'rubik',
@@ -496,6 +630,12 @@ const publicUser = (u) => {
   const profileBackground = typeof (u.profile_background ?? u.profileBackground) === 'string'
     ? (u.profile_background ?? u.profileBackground)
     : ''
+  const userStatus = typeof (u.user_status ?? u.userStatus) === 'string'
+    ? (u.user_status ?? u.userStatus)
+    : 'online'
+  const publicKey = typeof (u.public_key ?? u.publicKey) === 'string'
+    ? (u.public_key ?? u.publicKey)
+    : ''
   return {
     id: u.id,
     username: u.username,
@@ -505,7 +645,11 @@ const publicUser = (u) => {
     profile_status: profileStatus,
     profileBackground,
     profile_background: profileBackground,
+    userStatus,
+    user_status: userStatus,
     role: u.role,
+    publicKey,
+    public_key: publicKey,
     avatarSeed: seed,
     avatar_seed: seed,
     avatarUrl: avatarPath ? '/api/users/' + u.id + '/avatar' : '',
@@ -514,6 +658,18 @@ const publicUser = (u) => {
     avatar_updated_at: avatarUpdatedAt,
     nameStyle,
     name_style: nameStyle,
+  }
+}
+
+const isValidPublicKey = (value) => {
+  if (typeof value !== 'string') return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  try {
+    const raw = Buffer.from(trimmed, 'base64')
+    return raw.length === 32
+  } catch (_) {
+    return false
   }
 }
 
@@ -610,6 +766,99 @@ const getChannelAudienceUserIds = (channel) => {
   const admins = listAdminsStmt.all().map((row) => row.id)
   const payload = new Set([...members, normalized.createdBy, ...admins].filter(Boolean))
   return Array.from(payload)
+}
+
+const pendingPushByUser = new Map()
+
+const parsePushSubscription = (raw) => {
+  if (!raw || typeof raw !== 'object') return null
+  const endpoint = typeof raw.endpoint === 'string' ? raw.endpoint.trim() : ''
+  const p256dh = typeof raw.keys?.p256dh === 'string' ? raw.keys.p256dh.trim() : ''
+  const auth = typeof raw.keys?.auth === 'string' ? raw.keys.auth.trim() : ''
+  if (!endpoint || !p256dh || !auth) return null
+  return {
+    endpoint,
+    expirationTime: raw.expirationTime ?? null,
+    keys: { p256dh, auth },
+  }
+}
+
+const queuePushForUsers = (userIds = [], event = {}) => {
+  if (!PUSH_ENABLED) return
+  const now = Date.now()
+  userIds
+    .filter(Boolean)
+    .forEach((targetUserId) => {
+      const existing = pendingPushByUser.get(targetUserId)
+      if (existing) {
+        existing.items.push(event)
+        return
+      }
+      const entry = {
+        items: [event],
+        timer: setTimeout(() => flushQueuedPush(targetUserId), PUSH_BATCH_WINDOW_MS),
+      }
+      pendingPushByUser.set(targetUserId, entry)
+    })
+}
+
+const buildPushPayload = (events = []) => {
+  const valid = events.filter(Boolean)
+  const first = valid[0] || {}
+  const count = valid.length
+  const channels = new Set(valid.map((item) => item.channelName).filter(Boolean))
+  const uniqueChannelCount = channels.size
+  const single = count === 1
+  const title = single
+    ? (first.channelName || first.senderName || 'NE Messenger')
+    : 'NE Messenger'
+  const body = single
+    ? `${first.senderName || 'Пользователь'}: Новое сообщение`
+    : `${count} новых сообщений${uniqueChannelCount > 1 ? ` в ${uniqueChannelCount} чатах` : ''}`
+  const meta = single
+    ? {
+        messageId: first.messageId || null,
+        channelId: first.channelId || null,
+        channelName: first.channelName || null,
+      }
+    : { batch: true, count, channelCount: uniqueChannelCount }
+  return {
+    title,
+    body,
+    tag: single ? `msg:${first.messageId || first.channelId || Date.now()}` : 'batch:new-messages',
+    meta,
+    url: '/',
+    silent: false,
+  }
+}
+
+async function flushQueuedPush(userId) {
+  const entry = pendingPushByUser.get(userId)
+  if (!entry) return
+  pendingPushByUser.delete(userId)
+  if (!entry.items.length) return
+  const subscriptions = listPushSubscriptionsByUserStmt.all(userId)
+  if (!subscriptions.length) return
+  const payload = JSON.stringify(buildPushPayload(entry.items))
+  for (const row of subscriptions) {
+    let subscription
+    try {
+      subscription = JSON.parse(row.subscription_json)
+    } catch (err) {
+      deletePushSubscriptionByEndpointGlobalStmt.run(row.endpoint)
+      continue
+    }
+    try {
+      await webpush.sendNotification(subscription, payload, { TTL: 60, urgency: 'normal' })
+    } catch (err) {
+      const code = err?.statusCode
+      if (code === 404 || code === 410) {
+        deletePushSubscriptionByEndpointGlobalStmt.run(row.endpoint)
+      } else {
+        warn('[PUSH] send failed', 'user=' + userId, 'endpoint=' + row.endpoint, err?.message || err)
+      }
+    }
+  }
 }
 
 const emitChannelListForUser = (userId) => {
@@ -739,6 +988,35 @@ const adminOnly = (req, res, next) => {
   return res.status(403).json({ error: 'forbidden' })
 }
 
+app.get('/api/push/public-key', (_req, res) => {
+  res.json({ enabled: PUSH_ENABLED, publicKey: PUSH_ENABLED ? VAPID_PUBLIC_KEY : null })
+})
+
+app.post('/api/push/subscribe', auth, (req, res) => {
+  if (!PUSH_ENABLED) return res.status(503).json({ error: 'push_disabled' })
+  const parsed = parsePushSubscription(req.body?.subscription)
+  if (!parsed) return res.status(400).json({ error: 'invalid_subscription' })
+  const now = Date.now()
+  upsertPushSubscriptionStmt.run(
+    uuidv4(),
+    req.user.id,
+    parsed.endpoint,
+    JSON.stringify(parsed),
+    now,
+    now,
+    now,
+  )
+  res.json({ ok: true })
+})
+
+app.delete('/api/push/subscribe', auth, (req, res) => {
+  const endpointRaw = typeof req.body?.endpoint === 'string' ? req.body.endpoint : ''
+  const endpoint = endpointRaw.trim()
+  if (!endpoint) return res.status(400).json({ error: 'endpoint_required' })
+  deletePushSubscriptionByEndpointStmt.run(req.user.id, endpoint)
+  res.json({ ok: true })
+})
+
 app.post('/api/invites/claim', (req, res) => {
   const codeRaw = typeof req.body?.code === 'string' ? req.body.code : ''
   const code = codeRaw.trim().toUpperCase()
@@ -853,14 +1131,15 @@ app.delete('/api/friends/:userId', auth, (req, res) => {
 })
 
 app.post('/api/register', (req, res) => {
-  const { username: rawUsername, password: rawPassword, inviteCode: rawInviteCode, inviteClaimToken } = req.body || {}
+  const { username: rawUsername, password: rawPassword, inviteCode: rawInviteCode, inviteClaimToken, publicKey: rawPublicKey } = req.body || {}
   const username = typeof rawUsername === 'string' ? rawUsername.trim() : ''
   const password = typeof rawPassword === 'string' ? rawPassword : ''
+  const publicKey = typeof rawPublicKey === 'string' ? rawPublicKey.trim() : ''
   if (!username || !password) {
     warn('[REGISTER] invalid payload', req.ip)
     return res.status(400).json({ error: 'username_and_password_required' })
   }
-  if (password.length < 8 || !/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+  if (password.length < 6 || !/[a-z]/.test(password) || !/[A-Z]/.test(password)) {
     warn('[REGISTER] weak password', username)
     return res.status(400).json({ error: 'weak_password' })
   }
@@ -898,12 +1177,17 @@ app.post('/api/register', (req, res) => {
       return res.status(400).json({ error: 'invite_claim_invalid' })
     }
   }
+  if (publicKey && !isValidPublicKey(publicKey)) {
+    warn('[REGISTER] invalid public key', username)
+    return res.status(400).json({ error: 'invalid_public_key' })
+  }
   const id = uuidv4()
   const hash = bcrypt.hashSync(password, 10)
   const role = isFirstUser ? 'admin' : 'user'
   const avatarSeed = username.slice(0, 2)
   try {
-    db.prepare('INSERT INTO users (id,username,password_hash,role,avatar_seed) VALUES (?,?,?,?,?)').run(id, username, hash, role, avatarSeed)
+    db.prepare('INSERT INTO users (id,username,password_hash,role,avatar_seed,public_key) VALUES (?,?,?,?,?,?)')
+      .run(id, username, hash, role, avatarSeed, publicKey)
   } catch (e) {
     warn('[REGISTER] username_taken', username)
     return res.status(400).json({ error: 'username_taken' })
@@ -911,11 +1195,24 @@ app.post('/api/register', (req, res) => {
   db.prepare('INSERT OR IGNORE INTO workspace_members (workspace_id,user_id) VALUES (?,?)').run(defaultWs.id, id)
   if (invite) {
     markInviteUsedStmt.run(id, Date.now(), invite.id)
+    const inviterId = invite.created_by
+    if (inviterId && inviterId !== id) {
+      const inviter = selectUserById.get(inviterId)
+      if (inviter) {
+        addFriendship(id, inviterId)
+        emitToUser(id, 'friends:requests:update', { reason: 'invite_auto_friend' })
+        emitToUser(inviterId, 'friends:requests:update', { reason: 'invite_auto_friend' })
+        log('[REGISTER] invite auto-friend', 'new=' + id, 'inviter=' + inviterId, 'invite=' + invite.code)
+      } else {
+        warn('[REGISTER] invite creator missing for auto-friend', 'creator=' + inviterId, 'invite=' + invite.code)
+      }
+    }
   }
-  const token = jwt.sign({ id, username, role, avatar_seed: avatarSeed }, JWT_SECRET, { expiresIn: '30d' })
+  const accessToken = jwt.sign({ id, username, role, avatar_seed: avatarSeed }, JWT_SECRET, { expiresIn: '15m' })
+  const refreshToken = jwt.sign({ id, type: 'refresh' }, JWT_SECRET, { expiresIn: '10y' })
   const user = publicUser({ id, username, role, avatar_seed: avatarSeed })
   log('[REGISTER] success', username, 'role=' + role, invite ? 'invite=' + invite.code : 'no_invite')
-  res.json({ token, user })
+  res.json({ accessToken, refreshToken, user })
   io.emit('user:update', user)
 })
 
@@ -932,9 +1229,40 @@ app.post('/api/login', (req, res) => {
     return res.status(401).json({ error: 'invalid_credentials' })
   }
   db.prepare('INSERT OR IGNORE INTO workspace_members (workspace_id,user_id) VALUES (?,?)').run(defaultWs.id, userRecord.id)
-  const token = jwt.sign({ id: userRecord.id, username: userRecord.username, role: userRecord.role, avatar_seed: userRecord.avatar_seed || '' }, JWT_SECRET, { expiresIn: '30d' })
+  const accessToken = jwt.sign({ id: userRecord.id, username: userRecord.username, role: userRecord.role, avatar_seed: userRecord.avatar_seed || '' }, JWT_SECRET, { expiresIn: '15m' })
+  const refreshToken = jwt.sign({ id: userRecord.id, type: 'refresh' }, JWT_SECRET, { expiresIn: '10y' })
   log('[LOGIN] success', username)
-  res.json({ token, user: publicUser(userRecord) })
+  res.json({ accessToken, refreshToken, user: publicUser(userRecord) })
+})
+
+app.post('/api/refresh', (req, res) => {
+  const { refreshToken } = req.body || {}
+  if (!refreshToken) {
+    return res.status(401).json({ error: 'no_refresh_token' })
+  }
+  try {
+    const decoded = jwt.verify(refreshToken, JWT_SECRET)
+    if (decoded.type !== 'refresh') {
+      warn('[REFRESH] invalid token type', 'token_type=' + decoded.type)
+      return res.status(401).json({ error: 'invalid_token_type' })
+    }
+    const userId = decoded.id
+    const userRecord = selectUserById.get(userId)
+    if (!userRecord) {
+      warn('[REFRESH] user not found', 'user=' + userId)
+      return res.status(401).json({ error: 'user_not_found' })
+    }
+    const accessToken = jwt.sign(
+      { id: userRecord.id, username: userRecord.username, role: userRecord.role, avatar_seed: userRecord.avatar_seed || '' },
+      JWT_SECRET,
+      { expiresIn: '15m' }
+    )
+    log('[REFRESH] success', 'user=' + userId)
+    res.json({ accessToken })
+  } catch (e) {
+    warn('[REFRESH] invalid token', e.message)
+    return res.status(401).json({ error: 'invalid_refresh_token' })
+  }
 })
 
 app.get('/api/invites', auth, (req, res) => {
@@ -1233,7 +1561,7 @@ app.get('/api/channels/:id/avatar', (req, res) => {
 
 app.get('/api/users', auth, (req, res) => {
   const users = db
-    .prepare('SELECT id, username, display_name, profile_status, profile_background, role, avatar_seed, avatar_url, avatar_updated_at, name_style FROM users ORDER BY username ASC')
+    .prepare('SELECT id, username, display_name, profile_status, profile_background, user_status, role, public_key, avatar_seed, avatar_url, avatar_updated_at, name_style FROM users ORDER BY username ASC')
     .all()
   log('[USERS] list', 'by=' + req.user.id, 'count=' + users.length)
   res.json({ users: users.map(publicUser) })
@@ -1247,6 +1575,102 @@ app.get('/api/profile', auth, (req, res) => {
   }
   log('[PROFILE] fetch', 'user=' + req.user.id)
   res.json({ profile: publicUser(user) })
+})
+
+app.post('/api/profile/e2e-key', auth, (req, res) => {
+  const rawPublicKey = typeof req.body?.publicKey === 'string' ? req.body.publicKey.trim() : ''
+  if (!isValidPublicKey(rawPublicKey)) return res.status(400).json({ error: 'invalid_public_key' })
+  updatePublicKeyStmt.run(rawPublicKey, req.user.id)
+  const user = selectUserById.get(req.user.id)
+  if (!user) return res.status(404).json({ error: 'not_found' })
+  log('[E2E] public key updated', req.user.id)
+  res.json({ user: publicUser(user) })
+})
+
+app.get('/api/channels/:id/e2e-key', auth, (req, res) => {
+  const requested = req.params.id
+  if (!requested) return res.status(400).json({ error: 'invalid_channel' })
+  let channelId = requested
+  if (requested.startsWith('dm:')) {
+    if (!canAccessDirectChannel(requested, req.user.id)) return res.status(404).json({ error: 'not_found' })
+    const normalized = normalizeDirectChannelId(requested)
+    if (!normalized) return res.status(404).json({ error: 'not_found' })
+    channelId = normalized
+  } else {
+    const viewer = selectUserById.get(req.user.id)
+    if (!viewer) return res.status(404).json({ error: 'not_found' })
+    const access = resolveChannelAccess(viewer, requested)
+    if (!access.allowed) return res.status(404).json({ error: 'not_found' })
+    channelId = requested
+  }
+  const share = selectChannelKeyStmt.get(channelId, req.user.id)
+  if (!share) return res.status(404).json({ error: 'not_found' })
+  const sender = selectUserById.get(share.sender_id)
+  res.json({
+    key: {
+      channelId: share.channel_id,
+      userId: share.user_id,
+      wrappedKey: share.wrapped_key,
+      nonce: share.nonce,
+      senderId: share.sender_id,
+      senderPublicKey: sender?.public_key || '',
+      keyVersion: share.key_version || 1,
+      updatedAt: share.updated_at || 0,
+    },
+  })
+})
+
+app.post('/api/channels/:id/e2e-keys', auth, (req, res) => {
+  const requested = req.params.id
+  if (!requested) return res.status(400).json({ error: 'invalid_channel' })
+  const shares = Array.isArray(req.body?.shares) ? req.body.shares : []
+  if (!shares.length) return res.status(400).json({ error: 'invalid_payload' })
+  if (shares.length > 5000) return res.status(400).json({ error: 'too_many_shares' })
+
+  let channelId = requested
+  let allowedTargets = null
+
+  if (requested.startsWith('dm:')) {
+    if (!canAccessDirectChannel(requested, req.user.id)) return res.status(404).json({ error: 'not_found' })
+    const normalized = normalizeDirectChannelId(requested)
+    if (!normalized) return res.status(404).json({ error: 'not_found' })
+    channelId = normalized
+    const parsed = parseDirectChannelId(normalized)
+    if (!parsed) return res.status(404).json({ error: 'not_found' })
+    allowedTargets = new Set([parsed.first, parsed.second])
+  } else {
+    const viewer = selectUserById.get(req.user.id)
+    if (!viewer) return res.status(404).json({ error: 'not_found' })
+    const access = resolveChannelAccess(viewer, requested)
+    if (!access.allowed) return res.status(404).json({ error: 'not_found' })
+    channelId = requested
+    const channel = selectChannelByIdStmt.get(requested)
+    if (!channel) return res.status(404).json({ error: 'not_found' })
+    if (channel.is_private) {
+      const members = listChannelMembersStmt.all(requested)
+      allowedTargets = new Set(members.map((row) => row.user_id))
+      if (channel.created_by) allowedTargets.add(channel.created_by)
+      allowedTargets.add(req.user.id)
+    }
+  }
+
+  const now = Date.now()
+  let written = 0
+  shares.forEach((entry) => {
+    const userId = typeof entry?.userId === 'string' ? entry.userId.trim() : ''
+    const wrappedKey = typeof entry?.wrappedKey === 'string' ? entry.wrappedKey.trim() : ''
+    const nonce = typeof entry?.nonce === 'string' ? entry.nonce.trim() : ''
+    let keyVersion = parseInt(entry?.keyVersion, 10)
+    if (!Number.isFinite(keyVersion) || keyVersion <= 0) keyVersion = 1
+    if (!userId || !wrappedKey || !nonce) return
+    if (allowedTargets && !allowedTargets.has(userId)) return
+    const target = selectUserById.get(userId)
+    if (!target) return
+    upsertChannelKeyStmt.run(channelId, userId, wrappedKey, nonce, req.user.id, keyVersion, now)
+    written += 1
+  })
+  log('[E2E] channel keys upsert', 'channel=' + channelId, 'actor=' + req.user.id, 'count=' + written)
+  res.json({ ok: true, count: written })
 })
 
 app.post('/api/profile/avatar', auth, (req, res) => {
@@ -1285,6 +1709,42 @@ app.post('/api/profile/avatar', auth, (req, res) => {
   })
 })
 
+app.post('/api/media', auth, (req, res) => {
+  mediaUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const code = err.code === 'LIMIT_FILE_SIZE' ? 'media_too_large' : 'invalid_media'
+      return res.status(400).json({ error: code })
+    }
+    if (!req.file) return res.status(400).json({ error: 'invalid_media' })
+    const relPath = path.relative(UPLOAD_DIR, req.file.path).replace(/\\/g, '/')
+    const originalName = typeof req.file.originalname === 'string' ? req.file.originalname : req.file.filename
+    const payload = {
+      path: relPath,
+      url: `/api/media/${encodeURIComponent(path.basename(relPath))}`,
+      name: originalName,
+      mime: req.file.mimetype || 'application/octet-stream',
+      size: req.file.size || 0,
+      uploadedAt: Date.now(),
+    }
+    log('[MEDIA] uploaded', 'user=' + req.user.id, 'file=' + path.basename(relPath), 'mime=' + payload.mime)
+    res.json({ media: payload })
+  })
+})
+
+app.get('/api/media/:name', (req, res) => {
+  const raw = typeof req.params?.name === 'string' ? req.params.name : ''
+  const safeName = path.basename(raw)
+  const mediaPath = path.resolve(path.join(MEDIA_DIR, safeName))
+  if (!mediaPath.startsWith(path.resolve(MEDIA_DIR))) return res.status(403).json({ error: 'forbidden' })
+  if (!fs.existsSync(mediaPath)) return res.status(404).json({ error: 'not_found' })
+  if (req.query?.download === '1') {
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName.replace(/"/g, '')}"`)
+    res.setHeader('Content-Type', 'application/octet-stream')
+  }
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  res.sendFile(mediaPath)
+})
+
 app.post('/api/profile/display-name', auth, (req, res) => {
   const raw = typeof req.body?.displayName === 'string' ? req.body.displayName.trim() : ''
   if (raw && (raw.length < 2 || raw.length > 32)) {
@@ -1315,6 +1775,17 @@ app.post('/api/profile/background', auth, (req, res) => {
     return res.status(400).json({ error: 'invalid_background' })
   }
   updateProfileBackgroundStmt.run(raw, req.user.id)
+  const updated = selectUserById.get(req.user.id)
+  const payload = publicUser(updated)
+  io.emit('user:update', payload)
+  res.json({ user: payload })
+})
+
+app.post('/api/profile/presence-status', auth, (req, res) => {
+  const raw = typeof req.body?.status === 'string' ? req.body.status.trim().toLowerCase() : ''
+  const allowed = new Set(['online', 'idle', 'dnd', 'invisible'])
+  if (!allowed.has(raw)) return res.status(400).json({ error: 'invalid_status' })
+  updateUserStatusStmt.run(raw, req.user.id)
   const updated = selectUserById.get(req.user.id)
   const payload = publicUser(updated)
   io.emit('user:update', payload)
@@ -1394,6 +1865,7 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
   }
   db.prepare('DELETE FROM messages WHERE sender_id=?').run(id)
   db.prepare('DELETE FROM workspace_members WHERE user_id=?').run(id)
+  deletePushSubscriptionsByUserStmt.run(id)
   db.prepare('DELETE FROM users WHERE id=?').run(id)
   const sid = onlineUsers.get(id)
   if (sid) {
@@ -1524,6 +1996,23 @@ const channelAvatarUpload = multer({
   fileFilter: imageFileFilter,
 })
 
+const mediaStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true })
+    cb(null, MEDIA_DIR)
+  },
+  filename: (_req, file, cb) => {
+    const ext = (path.extname(file.originalname || '') || '').toLowerCase()
+    const safeBase = sanitizeForPath(path.basename(file.originalname || '', ext), 'media')
+    cb(null, `${Date.now()}-${safeBase}-${uuidv4().slice(0, 8)}${ext}`)
+  },
+})
+
+const mediaUpload = multer({
+  storage: mediaStorage,
+  limits: { fileSize: 25 * 1024 * 1024 },
+})
+
 app.delete('/api/messages/:id', auth, (req, res) => {
   const message = findMessageById.get(req.params.id)
   if (!message) return res.status(404).json({ error: 'not_found' })
@@ -1585,7 +2074,7 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   }
 
   const updatedAtRaw = Date.now()
-  updateMessageContentStmt(encryptText(rawContent), updatedAtRaw, nextReplyId, message.id)
+  updateMessageContentStmt(rawContent, updatedAtRaw, nextReplyId, message.id)
 
   const fresh = selectMessageFullById.get(message.id)
   const payload = publicMessage(fresh)
@@ -1686,16 +2175,35 @@ const formatInvite = (invite) => ({
 
 
 io.use((socket, next) => {
-  const token = socket.handshake.auth?.token
-  if (!token) return next(new Error('no_token'))
+  const token = socket.handshake.auth?.token || socket.handshake.auth?.accessToken
+  const transport = socket.handshake.query?.transport || socket.conn?.transport?.name || 'unknown'
+  const origin = socket.handshake.headers?.origin || '-'
+  const forwarded = socket.handshake.headers?.['x-forwarded-for'] || '-'
+  const addr = socket.handshake.address || socket.conn?.remoteAddress || '-'
+  if (!token) {
+    warn('[SOCKET] handshake rejected', 'reason=no_token', 'transport=' + transport, 'origin=' + origin, 'ip=' + addr, 'xff=' + forwarded)
+    return next(new Error('no_token'))
+  }
   try {
     socket.user = jwt.verify(token, JWT_SECRET)
-    log('[SOCKET] handshake', 'user=' + (socket.user.username || socket.user.id))
+    if (socket.user.type === 'refresh') {
+      warn('[SOCKET] handshake rejected', 'reason=invalid_token_type', 'transport=' + transport, 'origin=' + origin, 'ip=' + addr)
+      return next(new Error('invalid_token_type'))
+    }
+    log('[SOCKET] handshake ok', 'user=' + (socket.user.username || socket.user.id), 'transport=' + transport, 'origin=' + origin, 'ip=' + addr)
     next()
   } catch (e) {
-    warn('[SOCKET] invalid token', e.message)
+    warn('[SOCKET] handshake rejected', 'reason=invalid_token', e.message, 'transport=' + transport, 'origin=' + origin, 'ip=' + addr)
     next(new Error('invalid_token'))
   }
+})
+
+io.engine.on('connection_error', (err) => {
+  const context = err?.context || {}
+  const origin = context?.request?.headers?.origin || '-'
+  const xff = context?.request?.headers?.['x-forwarded-for'] || '-'
+  const addr = context?.request?.socket?.remoteAddress || '-'
+  warn('[SOCKET:engine] connection_error', 'code=' + (err?.code ?? '-'), 'message=' + (err?.message ?? '-'), 'origin=' + origin, 'ip=' + addr, 'xff=' + xff)
 })
 
 io.on('connection', (socket) => {
@@ -1840,8 +2348,7 @@ io.on('connection', (socket) => {
     }
     const id = uuidv4()
     const now = Date.now()
-    const encryptedContent = encryptText(content)
-    insertMessage.run(id, targetChannel, userId, encryptedContent, now, replyTargetId)
+    insertMessage.run(id, targetChannel, userId, content, now, replyTargetId)
     const inserted = selectMessageFullById.get(id)
     const payload = publicMessage(inserted)
     io.to(targetChannel).emit('message:new', payload)
@@ -1854,6 +2361,27 @@ io.on('connection', (socket) => {
         if (!sid || room.has(sid)) return
         io.to(sid).emit('message:new', payload)
       })
+    }
+    try {
+      const senderUser = selectUserById.get(userId)
+      const senderName = senderUser?.display_name || senderUser?.username || 'Пользователь'
+      const recipients = directParticipants
+        ? directParticipants
+        : getChannelAudienceUserIds(selectChannelByIdStmt.get(targetChannel))
+      const pushRecipients = recipients.filter((id) => id && id !== userId && !onlineUsers.has(id))
+      if (pushRecipients.length) {
+        const channelName = directParticipants
+          ? senderName
+          : (selectChannelByIdStmt.get(targetChannel)?.name || 'Чат')
+        queuePushForUsers(pushRecipients, {
+          messageId: payload.id,
+          channelId: targetChannel,
+          channelName,
+          senderName,
+        })
+      }
+    } catch (err) {
+      warn('[PUSH] queue failed', err?.message || err)
     }
     clearTypingForChannel(targetChannel)
   })
@@ -1923,7 +2451,20 @@ process.on('unhandledRejection', (reason) => {
   logError('Unhandled rejection', reason)
 })
 
-server.listen(PORT, () => log('Server listening on', PORT))
+process.on('uncaughtException', (err) => {
+  logError('Uncaught exception', err?.stack || err?.message || err)
+})
+
+process.on('warning', (warning) => {
+  warn('Process warning', warning?.name || 'Warning', warning?.message || '')
+})
+
+server.listen(PORT, () => {
+  log('Server listening on', PORT)
+  log('[BOOT] CORS origins =', origins.join(','))
+  log('[BOOT] NODE_ENV =', process.env.NODE_ENV || 'development')
+  log('[BOOT] uploads dir =', path.resolve(UPLOAD_DIR))
+})
 
 
 
