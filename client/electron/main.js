@@ -17,6 +17,7 @@ let updaterInitialized = false
 let updateCheckInProgress = false
 let updateDownloadInProgress = false
 let lastUpdateStatus = null
+let forceExitTimer = null
 
 const buildUpdateStatusPayload = (status, extra = {}) => ({
   status,
@@ -137,6 +138,33 @@ const hideWindowToTray = () => {
   if (process.platform === 'darwin' && app.dock) app.dock.hide()
 }
 
+const requestAppQuit = () => {
+  forceQuit = true
+  if (forceExitTimer) {
+    clearTimeout(forceExitTimer)
+    forceExitTimer = null
+  }
+  if (tray) {
+    tray.destroy()
+    tray = null
+  }
+  try {
+    if (win && !win.isDestroyed()) {
+      win.removeAllListeners('close')
+      win.close()
+    }
+  } catch (err) {
+    console.warn('[main] window close before quit failed', err)
+  }
+  app.quit()
+  // Fallback: force terminate if graceful quit is stuck and blocks update installer.
+  forceExitTimer = setTimeout(() => {
+    try {
+      app.exit(0)
+    } catch (_) {}
+  }, 2000)
+}
+
 const createTray = () => {
   if (tray) return tray
   const trayIcon = loadTrayIcon()
@@ -152,14 +180,7 @@ const createTray = () => {
     },
     {
       label: 'Quit',
-      click: () => {
-        forceQuit = true
-        if (tray) {
-          tray.destroy()
-          tray = null
-        }
-        app.quit()
-      },
+      click: () => requestAppQuit(),
     },
   ])
   tray.setContextMenu(contextMenu)
@@ -470,6 +491,10 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   forceQuit = true
+  if (forceExitTimer) {
+    clearTimeout(forceExitTimer)
+    forceExitTimer = null
+  }
   if (tray) {
     tray.destroy()
     tray = null

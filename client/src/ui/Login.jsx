@@ -84,7 +84,7 @@ export default function Login() {
     setProcessing(true)
     try {
       const { data } = await axios.post(server + '/api/login', { username, password })
-      setAuth(data.token, data.user, { persist: rememberLogin })
+      setAuth(data.accessToken, data.user, { persist: rememberLogin, refreshToken: data.refreshToken })
     } catch (err) {
       console.error(err)
       const error = err?.response?.data?.error
@@ -163,12 +163,12 @@ export default function Login() {
       setStatus('Введите имя пользователя')
       return
     }
-    if (!password || password.length < 8) {
-      setStatus('Пароль должен содержать минимум 8 символов, включая буквы и цифры')
+    if (!password || password.length < 6) {
+      setStatus('Пароль должен содержать минимум 6 символов')
       return
     }
-    if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
-      setStatus('Пароль должен содержать буквы и цифры')
+    if (!/[a-z]/.test(password) || !/[A-Z]/.test(password)) {
+      setStatus('Пароль должен содержать строчные и заглавные буквы')
       return
     }
     if (password !== passwordConfirm) {
@@ -185,16 +185,16 @@ export default function Login() {
         inviteClaimToken: inviteInfo.claimToken,
       }
       const { data } = await axios.post(server + '/api/register', payload)
-      setAuth(data.token, data.user, { persist: rememberLogin })
+      setAuth(data.accessToken, data.user, { persist: rememberLogin, refreshToken: data.refreshToken })
       if (avatarFile) {
         try {
           const form = new FormData()
           form.append('avatar', avatarFile)
-          const headers = { Authorization: `Bearer ${data.token}` }
+          const headers = { Authorization: `Bearer ${data.accessToken}` }
           const endpoint = server.endsWith('/') ? server + 'api/profile/avatar' : server + '/api/profile/avatar'
           const avatarResponse = await axios.post(endpoint, form, { headers })
           if (avatarResponse?.data?.user) {
-            setAuth(data.token, avatarResponse.data.user, { persist: rememberLogin })
+            setAuth(data.accessToken, avatarResponse.data.user, { persist: rememberLogin, refreshToken: data.refreshToken })
           }
         } catch (avatarErr) {
           console.error(avatarErr)
@@ -208,7 +208,7 @@ export default function Login() {
           case 'username_taken':
             return 'Такой логин уже используется'
           case 'weak_password':
-            return 'Пароль должен содержать минимум 8 символов, включая буквы и цифры'
+            return 'Пароль должен содержать минимум 6 символов, строчные и заглавные буквы'
           case 'invite_expired':
             return 'Срок действия кода истёк'
           case 'invite_used':
@@ -337,7 +337,7 @@ export default function Login() {
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          placeholder="Пароль (мин. 8 символов, буквы и цифры)"
+          placeholder="Пароль (мин. 6 символов, a-z и A-Z)"
           className="tg-input"
           autoComplete="new-password"
         />

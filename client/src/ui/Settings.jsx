@@ -9,6 +9,16 @@ export default function Settings() {
   const logout = useStore((s) => s.logout)
   const buildAvatarUrl = useStore((s) => s.buildAvatarUrl)
   const nameStyleValue = useStore((s) => s.nameStyle)
+  const notificationSettings = useStore((s) => s.notificationSettings)
+  const setNotificationSettings = useStore((s) => s.setNotificationSettings)
+  const resetNotificationSettings = useStore((s) => s.resetNotificationSettings)
+  const syncPushNotifications = useStore((s) => s.syncPushNotifications)
+  const audioInputDeviceId = useStore((s) => s.audioInputDeviceId)
+  const audioOutputDeviceId = useStore((s) => s.audioOutputDeviceId)
+  const voiceServerUrl = useStore((s) => s.voiceServerUrl)
+  const setAudioInputDeviceId = useStore((s) => s.setAudioInputDeviceId)
+  const setAudioOutputDeviceId = useStore((s) => s.setAudioOutputDeviceId)
+  const setVoiceServerUrl = useStore((s) => s.setVoiceServerUrl)
 
   const [autostartSupported, setAutostartSupported] = useState(false)
   const [autostartEnabled, setAutostartEnabled] = useState(false)
@@ -17,6 +27,12 @@ export default function Settings() {
   const [uiScale, setUiScale] = useState(1)
   const [activeSection, setActiveSection] = useState('account')
   const [settingsSearch, setSettingsSearch] = useState('')
+  const [audioInputs, setAudioInputs] = useState([])
+  const [audioOutputs, setAudioOutputs] = useState([])
+  const [audioDevicesLoading, setAudioDevicesLoading] = useState(false)
+  const [audioDevicesError, setAudioDevicesError] = useState('')
+  const [voiceServerDraft, setVoiceServerDraft] = useState('')
+  const [voiceServerStatus, setVoiceServerStatus] = useState(null)
   const [appVersion, setAppVersion] = useState('')
   const [updateState, setUpdateState] = useState({
     status: 'idle',
@@ -135,6 +151,32 @@ export default function Settings() {
     const timer = setTimeout(() => setAutostartStatus(null), 4000)
     return () => clearTimeout(timer)
   }, [autostartStatus])
+
+  const reloadAudioDevices = useCallback(async () => {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) return
+    setAudioDevicesLoading(true)
+    setAudioDevicesError('')
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      const inputs = devices.filter((d) => d.kind === 'audioinput')
+      const outputs = devices.filter((d) => d.kind === 'audiooutput')
+      setAudioInputs(inputs)
+      setAudioOutputs(outputs)
+    } catch (err) {
+      console.error('audio devices enumerate failed', err)
+      setAudioDevicesError('Не удалось получить список аудио устройств')
+    } finally {
+      setAudioDevicesLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    reloadAudioDevices()
+  }, [reloadAudioDevices])
+
+  useEffect(() => {
+    setVoiceServerDraft(voiceServerUrl || '')
+  }, [voiceServerUrl])
 
   const handleToggleAutostart = async () => {
     if (typeof window === 'undefined' || !autostartSupported) return
@@ -297,6 +339,7 @@ export default function Settings() {
       { id: 'invites', label: 'Приглашения', group: 'user' },
       { id: 'security', label: 'Пароль и безопасность', group: 'user' },
       { id: 'appearance', label: 'Внешний вид', group: 'app' },
+      { id: 'notifications', label: 'Уведомления', group: 'app' },
       { id: 'system', label: 'Системные', group: 'app' },
       { id: 'updates', label: 'Обновления', group: 'app' },
       { id: 'session', label: 'Сессия', group: 'app' },
@@ -340,6 +383,71 @@ export default function Settings() {
     <section className="panel rounded-3xl px-6 py-5 space-y-4">
       <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Системные</div>
       <div className="space-y-4 text-sm text-white/80">
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="text-sm text-white/80">Микрофон</div>
+              <div className="text-xs text-white/50">Устройство для записи голосовых</div>
+            </div>
+            <button type="button" onClick={reloadAudioDevices} className="tg-button text-xs" disabled={audioDevicesLoading}>
+              {audioDevicesLoading ? 'Обновление...' : 'Обновить'}
+            </button>
+          </div>
+          <select
+            value={audioInputDeviceId || 'default'}
+            onChange={(event) => setAudioInputDeviceId(event.target.value)}
+            className="tg-input text-sm"
+          >
+            <option value="default">Системный по умолчанию</option>
+            {audioInputs.map((device, index) => (
+              <option key={device.deviceId || `in-${index}`} value={device.deviceId || 'default'}>
+                {device.label || `Микрофон ${index + 1}`}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-3">
+          <div>
+            <div className="text-sm text-white/80">Устройство воспроизведения</div>
+            <div className="text-xs text-white/50">Куда выводить голосовые и аудио (если поддерживается)</div>
+          </div>
+          <select
+            value={audioOutputDeviceId || 'default'}
+            onChange={(event) => setAudioOutputDeviceId(event.target.value)}
+            className="tg-input text-sm"
+          >
+            <option value="default">Системный по умолчанию</option>
+            {audioOutputs.map((device, index) => (
+              <option key={device.deviceId || `out-${index}`} value={device.deviceId || 'default'}>
+                {device.label || `Выход ${index + 1}`}
+              </option>
+            ))}
+          </select>
+          {audioDevicesError && <div className="text-xs text-red-300">{audioDevicesError}</div>}
+        </div>
+        <div className="space-y-3">
+          <div>
+            <div className="text-sm text-white/80">Voice сервер (временный)</div>
+            <div className="text-xs text-white/50">Адрес SFU для звонков в текущей сессии приложения</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={voiceServerDraft}
+              onChange={(event) => setVoiceServerDraft(event.target.value)}
+              placeholder="http://localhost:4010"
+              className="tg-input text-sm"
+            />
+            <button type="button" onClick={applyVoiceServer} className="tg-button text-xs whitespace-nowrap">
+              Применить
+            </button>
+          </div>
+          {voiceServerStatus && (
+            <div className={voiceServerStatus.type === 'error' ? 'text-xs text-red-300' : 'text-xs text-sky-300'}>
+              {voiceServerStatus.message}
+            </div>
+          )}
+        </div>
         <div className="flex items-center justify-between gap-4">
           <div>
             <div className="text-sm text-white/80">Автозапуск</div>
@@ -369,6 +477,67 @@ export default function Settings() {
             {autostartStatus.message}
           </div>
         )}
+      </div>
+    </section>
+  )
+
+  const renderToggle = (key, title, description) => {
+    const value = Boolean(notificationSettings?.[key])
+    const handleToggle = () => {
+      const nextValue = !value
+      setNotificationSettings((prev) => ({ ...prev, [key]: nextValue }))
+      if (key === 'pushEnabled') {
+        setTimeout(() => {
+          syncPushNotifications().catch(() => {})
+        }, 0)
+      }
+    }
+    return (
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <div className="text-sm text-white/80">{title}</div>
+          <div className="text-xs text-white/50">{description}</div>
+        </div>
+        <button
+          type="button"
+          onClick={handleToggle}
+          className={`relative inline-flex h-7 w-14 items-center rounded-full border border-white/15 px-1 transition-all duration-200 ${
+            value ? 'bg-sky-400/90 shadow-[0_0_12px_rgba(56,189,248,0.4)]' : 'bg-white/10'
+          } cursor-pointer hover:bg-white/15`}
+        >
+          <span
+            className={`h-5 w-5 rounded-full bg-white shadow transition-transform duration-200 ease-out ${
+              value ? 'translate-x-7' : 'translate-x-0'
+            }`}
+          />
+        </button>
+      </div>
+    )
+  }
+
+  const applyVoiceServer = () => {
+    const ok = setVoiceServerUrl(voiceServerDraft)
+    setVoiceServerStatus(
+      ok
+        ? { type: 'success', message: 'Временный voice-сервер применён' }
+        : { type: 'error', message: 'Введите корректный адрес voice-сервера' },
+    )
+  }
+
+  const renderNotifications = () => (
+    <section className="panel rounded-3xl px-6 py-5 space-y-4">
+      <div className="text-white/70 text-xs uppercase tracking-[0.25em]">Уведомления</div>
+      <div className="space-y-4 text-sm text-white/80">
+        {renderToggle('desktopEnabled', 'Desktop уведомления', 'Показывать системные уведомления о новых сообщениях')}
+        {renderToggle('pushEnabled', 'Web Push', 'Получать push, когда вкладка/приложение закрыты')}
+        {renderToggle('mentionsOnly', 'Только упоминания', 'Сократить шум: уведомлять только о важных сообщениях')}
+        {renderToggle('soundEnabled', 'Звук уведомлений', 'Проигрывать короткий звук при новом сообщении')}
+        {renderToggle('dndEnabled', 'Режим не беспокоить', 'Временно отключить все входящие уведомления')}
+      </div>
+      <div className="pt-2">
+        <button type="button" onClick={resetNotificationSettings} className="tg-button text-xs">
+          Сбросить настройки уведомлений
+        </button>
       </div>
     </section>
   )
@@ -519,6 +688,7 @@ export default function Settings() {
           <Profile embedded includeInvites={false} includePassword includeProfileEditor={false} />
         )}
         {activeSection === 'appearance' && renderAppearance()}
+        {activeSection === 'notifications' && renderNotifications()}
         {activeSection === 'system' && renderSystem()}
         {activeSection === 'updates' && renderUpdates()}
         {activeSection === 'session' && renderSession()}

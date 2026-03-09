@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 
 const fallbackInitials = (value) => {
   if (!value) return '??'
@@ -9,6 +9,49 @@ const fallbackInitials = (value) => {
 
 export default function AvatarImage({ user, size = 36, className = '', src, fallback }) {
   const [broken, setBroken] = useState(false)
+  const [resolvedSrc, setResolvedSrc] = useState(null)
+
+  useEffect(() => {
+    setBroken(false)
+  }, [src])
+
+  useEffect(() => {
+    if (!src || typeof src !== 'string') {
+      setResolvedSrc(null)
+      return undefined
+    }
+    if (src.startsWith('blob:') || src.startsWith('data:') || !/ngrok-free\.(dev|app)/i.test(src)) {
+      setResolvedSrc(src)
+      return undefined
+    }
+
+    const controller = new AbortController()
+    let objectUrl = null
+
+    fetch(src, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: { 'ngrok-skip-browser-warning': 'true' },
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error(`avatar_http_${response.status}`)
+        return response.blob()
+      })
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob)
+        setResolvedSrc(objectUrl)
+      })
+      .catch((err) => {
+        if (err?.name === 'AbortError') return
+        setResolvedSrc(src)
+      })
+
+    return () => {
+      controller.abort()
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [src])
 
   const displayName = useMemo(
     () => fallback || user?.displayName || user?.username || '',
@@ -17,9 +60,9 @@ export default function AvatarImage({ user, size = 36, className = '', src, fall
   const initials = useMemo(() => fallbackInitials(displayName), [displayName])
   const imageSrc = useMemo(() => {
     if (broken) return null
-    if (src && typeof src === 'string' && src.length) return src
+    if (resolvedSrc && typeof resolvedSrc === 'string' && resolvedSrc.length) return resolvedSrc
     return null
-  }, [src, broken])
+  }, [resolvedSrc, broken])
 
   return (
     <div

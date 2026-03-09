@@ -19,6 +19,7 @@ function AppInner() {
   const retryDelay = useStore((s) => s.retryDelay)
   const connectionError = useStore((s) => s.connectionError)
   const triggerReconnectNow = useStore((s) => s.triggerReconnectNow)
+  const openServerModal = useStore((s) => s.openServerModal)
   const fetchFriends = useStore((s) => s.fetchFriends)
   const fetchFriendRequests = useStore((s) => s.fetchFriendRequests)
   const openChat = useStore((s) => s.openChat)
@@ -108,7 +109,8 @@ function AppInner() {
     return null
   }, [token, connectionStatus, countdownSeconds, connectionError])
 
-  const manualActionLabel = connectionStatus === 'awaiting_manual' ? 'Подключиться сейчас' : undefined
+  const manualActionLabel = connectionStatus === 'awaiting_manual' ? 'Переподключиться' : undefined
+  const serverActionLabel = connectionStatus === 'awaiting_manual' ? 'Ввести адрес' : undefined
   return (
     <div className="h-full w-full app-bg">
       <SplashScreen
@@ -118,6 +120,8 @@ function AppInner() {
         statusText={splashStatusText}
         secondaryActionLabel={manualActionLabel}
         onSecondaryAction={manualActionLabel ? triggerReconnectNow : undefined}
+        tertiaryActionLabel={serverActionLabel}
+        onTertiaryAction={serverActionLabel ? openServerModal : undefined}
       />
 
       <div className="h-full w-full overflow-hidden relative">

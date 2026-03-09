@@ -4,8 +4,8 @@ import axios from 'axios'
 import nacl from 'tweetnacl'
 import * as u8 from 'tweetnacl-util'
 import { showNewMessageNotification } from '../utils/notifications'
+import { removeWebPushSubscription, syncWebPushSubscription } from '../utils/webPush'
 
-const encoder = new TextEncoder()
 const storageKeyForChannel = (cid) => `chkey:${cid}`
 const APPEARANCE_STORAGE_KEY = 'nemessenger:appearance'
 const AUTH_STORAGE_KEY = 'nemessenger:auth'
@@ -14,6 +14,10 @@ const NAME_STYLE_KEY = 'nemessenger:name-style'
 const PROFILE_STATUS_KEY = 'nemessenger:profile-status'
 const PROFILE_BACKGROUND_KEY = 'nemessenger:profile-background'
 const SERVER_URL_KEY = 'nemessenger:server-url'
+const VOICE_SERVER_URL_KEY = 'nemessenger:voice-server-url'
+const AUDIO_INPUT_DEVICE_KEY = 'nemessenger:audio-input-device'
+const AUDIO_OUTPUT_DEVICE_KEY = 'nemessenger:audio-output-device'
+const NOTIFICATION_SETTINGS_KEY = 'nemessenger:notification-settings'
 const DEFAULT_APPEARANCE = Object.freeze({
   backgroundMode: 'gradient',
   gradient: { angle: 135, colors: ['#11131f', '#090a0f', '#141b2d'] },
@@ -29,6 +33,15 @@ const DEFAULT_NAME_STYLE = Object.freeze({
   effect: 'minimal',
   color: '#8ec5ff',
 })
+const DEFAULT_NOTIFICATION_SETTINGS = Object.freeze({
+  desktopEnabled: true,
+  pushEnabled: true,
+  soundEnabled: false,
+  mentionsOnly: false,
+  dndEnabled: false,
+})
+const ALLOWED_NAME_FONTS = new Set(['rubik', 'inter', 'mono', 'serif', 'display', 'georgia'])
+const ALLOWED_NAME_EFFECTS = new Set(['minimal', 'gradient', 'neon', 'glow', 'outline'])
 
 const clamp = (value, min, max) => {
   if (!Number.isFinite(value)) return min
@@ -172,6 +185,14 @@ const peerFromDirectChannel = (channelId, selfId) => {
 }
 
 const normalizeNameStyle = (raw) => {
+  const sanitizeColor = (value) => {
+    if (typeof value !== 'string') return DEFAULT_NAME_STYLE.color
+    const color = value.trim().slice(0, 32)
+    const isHex = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(color)
+    const isRgb = /^rgba?\(\s*(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\s*,\s*(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])\s*,\s*(\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])(\s*,\s*(0|0?\.\d+|1(\.0+)?))?\s*\)$/.test(color)
+    const isHsl = /^hsla?\(\s*\d{1,3}\s*,\s*\d{1,3}%\s*,\s*\d{1,3}%(\s*,\s*(0|0?\.\d+|1(\.0+)?))?\s*\)$/.test(color)
+    return isHex || isRgb || isHsl ? color : DEFAULT_NAME_STYLE.color
+  }
   if (!raw) return DEFAULT_NAME_STYLE
   if (typeof raw === 'string') {
     try {
@@ -180,10 +201,12 @@ const normalizeNameStyle = (raw) => {
       return DEFAULT_NAME_STYLE
     }
   }
+  const font = typeof raw.font === 'string' && ALLOWED_NAME_FONTS.has(raw.font) ? raw.font : DEFAULT_NAME_STYLE.font
+  const effect = typeof raw.effect === 'string' && ALLOWED_NAME_EFFECTS.has(raw.effect) ? raw.effect : DEFAULT_NAME_STYLE.effect
   return {
-    font: typeof raw.font === 'string' ? raw.font : DEFAULT_NAME_STYLE.font,
-    effect: typeof raw.effect === 'string' ? raw.effect : DEFAULT_NAME_STYLE.effect,
-    color: typeof raw.color === 'string' ? raw.color : DEFAULT_NAME_STYLE.color,
+    font,
+    effect,
+    color: sanitizeColor(raw.color),
   }
 }
 
@@ -193,28 +216,31 @@ const normalizeUser = (raw) => {
     id: raw.id,
     username: raw.username,
     role: raw.role,
+    publicKey: raw.publicKey ?? raw.public_key ?? '',
     avatarSeed: raw.avatarSeed ?? raw.avatar_seed ?? '',
     avatarUrl: raw.avatarUrl ?? raw.avatar_url ?? '',
     avatarUpdatedAt: raw.avatarUpdatedAt ?? raw.avatar_updated_at ?? 0,
     displayName: raw.displayName ?? raw.display_name ?? '',
     profileStatus: raw.profileStatus ?? raw.profile_status ?? '',
     profileBackground: raw.profileBackground ?? raw.profile_background ?? '',
+    userStatus: raw.userStatus ?? raw.user_status ?? 'online',
     nameStyle: normalizeNameStyle(raw.nameStyle ?? raw.name_style),
   }
 }
 
 const loadStoredAuth = () => {
-  if (typeof window === 'undefined') return { token: null, user: null }
+  if (typeof window === 'undefined') return { accessToken: null, refreshToken: null, user: null }
   try {
     const raw = window.localStorage.getItem(AUTH_STORAGE_KEY)
-    if (!raw) return { token: null, user: null }
+    if (!raw) return { accessToken: null, refreshToken: null, user: null }
     const parsed = JSON.parse(raw)
-    const token = typeof parsed.token === 'string' && parsed.token.length ? parsed.token : null
-    if (!token) return { token: null, user: null }
-    return { token, user: normalizeUser(parsed.user) }
+    const accessToken = typeof parsed.accessToken === 'string' && parsed.accessToken.length ? parsed.accessToken : null
+    const refreshToken = typeof parsed.refreshToken === 'string' && parsed.refreshToken.length ? parsed.refreshToken : null
+    if (!accessToken || !refreshToken) return { accessToken: null, refreshToken: null, user: null }
+    return { accessToken, refreshToken, user: normalizeUser(parsed.user) }
   } catch (err) {
     console.warn('auth restore failed', err)
-    return { token: null, user: null }
+    return { accessToken: null, refreshToken: null, user: null }
   }
 }
 
@@ -266,12 +292,7 @@ const loadNameStyle = () => {
   try {
     const raw = window.localStorage.getItem(NAME_STYLE_KEY)
     if (!raw) return DEFAULT_NAME_STYLE
-    const parsed = JSON.parse(raw)
-    return {
-      font: typeof parsed.font === 'string' ? parsed.font : DEFAULT_NAME_STYLE.font,
-      effect: typeof parsed.effect === 'string' ? parsed.effect : DEFAULT_NAME_STYLE.effect,
-      color: typeof parsed.color === 'string' ? parsed.color : DEFAULT_NAME_STYLE.color,
-    }
+    return normalizeNameStyle(JSON.parse(raw))
   } catch (err) {
     console.warn('name style restore failed', err)
     return DEFAULT_NAME_STYLE
@@ -288,9 +309,10 @@ const persistNameStyle = (style) => {
 }
 
 export const buildNameStyle = (style = DEFAULT_NAME_STYLE) => {
-  const font = style?.font || DEFAULT_NAME_STYLE.font
-  const effect = style?.effect || DEFAULT_NAME_STYLE.effect
-  const color = style?.color || DEFAULT_NAME_STYLE.color
+  const normalized = normalizeNameStyle(style)
+  const font = normalized.font
+  const effect = normalized.effect
+  const color = normalized.color
   const families = {
     rubik: '"Rubik", sans-serif',
     inter: '"Inter", sans-serif',
@@ -360,11 +382,105 @@ const persistServerUrl = (value) => {
     console.warn('server url persist failed', err)
   }
 }
-const persistAuth = (token, user) => {
+
+const loadVoiceServerUrl = () => {
+  if (typeof window === 'undefined') return ''
+  try {
+    const raw = window.localStorage.getItem(VOICE_SERVER_URL_KEY)
+    return typeof raw === 'string' ? raw : ''
+  } catch (err) {
+    console.warn('voice server url restore failed', err)
+    return ''
+  }
+}
+
+const persistVoiceServerUrl = (value) => {
   if (typeof window === 'undefined') return
   try {
-    if (token && user) {
-      window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ token, user }))
+    if (value) window.localStorage.setItem(VOICE_SERVER_URL_KEY, value)
+    else window.localStorage.removeItem(VOICE_SERVER_URL_KEY)
+  } catch (err) {
+    console.warn('voice server url persist failed', err)
+  }
+}
+
+const loadAudioInputDeviceId = () => {
+  if (typeof window === 'undefined') return 'default'
+  try {
+    const raw = window.localStorage.getItem(AUDIO_INPUT_DEVICE_KEY)
+    return typeof raw === 'string' && raw.trim() ? raw : 'default'
+  } catch (err) {
+    console.warn('audio input device restore failed', err)
+    return 'default'
+  }
+}
+
+const persistAudioInputDeviceId = (deviceId) => {
+  if (typeof window === 'undefined') return
+  try {
+    const normalized = typeof deviceId === 'string' && deviceId.trim() ? deviceId : 'default'
+    window.localStorage.setItem(AUDIO_INPUT_DEVICE_KEY, normalized)
+  } catch (err) {
+    console.warn('audio input device persist failed', err)
+  }
+}
+
+const loadAudioOutputDeviceId = () => {
+  if (typeof window === 'undefined') return 'default'
+  try {
+    const raw = window.localStorage.getItem(AUDIO_OUTPUT_DEVICE_KEY)
+    return typeof raw === 'string' && raw.trim() ? raw : 'default'
+  } catch (err) {
+    console.warn('audio output device restore failed', err)
+    return 'default'
+  }
+}
+
+const persistAudioOutputDeviceId = (deviceId) => {
+  if (typeof window === 'undefined') return
+  try {
+    const normalized = typeof deviceId === 'string' && deviceId.trim() ? deviceId : 'default'
+    window.localStorage.setItem(AUDIO_OUTPUT_DEVICE_KEY, normalized)
+  } catch (err) {
+    console.warn('audio output device persist failed', err)
+  }
+}
+
+const normalizeNotificationSettings = (raw = DEFAULT_NOTIFICATION_SETTINGS) => ({
+  desktopEnabled: raw?.desktopEnabled !== false,
+  pushEnabled: raw?.pushEnabled !== false,
+  soundEnabled: Boolean(raw?.soundEnabled),
+  mentionsOnly: Boolean(raw?.mentionsOnly),
+  dndEnabled: Boolean(raw?.dndEnabled),
+})
+
+const loadNotificationSettings = () => {
+  if (typeof window === 'undefined') return normalizeNotificationSettings(DEFAULT_NOTIFICATION_SETTINGS)
+  try {
+    const raw = window.localStorage.getItem(NOTIFICATION_SETTINGS_KEY)
+    if (!raw) return normalizeNotificationSettings(DEFAULT_NOTIFICATION_SETTINGS)
+    const parsed = JSON.parse(raw)
+    return normalizeNotificationSettings(parsed)
+  } catch (err) {
+    console.warn('notification settings restore failed', err)
+    return normalizeNotificationSettings(DEFAULT_NOTIFICATION_SETTINGS)
+  }
+}
+
+const persistNotificationSettings = (settings) => {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(NOTIFICATION_SETTINGS_KEY, JSON.stringify(settings))
+  } catch (err) {
+    console.warn('notification settings persist failed', err)
+  }
+}
+
+const persistAuth = (accessToken, refreshToken, user) => {
+  if (typeof window === 'undefined') return
+  try {
+    if (accessToken && refreshToken && user) {
+      window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ accessToken, refreshToken, user }))
     } else {
       window.localStorage.removeItem(AUTH_STORAGE_KEY)
     }
@@ -406,33 +522,101 @@ const normalizeChannel = (raw) => {
 }
 
 
-const deriveKey = (cid) => {
-  if (!cid) return null
-  const source = encoder.encode(String(cid))
-  if (!source.length) return null
-  const bytes = new Uint8Array(32)
-  for (let i = 0; i < 32; i += 1) {
-    bytes[i] = source[i % source.length]
+const E2E_IDENTITY_PREFIX = 'nemessenger:e2e:identity:'
+const keyStorageForUser = (userId) => `${E2E_IDENTITY_PREFIX}${userId}`
+
+const randomSecretKeyB64 = () => u8.encodeBase64(nacl.randomBytes(32))
+
+const loadIdentityForUser = (userId) => {
+  if (typeof window === 'undefined' || !userId) return null
+  try {
+    const raw = window.localStorage.getItem(keyStorageForUser(userId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    const publicKey = typeof parsed?.publicKey === 'string' ? parsed.publicKey : ''
+    const secretKey = typeof parsed?.secretKey === 'string' ? parsed.secretKey : ''
+    if (!publicKey || !secretKey) return null
+    if (u8.decodeBase64(publicKey).length !== 32) return null
+    if (u8.decodeBase64(secretKey).length !== 32) return null
+    return { publicKey, secretKey }
+  } catch (err) {
+    console.warn('e2e identity restore failed', err)
+    return null
   }
-  return u8.encodeBase64(bytes)
+}
+
+const persistIdentityForUser = (userId, identity) => {
+  if (typeof window === 'undefined' || !userId || !identity) return
+  try {
+    window.localStorage.setItem(keyStorageForUser(userId), JSON.stringify(identity))
+  } catch (err) {
+    console.warn('e2e identity persist failed', err)
+  }
+}
+
+const waitMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const canBootstrapChannelKey = ({ channelId, me, channel, users }) => {
+  if (!channelId || !me?.id) return false
+  if (channelId.startsWith('dm:')) {
+    const parsed = parseDirectChannelId(channelId)
+    return Boolean(parsed && (parsed.first === me.id || parsed.second === me.id))
+  }
+  if (channel?.isPrivate) return channel.createdBy === me.id
+  const knownIds = Array.isArray(users) ? users.map((u) => u?.id).filter(Boolean).sort() : []
+  if (!knownIds.length) return false
+  return knownIds[0] === me.id
 }
 
 const enc = {
-  setKeyForChannel: (cid, keyStr) => localStorage.setItem(storageKeyForChannel(cid), keyStr),
-  getKeyForChannel: (cid) => localStorage.getItem(storageKeyForChannel(cid)) || deriveKey(cid),
-  ensureKey: (cid) => {
+  setKeyForChannel: (cid, keyStr) => {
+    if (typeof window === 'undefined' || !cid || !keyStr) return
+    window.localStorage.setItem(storageKeyForChannel(cid), keyStr)
+  },
+  getKeyForChannel: (cid) => {
+    if (typeof window === 'undefined' || !cid) return null
+    return window.localStorage.getItem(storageKeyForChannel(cid))
+  },
+  ensureKey: (cid) => enc.getKeyForChannel(cid),
+  generateKeyForChannel: (cid) => {
     if (!cid) return null
-    const keyName = storageKeyForChannel(cid)
-    let keyStr = localStorage.getItem(keyName)
-    if (!keyStr) {
-      keyStr = deriveKey(cid)
-      if (keyStr) localStorage.setItem(keyName, keyStr)
-    }
+    const keyStr = randomSecretKeyB64()
+    enc.setKeyForChannel(cid, keyStr)
     return keyStr
+  },
+  ensureIdentity: (userId) => {
+    if (!userId) return null
+    let identity = loadIdentityForUser(userId)
+    if (identity) return identity
+    const pair = nacl.box.keyPair()
+    identity = {
+      publicKey: u8.encodeBase64(pair.publicKey),
+      secretKey: u8.encodeBase64(pair.secretKey.subarray(0, 32)),
+    }
+    persistIdentityForUser(userId, identity)
+    return identity
+  },
+  wrapChannelKeyForUser: (channelKeyB64, recipientPublicKeyB64, senderSecretKeyB64) => {
+    const channelKey = u8.decodeBase64(channelKeyB64)
+    const recipientPublicKey = u8.decodeBase64(recipientPublicKeyB64)
+    const senderSecretKey32 = u8.decodeBase64(senderSecretKeyB64)
+    const senderFullSecret = nacl.box.keyPair.fromSecretKey(senderSecretKey32).secretKey
+    const nonce = nacl.randomBytes(24)
+    const box = nacl.box(channelKey, nonce, recipientPublicKey, senderFullSecret)
+    return { wrappedKey: u8.encodeBase64(box), nonce: u8.encodeBase64(nonce) }
+  },
+  unwrapChannelKey: ({ wrappedKey, nonce, senderPublicKey, recipientSecretKey }) => {
+    const wrapped = u8.decodeBase64(wrappedKey)
+    const nonceBytes = u8.decodeBase64(nonce)
+    const senderPublic = u8.decodeBase64(senderPublicKey)
+    const recipientSecret32 = u8.decodeBase64(recipientSecretKey)
+    const recipientFullSecret = nacl.box.keyPair.fromSecretKey(recipientSecret32).secretKey
+    const opened = nacl.box.open(wrapped, nonceBytes, senderPublic, recipientFullSecret)
+    return opened ? u8.encodeBase64(opened) : null
   },
   encrypt: (cid, text) => {
     const keyStr = enc.ensureKey(cid)
-    if (!keyStr) return text
+    if (!keyStr) return null
     const key = u8.decodeBase64(keyStr)
     const nonce = nacl.randomBytes(24)
     const box = nacl.secretbox(u8.decodeUTF8(text), nonce, key)
@@ -502,12 +686,20 @@ const initialAuth = loadStoredAuth()
 
 const useStore = create((set, get) => ({
   serverUrl: loadServerUrl() || import.meta.env.VITE_LGM_SERVER || 'http://localhost:4000',
-  token: initialAuth.token,
+  voiceServerUrl: loadVoiceServerUrl() || import.meta.env.VITE_VOICE_SERVER || 'http://localhost:4010',
+  serverModalOpen: false,
+  accessToken: initialAuth.accessToken,
+  refreshToken: initialAuth.refreshToken,
+  token: initialAuth.accessToken,  // keep for backward compatibility
   user: initialAuth.user,
+  e2eReady: false,
   userStatus: loadUserStatus(),
   profileBackground: loadProfileBackground(),
   profileStatus: loadProfileStatus(),
   nameStyle: loadNameStyle(),
+  notificationSettings: loadNotificationSettings(),
+  audioInputDeviceId: loadAudioInputDeviceId(),
+  audioOutputDeviceId: loadAudioOutputDeviceId(),
   users: [],
   view: 'chat',
   socket: null,
@@ -534,14 +726,19 @@ const useStore = create((set, get) => ({
   appearance: loadAppearance(),
   appearanceNoise: null,
 
-  setAuth: (token, user, options = {}) => {
+  setAuth: (accessTokenOrToken, user, options = {}) => {
     const normalized = normalizeUser(user)
     const shouldPersist = options.persist ?? true
-    if (token && normalized && shouldPersist) persistAuth(token, normalized)
-    else if (!token || !shouldPersist) persistAuth(null, null)
+    // Support both old format (single token) and new format (accessToken, refreshToken as user.refreshToken)
+    let accessToken = accessTokenOrToken
+    let refreshToken = user?.refreshToken || options.refreshToken
+    
+    if (accessToken && normalized && shouldPersist) persistAuth(accessToken, refreshToken, normalized)
+    else if (!accessToken || !shouldPersist) persistAuth(null, null, null)
     if (normalized?.nameStyle) persistNameStyle(normalized.nameStyle)
     if (typeof normalized?.profileStatus === 'string') persistProfileStatus(normalized.profileStatus)
     if (typeof normalized?.profileBackground === 'string') persistProfileBackground(normalized.profileBackground)
+    if (typeof normalized?.userStatus === 'string') persistUserStatus(normalized.userStatus)
     set((state) => {
       let list = state.users
       if (normalized) {
@@ -549,22 +746,36 @@ const useStore = create((set, get) => ({
         list = exists ? list.map((u) => (u.id === normalized.id ? normalized : u)) : [...list, normalized]
       }
       return {
-        token,
+        accessToken,
+        refreshToken,
+        token: accessToken,  // keep for backward compatibility
         user: normalized,
         nameStyle: normalized?.nameStyle || state.nameStyle,
         profileStatus: normalized?.profileStatus ?? state.profileStatus,
         profileBackground: normalized?.profileBackground ?? state.profileBackground,
+        userStatus: normalized?.userStatus ?? state.userStatus,
         users: list,
         view: 'chat',
       }
     })
+    if (accessToken && normalized?.id) {
+      Promise.resolve()
+        .then(() => get().ensureE2EIdentity())
+        .catch((err) => console.warn('ensure e2e identity after auth failed', err))
+    }
   },
   setView: (view) => set({ view }),
   setUserStatus: (status) => {
     const normalized = typeof status === 'string' ? status.trim().toLowerCase() : ''
     if (!['online', 'idle', 'dnd', 'invisible'].includes(normalized)) return
     persistUserStatus(normalized)
-    set({ userStatus: normalized })
+    set((state) => ({
+      userStatus: normalized,
+      user: state.user ? { ...state.user, userStatus: normalized } : state.user,
+      users: state.user?.id
+        ? state.users.map((u) => (u.id === state.user.id ? { ...u, userStatus: normalized } : u))
+        : state.users,
+    }))
   },
   setProfileStatus: (value) => {
     const normalized = typeof value === 'string' ? value.trim() : ''
@@ -578,12 +789,13 @@ const useStore = create((set, get) => ({
     }))
   },
   setNameStyle: (patch) => {
-    const next = {
+    const draft = {
       font: DEFAULT_NAME_STYLE.font,
       effect: DEFAULT_NAME_STYLE.effect,
       color: DEFAULT_NAME_STYLE.color,
       ...(typeof patch === 'object' && patch ? patch : {}),
     }
+    const next = normalizeNameStyle(draft)
     persistNameStyle(next)
     set((state) => ({
       nameStyle: next,
@@ -596,11 +808,11 @@ const useStore = create((set, get) => ({
   updateNameStyle: async (style) => {
     const token = get().token
     if (!token) throw new Error('not_authenticated')
-    const payload = {
+    const payload = normalizeNameStyle({
       font: typeof style?.font === 'string' ? style.font : DEFAULT_NAME_STYLE.font,
       effect: typeof style?.effect === 'string' ? style.effect : DEFAULT_NAME_STYLE.effect,
       color: typeof style?.color === 'string' ? style.color : DEFAULT_NAME_STYLE.color,
-    }
+    })
     const { data } = await axios.post(
       `${get().serverUrl}/api/profile/name-style`,
       payload,
@@ -629,26 +841,88 @@ const useStore = create((set, get) => ({
         : state.users,
     }))
   },
+  setAudioInputDeviceId: (deviceId) => {
+    const normalized = typeof deviceId === 'string' && deviceId.trim() ? deviceId : 'default'
+    persistAudioInputDeviceId(normalized)
+    set({ audioInputDeviceId: normalized })
+  },
+  setAudioOutputDeviceId: (deviceId) => {
+    const normalized = typeof deviceId === 'string' && deviceId.trim() ? deviceId : 'default'
+    persistAudioOutputDeviceId(normalized)
+    set({ audioOutputDeviceId: normalized })
+  },
+  setNotificationSettings: (patch) => {
+    set((state) => {
+      const previous = normalizeNotificationSettings(state.notificationSettings || DEFAULT_NOTIFICATION_SETTINGS)
+      const nextRaw = typeof patch === 'function' ? patch(previous) : { ...previous, ...(patch || {}) }
+      const next = normalizeNotificationSettings(nextRaw)
+      persistNotificationSettings(next)
+      return { notificationSettings: next }
+    })
+  },
+  resetNotificationSettings: () => {
+    const next = normalizeNotificationSettings(DEFAULT_NOTIFICATION_SETTINGS)
+    persistNotificationSettings(next)
+    set({ notificationSettings: next })
+  },
   setServerUrl: (nextUrl, options = {}) => {
     const raw = typeof nextUrl === 'string' ? nextUrl.trim() : ''
     if (!raw) return false
     const normalized = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`
+    const previous = get().serverUrl
+    const serverChanged = typeof previous === 'string' && previous.trim() !== normalized
     persistServerUrl(normalized)
     set({ serverUrl: normalized })
-    if (options.reconnect && get().token) {
+    if (serverChanged && (get().accessToken || get().token)) {
+      // Tokens are server-specific; force clean login on server switch.
+      get().logout()
+      return true
+    }
+    if (options.reconnect && (get().accessToken || get().token)) {
       get().connect()
     }
     return true
   },
+  setVoiceServerUrl: (nextUrl) => {
+    const raw = typeof nextUrl === 'string' ? nextUrl.trim() : ''
+    if (!raw) return false
+    const normalized = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`
+    persistVoiceServerUrl(normalized)
+    set({ voiceServerUrl: normalized })
+    return true
+  },
+  openServerModal: () => set({ serverModalOpen: true }),
+  closeServerModal: () => set({ serverModalOpen: false }),
   openProfile: () => set({ view: 'profile' }),
   openSettings: () => set({ view: 'settings' }),
   openChat: () => set({ view: 'chat' }),
+  syncPushNotifications: async () => {
+    const token = get().accessToken || get().token
+    const serverUrl = get().serverUrl
+    const pushEnabled = get().notificationSettings?.pushEnabled !== false
+    if (!token || !serverUrl) return false
+    try {
+      if (!pushEnabled) {
+        await removeWebPushSubscription({ serverUrl, token }).catch(() => {})
+        return false
+      }
+      return await syncWebPushSubscription({ serverUrl, token })
+    } catch (err) {
+      console.warn('web push sync failed', err)
+      return false
+    }
+  },
   openAdmin: () => {
     if (get().user?.role !== 'admin') return
     set({ view: 'admin' })
   },
   logout: () => {
-    persistAuth(null, null)
+    const logoutToken = get().accessToken || get().token
+    const logoutServerUrl = get().serverUrl
+    Promise.resolve()
+      .then(() => removeWebPushSubscription({ serverUrl: logoutServerUrl, token: logoutToken }))
+      .catch(() => {})
+    persistAuth(null, null, null)
     const socket = get().socket
     if (socket) {
       if (typeof socket.removeAllListeners === 'function') socket.removeAllListeners()
@@ -661,8 +935,11 @@ const useStore = create((set, get) => ({
       console.warn('cancel reconnect on logout failed', err)
     }
     set({
+      accessToken: null,
+      refreshToken: null,
       token: null,
       user: null,
+      e2eReady: false,
       view: 'chat',
       socket: null,
       connectionStatus: 'idle',
@@ -706,6 +983,183 @@ const useStore = create((set, get) => ({
     if (noise) set({ appearanceNoise: noise })
     return noise
   },
+  ensureE2EIdentity: async () => {
+    const user = get().user
+    const token = get().token
+    if (!user?.id || !token) return null
+    const identity = enc.ensureIdentity(user.id)
+    if (!identity) return null
+    const currentPublic = typeof user.publicKey === 'string' ? user.publicKey : ''
+    if (currentPublic !== identity.publicKey) {
+      try {
+        const { data } = await axios.post(
+          `${get().serverUrl}/api/profile/e2e-key`,
+          { publicKey: identity.publicKey },
+          { headers: buildAuthHeaders(token) },
+        )
+        const normalized = normalizeUser(data?.user)
+        if (normalized) {
+          set((state) => ({
+            user: state.user?.id === normalized.id ? { ...state.user, ...normalized } : state.user,
+            users: state.users.some((u) => u.id === normalized.id)
+              ? state.users.map((u) => (u.id === normalized.id ? { ...u, ...normalized } : u))
+              : [...state.users, normalized],
+            e2eReady: true,
+          }))
+        } else {
+          set({ e2eReady: true })
+        }
+      } catch (err) {
+        console.error('e2e public key sync failed', err)
+        return null
+      }
+    } else {
+      set({ e2eReady: true })
+    }
+    return identity
+  },
+  ensureChannelKey: async (channelId, options = {}) => {
+    if (!channelId) return null
+    const existing = enc.getKeyForChannel(channelId)
+    const token = get().token
+    const me = get().user
+    if (!token || !me?.id) return existing || null
+    const identity = await get().ensureE2EIdentity()
+    if (!identity) return null
+    const fetchSharedKey = async () => {
+      const { data } = await axios.get(`${get().serverUrl}/api/channels/${encodeURIComponent(channelId)}/e2e-key`, {
+        headers: buildAuthHeaders(token),
+      })
+      const key = data?.key
+      if (key?.wrappedKey && key?.nonce && key?.senderPublicKey) {
+        const unwrapped = enc.unwrapChannelKey({
+          wrappedKey: key.wrappedKey,
+          nonce: key.nonce,
+          senderPublicKey: key.senderPublicKey,
+          recipientSecretKey: identity.secretKey,
+        })
+        if (unwrapped) {
+          enc.setKeyForChannel(channelId, unwrapped)
+          return { status: 'ok', key: unwrapped }
+        }
+        return { status: 'unwrap_failed', key: null }
+      }
+      return { status: 'not_found', key: null }
+    }
+    let fetchStatus = 'unknown'
+    try {
+      const shared = await fetchSharedKey()
+      fetchStatus = shared?.status || 'unknown'
+      if (shared?.status === 'ok' && shared?.key) return shared.key
+      if (shared?.status === 'unwrap_failed') return existing || null
+    } catch (err) {
+      const code = err?.response?.status
+      fetchStatus = code === 404 ? 'not_found' : 'error'
+      if (code !== 404) console.warn('fetch e2e channel key failed', err)
+      if (existing) return existing
+    }
+
+    if (!options?.bootstrap && existing) return existing
+
+    // Bootstrap only when server explicitly says there is no key.
+    // Never rotate channel key after transport/server errors or unwrap mismatch.
+    if (!options?.bootstrap || fetchStatus !== 'not_found') return existing || null
+
+    const channel = (get().channels || []).find((c) => c.id === channelId)
+    const canBootstrap = canBootstrapChannelKey({
+      channelId,
+      me,
+      channel,
+      users: get().users || [],
+    })
+    if (!canBootstrap) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await waitMs(350 * (attempt + 1))
+        try {
+          const shared = await fetchSharedKey()
+          if (shared?.status === 'ok' && shared?.key) return shared.key
+          if (shared?.status === 'unwrap_failed') return null
+          if (shared?.status !== 'not_found') return null
+        } catch (err) {
+          const code = err?.response?.status
+          if (code && code !== 404) console.warn('retry fetch e2e channel key failed', err)
+          if (code && code !== 404) return null
+        }
+      }
+      return null
+    }
+
+    const channelKey = enc.generateKeyForChannel(channelId)
+    if (!channelKey) return null
+
+    const recipients = new Map()
+    let users = get().users || []
+    const byId = new Map(users.map((u) => [u.id, u]))
+
+    if (channelId.startsWith('dm:')) {
+      const parsed = parseDirectChannelId(channelId)
+      const missingDmPublicKey = Boolean(
+        parsed?.second &&
+        parsed.second !== me.id &&
+        (!byId.get(parsed.second)?.publicKey || typeof byId.get(parsed.second)?.publicKey !== 'string'),
+      )
+      if (missingDmPublicKey) {
+        try {
+          const { data } = await axios.get(`${get().serverUrl}/api/users`, { headers: buildAuthHeaders(token) })
+          const normalizedUsers = Array.isArray(data?.users) ? data.users.map(normalizeUser).filter(Boolean) : []
+          if (normalizedUsers.length) {
+            users = normalizedUsers
+            set((state) => {
+              const current = state.user ? normalizedUsers.find((u) => u.id === state.user.id) || state.user : state.user
+              return { users: normalizedUsers, user: current }
+            })
+          }
+        } catch (err) {
+          console.warn('users fetch for dm e2e bootstrap failed', err)
+        }
+      }
+      const refreshedById = new Map((users || []).map((u) => [u.id, u]))
+      if (parsed?.first) recipients.set(parsed.first, refreshedById.get(parsed.first))
+      if (parsed?.second) recipients.set(parsed.second, refreshedById.get(parsed.second))
+    } else if (channel?.isPrivate) {
+      let members = get().channelMembers[channelId] || []
+      if (!members.length) {
+        try {
+          members = await get().fetchChannelMembers(channelId)
+        } catch (_) {
+          members = []
+        }
+      }
+      members.forEach((entry) => {
+        const user = entry?.user
+        if (user?.id) recipients.set(user.id, user)
+      })
+      if (channel?.createdBy) recipients.set(channel.createdBy, byId.get(channel.createdBy))
+    } else {
+      users.forEach((u) => {
+        if (u?.id) recipients.set(u.id, u)
+      })
+    }
+
+    recipients.set(me.id, byId.get(me.id) || me)
+    const shares = []
+    recipients.forEach((target, userId) => {
+      if (!userId || !target?.publicKey) return
+      try {
+        const wrapped = enc.wrapChannelKeyForUser(channelKey, target.publicKey, identity.secretKey)
+        shares.push({ userId, wrappedKey: wrapped.wrappedKey, nonce: wrapped.nonce, keyVersion: 1 })
+      } catch (err) {
+        console.warn('channel key wrap failed', userId, err)
+      }
+    })
+    if (!shares.length) return null
+    await axios.post(
+      `${get().serverUrl}/api/channels/${encodeURIComponent(channelId)}/e2e-keys`,
+      { shares },
+      { headers: buildAuthHeaders(token) },
+    )
+    return channelKey
+  },
   setChannelKey: (cid, keyStr) => enc.setKeyForChannel(cid, keyStr),
   getChannelKey: (cid) => enc.getKeyForChannel(cid),
   buildAvatarUrl: (user) => {
@@ -731,6 +1185,18 @@ const useStore = create((set, get) => ({
       return url.toString()
     } catch (err) {
       console.error('channel avatar url build failed', err)
+      return null
+    }
+  },
+  buildMediaUrl: (relativeUrl) => {
+    if (!relativeUrl || typeof relativeUrl !== 'string') return null
+    try {
+      if (relativeUrl.startsWith('blob:') || relativeUrl.startsWith('data:')) return relativeUrl
+      const server = get().serverUrl
+      const base = server.endsWith('/') ? server : `${server}/`
+      return new URL(relativeUrl, base).toString()
+    } catch (err) {
+      console.error('media url build failed', err)
       return null
     }
   },
@@ -805,9 +1271,36 @@ const useStore = create((set, get) => ({
     set({ reconnectAttempt: 0, connectionStatus: 'connecting', connectionError: null })
     get().connect()
   },
+  refreshAccessToken: async () => {
+    const refreshToken = get().refreshToken
+    if (!refreshToken) {
+      get().logout()
+      return false
+    }
+    try {
+      const server = get().serverUrl
+      const { data } = await axios.post(`${server}/api/refresh`, { refreshToken })
+      const newAccessToken = data.accessToken
+      if (!newAccessToken) {
+        get().logout()
+        return false
+      }
+      // Update accessToken in store
+      set({ accessToken: newAccessToken, token: newAccessToken })
+      // Update in localStorage
+      const user = get().user
+      persistAuth(newAccessToken, refreshToken, user)
+      console.log('[REFRESH] access token renewed')
+      return true
+    } catch (err) {
+      console.warn('[REFRESH] failed', err.message)
+      get().logout()
+      return false
+    }
+  },
   connect: async () => {
-    const token = get().token
-    if (!token) return
+    const accessToken = get().accessToken
+    if (!accessToken) return
     const server = get().serverUrl
     get().cancelReconnectCountdown()
     const existingSocket = get().socket
@@ -817,14 +1310,33 @@ const useStore = create((set, get) => ({
       existingSocket.disconnect()
     }
     set({ connectionStatus: 'connecting', connectionError: null })
-    const socket = io(server, { auth: { token }, reconnection: false })
+    const socket = io(server, {
+      auth: { accessToken },
+      reconnection: false,
+      transports: ['websocket'],
+    })
     set({ socket })
     const manager = socket.io
     let handleCloseRef = null
 
+    const normalizeSocketError = (error) => {
+      if (!error) return null
+      if (typeof error === 'string') return error
+      const parts = []
+      if (error.message) parts.push(String(error.message))
+      if (error.description) parts.push(String(error.description))
+      if (error.data) {
+        try {
+          parts.push(typeof error.data === 'string' ? error.data : JSON.stringify(error.data))
+        } catch (_) {}
+      }
+      const result = parts.join(' | ').trim()
+      return result || null
+    }
+
     const scheduleReconnect = (error) => {
-      if (!get().token) return
-      const message = typeof error === 'string' ? error : error?.message || null
+      if (!get().accessToken) return
+      const message = normalizeSocketError(error)
       if (manager?.off && handleCloseRef) manager.off('close', handleCloseRef)
       if (reconnectTimeoutId) {
         if (message) {
@@ -871,18 +1383,69 @@ const useStore = create((set, get) => ({
         set({ connectionStatus: 'connected', reconnectAttempt: 0, connectionError: null })
         socket.emit('init:request', {})
         try {
-          const { data } = await axios.get(`${server}/api/users`, { headers: buildAuthHeaders(get().token) })
+          const { data } = await axios.get(`${server}/api/users`, { headers: buildAuthHeaders(get().accessToken) })
         const normalized = (data.users || []).map(normalizeUser).filter(Boolean)
         set((state) => {
           const current = state.user ? normalized.find((u) => u.id === state.user.id) || state.user : state.user
           return { users: normalized, user: current }
         })
+        await get().ensureE2EIdentity()
+        get().syncPushNotifications().catch(() => {})
         } catch (err) {
           console.error('users fetch failed', err)
         }
       })
 
       socket.on('connect_error', (err) => {
+        console.warn('[SOCKET] connect_error', {
+          message: err?.message,
+          description: err?.description,
+          data: err?.data,
+          context: err?.context,
+        })
+        const rawMessage = String(err?.message || '').toLowerCase()
+        const rawDescription = String(err?.description || '').toLowerCase()
+        const rawData = String(
+          typeof err?.data === 'string' ? err.data : (() => {
+            try {
+              return JSON.stringify(err?.data || '')
+            } catch (_) {
+              return ''
+            }
+          })(),
+        ).toLowerCase()
+        const authFailure =
+          rawMessage.includes('invalid_token') ||
+          rawMessage.includes('no_token') ||
+          rawDescription.includes('invalid_token') ||
+          rawDescription.includes('no_token') ||
+          rawData.includes('invalid_token') ||
+          rawData.includes('no_token')
+        if (authFailure) {
+          console.warn('[SOCKET] auth failure on connect, trying token refresh')
+          get()
+            .refreshAccessToken()
+            .then((ok) => {
+              if (!ok) {
+                console.warn('[SOCKET] refresh failed after socket auth error, forcing logout')
+                get().logout()
+                return
+              }
+              const existing = get().socket
+              if (existing) {
+                if (typeof existing.removeAllListeners === 'function') existing.removeAllListeners()
+                if (existing.io?.off) existing.io.off('close')
+                existing.disconnect()
+              }
+              get().cancelReconnectCountdown()
+              set({ reconnectAttempt: 0, connectionStatus: 'connecting', connectionError: null })
+              get().connect()
+            })
+            .catch(() => {
+              get().logout()
+            })
+          return
+        }
         scheduleReconnect(err)
       })
 
@@ -895,7 +1458,8 @@ const useStore = create((set, get) => ({
         })
       })
 
-    socket.on('init:response', ({ workspaces, channels, activeChannelId, messages }) => {
+    socket.on('init:response', async ({ workspaces, channels, activeChannelId, messages }) => {
+      if (activeChannelId) await get().ensureChannelKey(activeChannelId, { bootstrap: false })
       const normalizeMessage = formatMessage(activeChannelId)
       const normalizedChannels = Array.isArray(channels) ? channels.map(normalizeChannel).filter(Boolean) : []
       set({
@@ -910,7 +1474,8 @@ const useStore = create((set, get) => ({
       })
     })
 
-    socket.on('channel:opened', ({ channelId, messages }) => {
+    socket.on('channel:opened', async ({ channelId, messages }) => {
+      await get().ensureChannelKey(channelId, { bootstrap: false })
       const normalize = formatMessage(channelId)
       set((state) => {
         const payload = {
@@ -933,7 +1498,8 @@ const useStore = create((set, get) => ({
       })
     })
 
-    socket.on('messages:page', ({ channelId, messages, limit = 50 }) => {
+    socket.on('messages:page', async ({ channelId, messages, limit = 50 }) => {
+      await get().ensureChannelKey(channelId, { bootstrap: false })
       const page = messages.map(formatMessage(channelId)).filter(Boolean)
       set((state) => {
         const existing = state.messages[channelId] || []
@@ -952,7 +1518,8 @@ const useStore = create((set, get) => ({
       })
     })
 
-    socket.on('message:new', (payload) => {
+    socket.on('message:new', async (payload) => {
+      await get().ensureChannelKey(payload.channelId, { bootstrap: false })
       const normalized = formatMessage(payload.channelId)(payload)
       if (!normalized) return
       set((state) => {
@@ -997,7 +1564,8 @@ const useStore = create((set, get) => ({
       })
     })
 
-    socket.on('message:updated', (payload) => {
+    socket.on('message:updated', async (payload) => {
+      await get().ensureChannelKey(payload.channelId, { bootstrap: false })
       const normalized = formatMessage(payload.channelId)(payload)
       if (!normalized) return
       set((state) => {
@@ -1129,9 +1697,12 @@ const useStore = create((set, get) => ({
           ? state.users.map((u) => (u.id === normalized.id ? { ...u, ...normalized } : u))
           : [...state.users, normalized]
         const user = state.user?.id === normalized.id ? { ...state.user, ...normalized } : state.user
+        const friends = state.friends.some((friend) => friend.id === normalized.id)
+          ? state.friends.map((friend) => (friend.id === normalized.id ? { ...friend, ...normalized } : friend))
+          : state.friends
         const isSelf = state.user?.id === normalized.id
         const nameStyle = isSelf ? normalized.nameStyle : state.nameStyle
-        const patch = { users, user, nameStyle }
+        const patch = { users, user, friends, nameStyle }
         if (isSelf && normalized?.nameStyle) {
           persistNameStyle(normalized.nameStyle)
         }
@@ -1143,6 +1714,10 @@ const useStore = create((set, get) => ({
           if (typeof normalized.profileBackground === 'string') {
             persistProfileBackground(normalized.profileBackground)
             patch.profileBackground = normalized.profileBackground
+          }
+          if (typeof normalized.userStatus === 'string') {
+            persistUserStatus(normalized.userStatus)
+            patch.userStatus = normalized.userStatus
           }
         }
         return patch
@@ -1165,6 +1740,9 @@ const useStore = create((set, get) => ({
       view: 'chat',
     }))
     socket.emit('channel:switch', { channelId })
+    Promise.resolve()
+      .then(() => get().ensureChannelKey(channelId, { bootstrap: false }))
+      .catch(() => {})
   },
 
   openDirectChat: (userId) => {
@@ -1181,13 +1759,18 @@ const useStore = create((set, get) => ({
       view: 'chat',
     }))
     socket.emit('channel:switch', { channelId })
+    Promise.resolve()
+      .then(() => get().ensureChannelKey(channelId, { bootstrap: true }))
+      .catch(() => {})
   },
 
-  sendMessage: (content, replyTo = null) => {
+  sendMessage: async (content, replyTo = null) => {
     const socket = get().socket
     const channelId = get().activeChannelId
     if (!socket || !channelId || !content.trim()) return
+    await get().ensureChannelKey(channelId, { bootstrap: true })
     const encrypted = enc.encrypt(channelId, content.trim())
+    if (!encrypted) throw new Error('e2e_key_unavailable')
     socket.emit('message:send', { channelId, content: encrypted, replyTo: replyTo || null })
   },
 
@@ -1196,7 +1779,9 @@ const useStore = create((set, get) => ({
     if (!token) throw new Error('not_authenticated')
     const trimmed = typeof content === 'string' ? content.trim() : ''
     if (!trimmed) throw new Error('invalid_content')
+    await get().ensureChannelKey(channelId, { bootstrap: false })
     const encrypted = enc.encrypt(channelId, trimmed)
+    if (!encrypted) throw new Error('e2e_key_unavailable')
     const payload = { content: encrypted }
     if (typeof replyTo !== 'undefined') payload.replyTo = replyTo
     await axios.patch(`${get().serverUrl}/api/messages/${messageId}`, payload, {
@@ -1252,6 +1837,9 @@ const useStore = create((set, get) => ({
       : []
     if (channel && members.length) {
       set((state) => ({ channelMembers: { ...state.channelMembers, [channel.id]: members } }))
+    }
+    if (channel?.id) {
+      await get().ensureChannelKey(channel.id, { bootstrap: true })
     }
     return channel
   },
@@ -1515,6 +2103,66 @@ const useStore = create((set, get) => ({
     }))
     return updated
   },
+  uploadMedia: async (file, onProgress) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    if (!file) throw new Error('invalid_media')
+    const MAX_CHUNK = 25 * 1024 * 1024 // 25 MB
+    // small file -> single upload (server will store encrypted)
+    if (typeof file.size === 'number' && file.size <= MAX_CHUNK) {
+      const form = new FormData()
+      form.append('file', file)
+      const { data } = await axios.post(`${get().serverUrl}/api/media`, form, {
+        headers: buildAuthHeaders(token),
+        onUploadProgress: (progressEvent) => {
+          try {
+            if (typeof onProgress === 'function' && progressEvent?.total) {
+              const percent = Math.round((progressEvent.loaded / progressEvent.total) * 100)
+              onProgress(percent)
+            }
+          } catch (_) {}
+        },
+      })
+      return data?.media || null
+    }
+
+    // large file -> chunked upload
+    const totalSize = file.size || 0
+    const totalChunks = Math.ceil(totalSize / MAX_CHUNK)
+    const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    let uploadedBytes = 0
+    for (let idx = 0; idx < totalChunks; idx += 1) {
+      const start = idx * MAX_CHUNK
+      const end = Math.min(totalSize, (idx + 1) * MAX_CHUNK)
+      const chunkBlob = file.slice(start, end)
+      const form = new FormData()
+      form.append('chunk', chunkBlob, file.name)
+      form.append('uploadId', uploadId)
+      form.append('index', String(idx))
+      form.append('total', String(totalChunks))
+      form.append('filename', file.name)
+      form.append('mime', file.type || 'application/octet-stream')
+      // send chunk
+      const resp = await axios.post(`${get().serverUrl}/api/media/chunk`, form, {
+        headers: buildAuthHeaders(token),
+        onUploadProgress: (progressEvent) => {
+          try {
+            if (typeof onProgress === 'function' && progressEvent?.total) {
+              const percentChunk = (progressEvent.loaded / progressEvent.total) || 0
+              const overall = Math.round(((uploadedBytes + percentChunk * (end - start)) / totalSize) * 100)
+              onProgress(overall)
+            }
+          } catch (_) {}
+        },
+      })
+      // if server returns assembled media on final chunk, return it
+      if (resp?.data?.media) return resp.data.media
+      uploadedBytes += (end - start)
+    }
+    // if loop finishes without final response, try to fetch assembled media by uploadId (best-effort)
+    // server returns media only when assembly completes; otherwise throw
+    throw new Error('upload_failed')
+  },
 
   changePassword: async (currentPassword, newPassword) => {
     const token = get().token
@@ -1582,6 +2230,28 @@ const useStore = create((set, get) => ({
     persistProfileBackground(updated.profileBackground || '')
     set((state) => ({
       profileBackground: updated.profileBackground || '',
+      user: state.user?.id === updated.id ? updated : state.user,
+      users: state.users.some((u) => u.id === updated.id)
+        ? state.users.map((u) => (u.id === updated.id ? updated : u))
+        : [...state.users, updated],
+    }))
+    return updated
+  },
+
+  updateUserStatus: async (status) => {
+    const token = get().token
+    if (!token) throw new Error('not_authenticated')
+    const normalized = typeof status === 'string' ? status.trim().toLowerCase() : ''
+    const { data } = await axios.post(
+      `${get().serverUrl}/api/profile/presence-status`,
+      { status: normalized },
+      { headers: buildAuthHeaders(token) },
+    )
+    const updated = normalizeUser(data.user ?? data)
+    if (!updated) return null
+    persistUserStatus(updated.userStatus || 'online')
+    set((state) => ({
+      userStatus: updated.userStatus || 'online',
       user: state.user?.id === updated.id ? updated : state.user,
       users: state.users.some((u) => u.id === updated.id)
         ? state.users.map((u) => (u.id === updated.id ? updated : u))

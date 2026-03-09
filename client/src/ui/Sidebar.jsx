@@ -27,7 +27,7 @@ export default function Sidebar() {
   const me = useStore((s) => s.user)
   const messagesMap = useStore((s) => s.messages)
   const userStatus = useStore((s) => s.userStatus)
-  const setUserStatus = useStore((s) => s.setUserStatus)
+  const updateUserStatus = useStore((s) => s.updateUserStatus)
   const profileStatus = useStore((s) => s.profileStatus)
   const nameStyleValue = useStore((s) => s.nameStyle)
   const onlineUserIds = useStore((s) => s.onlineUserIds)
@@ -278,7 +278,7 @@ export default function Sidebar() {
   const statusOptions = [
     { id: 'online', label: 'В сети', color: 'bg-emerald-400' },
     { id: 'idle', label: 'Неактивен', color: 'bg-yellow-400' },
-    { id: 'dnd', label: 'Не беспокоить', color: 'bg-red-500' },
+    { id: 'dnd', label: 'Занят', color: 'bg-red-500' },
     { id: 'invisible', label: 'Невидимый', color: 'bg-white/40' },
   ]
   const currentStatus = statusOptions.find((option) => option.id === userStatus) || statusOptions[0]
@@ -289,6 +289,26 @@ export default function Sidebar() {
     const last = list[list.length - 1]
     const raw = last?.content
     if (typeof raw !== 'string') return 'Вложение'
+    if (raw.startsWith('MSGJSON:')) {
+      try {
+        const parsed = JSON.parse(raw.slice('MSGJSON:'.length))
+        if (parsed?.voice) return 'Голосовое сообщение'
+        const attachments = Array.isArray(parsed?.attachments) ? parsed.attachments : []
+        if (attachments.length) {
+          const firstMime = String(attachments[0]?.mime || '')
+          if (firstMime.startsWith('image/')) return attachments.length === 1 ? 'Фото' : `Фото (${attachments.length})`
+          if (firstMime.startsWith('video/')) return attachments.length === 1 ? 'Видео' : `Видео (${attachments.length})`
+          if (firstMime.startsWith('audio/')) return attachments.length === 1 ? 'Аудио' : `Аудио (${attachments.length})`
+          return attachments.length === 1 ? 'Файл' : `Файлы (${attachments.length})`
+        }
+        const textValue = typeof parsed?.text === 'string' ? parsed.text : ''
+        const compact = textValue.replace(/\s+/g, ' ').trim()
+        if (!compact) return 'Файл'
+        return compact.length > 60 ? `${compact.slice(0, 57)}...` : compact
+      } catch (_) {
+        return 'Файл'
+      }
+    }
     const trimmed = raw.replace(/\s+/g, ' ').trim()
     if (!trimmed) return 'Без текста'
     return trimmed.length > 60 ? `${trimmed.slice(0, 57)}...` : trimmed
@@ -372,7 +392,11 @@ export default function Sidebar() {
             combinedChats.map((item) => {
               if (item.type === 'dm') {
                 const user = item.user
-                const isOnline = onlineSet.has(user.id)
+                const rawStatus = user.userStatus || 'online'
+                const isInvisible = rawStatus === 'invisible'
+                const isOnline = onlineSet.has(user.id) && !isInvisible
+                const statusColor =
+                  rawStatus === 'dnd' ? 'bg-red-500' : rawStatus === 'idle' ? 'bg-yellow-400' : 'bg-emerald-400'
                 const directId = buildDirectChannelId(me?.id || '', user.id)
                 const active = directId && directId === activeChannelId
                 const unreadCount = directId ? unread[directId] || 0 : 0
@@ -387,7 +411,9 @@ export default function Sidebar() {
                     <div className="flex items-center gap-3 min-w-0 flex-1">
                       <div className="relative flex-shrink-0">
                         <AvatarImage user={user} size={32} src={buildAvatarUrl?.(user)} />
-                        {isOnline ? <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-400 border-2 border-[#101822]" /> : null}
+                        {isOnline ? (
+                          <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full ${statusColor} border-2 border-[#101822]`} />
+                        ) : null}
                       </div>
                       <div className="min-w-0 text-left">
                         <div className="text-sm font-medium" style={getUserNameStyle(user)}>
@@ -422,7 +448,11 @@ export default function Sidebar() {
                       <div className="text-xs text-white/60 truncate">{lastMessage || 'Нет сообщений'}</div>
                     </div>
                   </div>
-                  {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
+                  {unreadCount > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="badge">{unreadCount}</span>
+                    </div>
+                  )}
                 </button>
               )
             })
@@ -572,7 +602,9 @@ export default function Sidebar() {
                           key={option.id}
                           type="button"
                           onClick={() => {
-                            setUserStatus(option.id)
+                            updateUserStatus(option.id).catch((error) => {
+                              console.warn('update user status failed', error)
+                            })
                             setStatusMenuOpen(false)
                           }}
                           className="w-full px-4 py-2 text-sm flex items-center gap-3 hover:bg-white/10 transition"

@@ -6,6 +6,7 @@ function isElectron() {
 }
 
 let permissionRequested = false
+const NOTIFICATION_SETTINGS_KEY = 'nemessenger:notification-settings'
 
 async function ensureBrowserPermission() {
   if (typeof window === 'undefined' || typeof window.Notification === 'undefined') return false
@@ -24,6 +25,14 @@ async function ensureBrowserPermission() {
 const recentShown = new Set()
 const RECENT_TTL = 30 * 1000 // 30s
 const MAX_BODY_LENGTH = 180
+const NOTIFICATION_COOLDOWN_MS = 2200
+const BURST_WINDOW_MS = 9000
+const BURST_DEBOUNCE_MS = 1500
+let lastShownAt = 0
+let burstCount = 0
+let burstStartedAt = 0
+let burstTimer = null
+let burstState = null
 
 function markShown(id) {
   if (!id) return
@@ -51,8 +60,55 @@ const buildPreview = (content) => {
   return trimmed
 }
 
+const areNotificationsEnabledBySettings = () => {
+  if (typeof window === 'undefined') return true
+  try {
+    const raw = window.localStorage.getItem(NOTIFICATION_SETTINGS_KEY)
+    if (!raw) return true
+    const parsed = JSON.parse(raw)
+    if (parsed?.dndEnabled) return false
+    if (parsed?.desktopEnabled === false) return false
+    return true
+  } catch (_) {
+    return true
+  }
+}
+
+const sendSystemNotification = async ({ title, body, silent, showSubtitle, author, messageId, channelId, chatName }) => {
+  if (isElectron() && window.electronAPI && typeof window.electronAPI.sendNotification === 'function') {
+    try {
+      const payload = {
+        title,
+        body,
+        meta: { messageId, channelId, channelName: chatName },
+      }
+      if (showSubtitle) payload.subtitle = author
+      if (silent) payload.silent = true
+      window.electronAPI.sendNotification(payload)
+      markShown(messageId)
+      lastShownAt = Date.now()
+      return true
+    } catch (err) {
+      // fall through to browser notifications
+    }
+  }
+
+  if (typeof window === 'undefined' || typeof window.Notification === 'undefined') return false
+  if (!shouldUseBrowserNotifications()) return false
+
+  if (Notification.permission !== 'granted') {
+    const ok = await ensureBrowserPermission()
+    if (!ok) return false
+  }
+  new Notification(title, { body, silent })
+  markShown(messageId)
+  lastShownAt = Date.now()
+  return true
+}
+
 export async function showNewMessageNotification(arg1, arg2, arg3) {
   try {
+    if (!areNotificationsEnabledBySettings()) return false
     const options = normalizeOptions(arg1, arg2, arg3)
     const {
       author: rawAuthor = 'NE Messenger',
@@ -80,38 +136,36 @@ export async function showNewMessageNotification(arg1, arg2, arg3) {
       console.log('[notif] showNewMessageNotification', { title, body, electron: isElectron() })
     }
 
-    if (isElectron() && window.electronAPI && typeof window.electronAPI.sendNotification === 'function') {
-      try {
-        const payload = {
-          title,
-          body,
-          meta: { messageId, channelId, channelName: chatName },
-        }
-        if (showSubtitle) payload.subtitle = author
-        if (silent) payload.silent = true
-        window.electronAPI.sendNotification(payload)
-        markShown(messageId)
-        return true
-      } catch (err) {
-        // fall through to browser notifications
+    const now = Date.now()
+    if (!burstStartedAt || now - burstStartedAt > BURST_WINDOW_MS) {
+      burstStartedAt = now
+      burstCount = 0
+      burstState = null
+      if (burstTimer) {
+        clearTimeout(burstTimer)
+        burstTimer = null
       }
     }
-
-    if (typeof window === 'undefined' || typeof window.Notification === 'undefined') return false
-    if (!shouldUseBrowserNotifications()) return false
-
-    if (Notification.permission === 'granted') {
-      new Notification(title, { body, silent })
-      markShown(messageId)
-      return true
+    burstCount += 1
+    const cooldownActive = now - lastShownAt < NOTIFICATION_COOLDOWN_MS
+    const shouldBatch = burstCount > 3 || cooldownActive
+    if (shouldBatch) {
+      burstState = { title, body, silent, showSubtitle, author, messageId, channelId, chatName }
+      if (!burstTimer) {
+        burstTimer = setTimeout(() => {
+          burstTimer = null
+          const pending = burstState
+          burstState = null
+          if (!pending) return
+          const summaryBody = burstCount > 1 ? `${pending.body} (+${burstCount - 1})` : pending.body
+          sendSystemNotification({ ...pending, body: summaryBody }).catch(() => {})
+          burstCount = 0
+          burstStartedAt = 0
+        }, BURST_DEBOUNCE_MS)
+      }
+      return false
     }
-    const ok = await ensureBrowserPermission()
-    if (ok) {
-      new Notification(title, { body, silent })
-      markShown(messageId)
-      return true
-    }
-    return false
+    return sendSystemNotification({ title, body, silent, showSubtitle, author, messageId, channelId, chatName })
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn('showNewMessageNotification error', err)

@@ -52,6 +52,8 @@ export default function SplashScreen({
   statusText = '',
   secondaryActionLabel,
   onSecondaryAction,
+  tertiaryActionLabel,
+  onTertiaryAction,
 }) {
   return (
     <AnimatePresence onExitComplete={onExitComplete}>
@@ -126,21 +128,32 @@ export default function SplashScreen({
               </motion.p>
             ) : null}
 
+            {secondaryActionLabel && onSecondaryAction ? (
+              <div className="flex flex-col sm:flex-row gap-3 mt-4">
+                <button
+                  type="button"
+                  className="tg-button relative z-10 flex-1"
+                  onClick={onSecondaryAction}
+                >
+                  {secondaryActionLabel}
+                </button>
+                {tertiaryActionLabel && onTertiaryAction ? (
+                  <button
+                    type="button"
+                    className="tg-button relative z-10 flex-1"
+                    onClick={onTertiaryAction}
+                  >
+                    {tertiaryActionLabel}
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+
             <motion.div
               className="splash-progress"
               animate={{ width: ['12%', '68%', '42%', '96%'] }}
               transition={{ duration: 5.4, repeat: Infinity, ease: 'easeInOut' }}
             />
-
-            {secondaryActionLabel && onSecondaryAction ? (
-              <button
-                type="button"
-                className="mt-4 tg-button"
-                onClick={onSecondaryAction}
-              >
-                {secondaryActionLabel}
-              </button>
-            ) : null}
           </motion.div>
         </motion.div>
       )}
