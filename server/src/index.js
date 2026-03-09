@@ -118,6 +118,25 @@ const decryptText = (maybeEncrypted) => {
   }
 }
 
+const encryptBuffer = (buffer) => {
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
+  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return Buffer.concat([iv, tag, encrypted])
+}
+
+const decryptBuffer = (payload) => {
+  if (!payload || payload.length <= 28) return payload
+  const iv = payload.subarray(0, 12)
+  const tag = payload.subarray(12, 28)
+  const ciphertext = payload.subarray(28)
+  const decipher = crypto.createDecipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
+  decipher.setAuthTag(tag)
+  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+  return decrypted
+}
+
 
 
 const corsOptions = {
@@ -166,11 +185,25 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true })
 if (!fs.existsSync(CHANNEL_AVATAR_DIR)) fs.mkdirSync(CHANNEL_AVATAR_DIR, { recursive: true })
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true })
+const CHUNKS_DIR = path.join(MEDIA_DIR, 'chunks')
+if (!fs.existsSync(CHUNKS_DIR)) fs.mkdirSync(CHUNKS_DIR, { recursive: true })
 const UPLOADS_ROOT = path.resolve(UPLOAD_DIR)
 
 const db = new Database('messenger_e2e.db')
 db.pragma('journal_mode = WAL')
 
+// ensure media_files table for encrypted media storage
+db.exec(`
+CREATE TABLE IF NOT EXISTS media_files (
+  id TEXT PRIMARY KEY,
+  filename TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  owner_id TEXT DEFAULT '',
+  data BLOB NOT NULL,
+  uploaded_at INTEGER NOT NULL
+);
+`)
 const identifierPattern = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 const getTableColumns = (table) => {
@@ -1710,30 +1743,109 @@ app.post('/api/profile/avatar', auth, (req, res) => {
 })
 
 app.post('/api/media', auth, (req, res) => {
-  mediaUpload.single('file')(req, res, (err) => {
+  // accept small single-file uploads into memory, encrypt and store in DB
+  const single = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }).single('file')
+  single(req, res, (err) => {
     if (err) {
       const code = err.code === 'LIMIT_FILE_SIZE' ? 'media_too_large' : 'invalid_media'
       return res.status(400).json({ error: code })
     }
-    if (!req.file) return res.status(400).json({ error: 'invalid_media' })
-    const relPath = path.relative(UPLOAD_DIR, req.file.path).replace(/\\/g, '/')
-    const originalName = typeof req.file.originalname === 'string' ? req.file.originalname : req.file.filename
-    const payload = {
-      path: relPath,
-      url: `/api/media/${encodeURIComponent(path.basename(relPath))}`,
-      name: originalName,
-      mime: req.file.mimetype || 'application/octet-stream',
-      size: req.file.size || 0,
-      uploadedAt: Date.now(),
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'invalid_media' })
+    try {
+      const originalName = typeof req.file.originalname === 'string' ? req.file.originalname : 'file'
+      const id = uuidv4()
+      const encrypted = encryptBuffer(req.file.buffer)
+      const size = req.file.size || 0
+      const insert = db.prepare('INSERT INTO media_files (id, filename, mime, size, owner_id, data, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      insert.run(id, originalName, req.file.mimetype || 'application/octet-stream', size, req.user.id, encrypted, Date.now())
+      const payload = {
+        id,
+        url: `/api/media/${encodeURIComponent(id)}`,
+        name: originalName,
+        mime: req.file.mimetype || 'application/octet-stream',
+        size,
+        uploadedAt: Date.now(),
+      }
+      log('[MEDIA] uploaded -> db', 'user=' + req.user.id, 'id=' + id, 'mime=' + payload.mime)
+      res.json({ media: payload })
+    } catch (e) {
+      logError('[MEDIA] single upload failed', e?.message || e)
+      res.status(500).json({ error: 'server_error' })
     }
-    log('[MEDIA] uploaded', 'user=' + req.user.id, 'file=' + path.basename(relPath), 'mime=' + payload.mime)
-    res.json({ media: payload })
+  })
+})
+
+// chunk upload endpoint: receive chunks, assemble when complete and store encrypted in DB
+app.post('/api/media/chunk', auth, (req, res) => {
+  const single = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }).single('chunk')
+  single(req, res, async (err) => {
+    if (err) {
+      const code = err.code === 'LIMIT_FILE_SIZE' ? 'media_too_large' : 'invalid_media'
+      return res.status(400).json({ error: code })
+    }
+    if (!req.file || !req.body) return res.status(400).json({ error: 'invalid_chunk' })
+    const uploadId = typeof req.body.uploadId === 'string' ? req.body.uploadId.trim() : ''
+    const index = Number.isFinite(Number(req.body.index)) ? parseInt(req.body.index, 10) : null
+    const total = Number.isFinite(Number(req.body.total)) ? parseInt(req.body.total, 10) : null
+    const originalName = typeof req.body.filename === 'string' ? req.body.filename : 'file'
+    const mime = typeof req.body.mime === 'string' ? req.body.mime : (req.file.mimetype || 'application/octet-stream')
+    if (!uploadId || index === null || total === null) return res.status(400).json({ error: 'invalid_chunk_meta' })
+    try {
+      const chunkPath = path.join(CHUNKS_DIR, `${uploadId}-${index}`)
+      fs.writeFileSync(chunkPath, req.file.buffer)
+      log('[MEDIA:chunk] saved', 'user=' + req.user.id, 'upload=' + uploadId, 'index=' + index)
+      // check if all chunks received
+      const files = fs.readdirSync(CHUNKS_DIR).filter((f) => f.startsWith(uploadId + '-'))
+      if (files.length === total) {
+        // assemble in order
+        const buffers = []
+        for (let i = 0; i < total; i += 1) {
+          const p = path.join(CHUNKS_DIR, `${uploadId}-${i}`)
+          if (!fs.existsSync(p)) throw new Error('missing_chunk_' + i)
+          buffers.push(fs.readFileSync(p))
+        }
+        const full = Buffer.concat(buffers)
+        const id = uuidv4()
+        const encrypted = encryptBuffer(full)
+        const insert = db.prepare('INSERT INTO media_files (id, filename, mime, size, owner_id, data, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        insert.run(id, originalName, mime, full.length, req.user.id, encrypted, Date.now())
+        // cleanup chunks
+        for (const f of files) {
+          try { fs.unlinkSync(path.join(CHUNKS_DIR, f)) } catch (_) {}
+        }
+        const payload = { id, url: `/api/media/${encodeURIComponent(id)}`, name: originalName, mime, size: full.length, uploadedAt: Date.now() }
+        log('[MEDIA:chunk] assembled -> db', 'user=' + req.user.id, 'id=' + id, 'chunks=' + total)
+        return res.json({ media: payload })
+      }
+      return res.json({ ok: true, received: index })
+    } catch (e) {
+      logError('[MEDIA:chunk] failed', e?.message || e)
+      return res.status(500).json({ error: 'server_error' })
+    }
   })
 })
 
 app.get('/api/media/:name', (req, res) => {
   const raw = typeof req.params?.name === 'string' ? req.params.name : ''
   const safeName = path.basename(raw)
+  // try to find media by id in DB (encrypted storage)
+  try {
+    const row = db.prepare('SELECT id, filename, mime, size, data FROM media_files WHERE id = ?').get(safeName)
+    if (row) {
+      const decrypted = decryptBuffer(row.data)
+      if (req.query?.download === '1') {
+        res.setHeader('Content-Disposition', `attachment; filename="${String(row.filename).replace(/"/g, '')}"`)
+        res.setHeader('Content-Type', 'application/octet-stream')
+      } else {
+        res.setHeader('Content-Type', row.mime || 'application/octet-stream')
+      }
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+      return res.send(decrypted)
+    }
+  } catch (e) {
+    warn('[MEDIA] db lookup failed', e?.message || e)
+  }
+  // fallback to file on disk (legacy)
   const mediaPath = path.resolve(path.join(MEDIA_DIR, safeName))
   if (!mediaPath.startsWith(path.resolve(MEDIA_DIR))) return res.status(403).json({ error: 'forbidden' })
   if (!fs.existsSync(mediaPath)) return res.status(404).json({ error: 'not_found' })
