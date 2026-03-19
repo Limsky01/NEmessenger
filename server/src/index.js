@@ -12,6 +12,7 @@ import fs from 'fs'
 import path from 'path'
 import multer from 'multer'
 import crypto from 'crypto'
+import { Transform } from 'stream'
 
 
 const app = express()
@@ -137,6 +138,83 @@ const decryptBuffer = (payload) => {
   return decrypted
 }
 
+const ENCRYPTED_MEDIA_IV_LENGTH = 12
+const ENCRYPTED_MEDIA_TAG_LENGTH = 16
+
+const encryptChunksToFile = (chunkPaths, outputPath) => {
+  const iv = crypto.randomBytes(ENCRYPTED_MEDIA_IV_LENGTH)
+  const cipher = crypto.createCipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
+  const handle = fs.openSync(outputPath, 'w')
+  try {
+    fs.writeFileSync(handle, iv)
+    for (const chunkPath of chunkPaths) {
+      const chunkBuffer = fs.readFileSync(chunkPath)
+      const encryptedChunk = cipher.update(chunkBuffer)
+      if (encryptedChunk.length) fs.writeFileSync(handle, encryptedChunk)
+    }
+    const finalChunk = cipher.final()
+    if (finalChunk.length) fs.writeFileSync(handle, finalChunk)
+    fs.writeFileSync(handle, cipher.getAuthTag())
+  } finally {
+    fs.closeSync(handle)
+  }
+}
+
+class DecryptTailTransform extends Transform {
+  constructor(iv) {
+    super()
+    this.decipher = crypto.createDecipheriv('aes-256-gcm', DATA_ENCRYPTION_KEY, iv)
+    this.tail = Buffer.alloc(0)
+  }
+
+  _transform(chunk, _encoding, callback) {
+    try {
+      const combined = this.tail.length ? Buffer.concat([this.tail, chunk]) : chunk
+      if (combined.length <= ENCRYPTED_MEDIA_TAG_LENGTH) {
+        this.tail = combined
+        callback()
+        return
+      }
+      const body = combined.subarray(0, combined.length - ENCRYPTED_MEDIA_TAG_LENGTH)
+      this.tail = combined.subarray(combined.length - ENCRYPTED_MEDIA_TAG_LENGTH)
+      const decrypted = this.decipher.update(body)
+      if (decrypted.length) this.push(decrypted)
+      callback()
+    } catch (err) {
+      callback(err)
+    }
+  }
+
+  _flush(callback) {
+    try {
+      if (this.tail.length !== ENCRYPTED_MEDIA_TAG_LENGTH) {
+        callback(new Error('invalid_encrypted_media'))
+        return
+      }
+      this.decipher.setAuthTag(this.tail)
+      const finalChunk = this.decipher.final()
+      if (finalChunk.length) this.push(finalChunk)
+      callback()
+    } catch (err) {
+      callback(err)
+    }
+  }
+}
+
+const createEncryptedMediaReadStream = (filePath) => {
+  const stats = fs.statSync(filePath)
+  const minimumSize = ENCRYPTED_MEDIA_IV_LENGTH + ENCRYPTED_MEDIA_TAG_LENGTH
+  if (stats.size <= minimumSize) throw new Error('invalid_encrypted_media')
+  const handle = fs.openSync(filePath, 'r')
+  const iv = Buffer.alloc(ENCRYPTED_MEDIA_IV_LENGTH)
+  try {
+    fs.readSync(handle, iv, 0, ENCRYPTED_MEDIA_IV_LENGTH, 0)
+  } finally {
+    fs.closeSync(handle)
+  }
+  return fs.createReadStream(filePath, { start: ENCRYPTED_MEDIA_IV_LENGTH }).pipe(new DecryptTailTransform(iv))
+}
+
 
 
 const corsOptions = {
@@ -201,6 +279,15 @@ CREATE TABLE IF NOT EXISTS media_files (
   size INTEGER NOT NULL,
   owner_id TEXT DEFAULT '',
   data BLOB NOT NULL,
+  uploaded_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS media_stream_files (
+  id TEXT PRIMARY KEY,
+  filename TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  owner_id TEXT DEFAULT '',
+  storage_path TEXT NOT NULL,
   uploaded_at INTEGER NOT NULL
 );
 `)
@@ -473,6 +560,12 @@ const selectChannelKeyStmt = db.prepare(
 const findMessageById = hasMessageReplyColumn
   ? db.prepare('SELECT id, channel_id, sender_id, reply_to FROM messages WHERE id=?')
   : db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
+const insertStreamMediaStmt = db.prepare(
+  'INSERT INTO media_stream_files (id, filename, mime, size, owner_id, storage_path, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+)
+const selectStreamMediaByIdStmt = db.prepare(
+  'SELECT id, filename, mime, size, storage_path FROM media_stream_files WHERE id=?',
+)
 
 const messageSelectBase = hasMessageReplyColumn
   ? `SELECT m.*, parent.sender_id AS reply_sender_id, parent.content AS reply_content, parent.created_at AS reply_created_at,
@@ -1797,25 +1890,32 @@ app.post('/api/media/chunk', auth, (req, res) => {
       // check if all chunks received
       const files = fs.readdirSync(CHUNKS_DIR).filter((f) => f.startsWith(uploadId + '-'))
       if (files.length === total) {
-        // assemble in order
-        const buffers = []
-        for (let i = 0; i < total; i += 1) {
-          const p = path.join(CHUNKS_DIR, `${uploadId}-${i}`)
-          if (!fs.existsSync(p)) throw new Error('missing_chunk_' + i)
-          buffers.push(fs.readFileSync(p))
+        const extension = path.extname(originalName || '').toLowerCase()
+        const safeExt = extension && extension.length <= 16 ? extension : ''
+        const id = `${uuidv4()}${safeExt}`
+        const outputPath = path.join(MEDIA_DIR, id)
+        const orderedChunkPaths = []
+        let totalSize = 0
+        try {
+          for (let i = 0; i < total; i += 1) {
+            const p = path.join(CHUNKS_DIR, `${uploadId}-${i}`)
+            if (!fs.existsSync(p)) throw new Error('missing_chunk_' + i)
+            orderedChunkPaths.push(p)
+            totalSize += fs.statSync(p).size
+          }
+          encryptChunksToFile(orderedChunkPaths, outputPath)
+          insertStreamMediaStmt.run(id, originalName, mime, totalSize, req.user.id, id, Date.now())
+          const payload = { id, url: `/api/media/${encodeURIComponent(id)}`, name: originalName, mime, size: totalSize, uploadedAt: Date.now() }
+          log('[MEDIA:chunk] assembled -> encrypted-file', 'user=' + req.user.id, 'id=' + id, 'chunks=' + total, 'size=' + totalSize)
+          return res.json({ media: payload })
+        } finally {
+          for (const f of files) {
+            try { fs.unlinkSync(path.join(CHUNKS_DIR, f)) } catch (_) {}
+          }
+          if (!selectStreamMediaByIdStmt.get(id) && fs.existsSync(outputPath)) {
+            try { fs.unlinkSync(outputPath) } catch (_) {}
+          }
         }
-        const full = Buffer.concat(buffers)
-        const id = uuidv4()
-        const encrypted = encryptBuffer(full)
-        const insert = db.prepare('INSERT INTO media_files (id, filename, mime, size, owner_id, data, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        insert.run(id, originalName, mime, full.length, req.user.id, encrypted, Date.now())
-        // cleanup chunks
-        for (const f of files) {
-          try { fs.unlinkSync(path.join(CHUNKS_DIR, f)) } catch (_) {}
-        }
-        const payload = { id, url: `/api/media/${encodeURIComponent(id)}`, name: originalName, mime, size: full.length, uploadedAt: Date.now() }
-        log('[MEDIA:chunk] assembled -> db', 'user=' + req.user.id, 'id=' + id, 'chunks=' + total)
-        return res.json({ media: payload })
       }
       return res.json({ ok: true, received: index })
     } catch (e) {
@@ -1825,7 +1925,7 @@ app.post('/api/media/chunk', auth, (req, res) => {
   })
 })
 
-app.get('/api/media/:name', (req, res) => {
+app.get('/api/media/:name', auth, (req, res) => {
   const raw = typeof req.params?.name === 'string' ? req.params.name : ''
   const safeName = path.basename(raw)
   // try to find media by id in DB (encrypted storage)
@@ -1844,6 +1944,25 @@ app.get('/api/media/:name', (req, res) => {
     }
   } catch (e) {
     warn('[MEDIA] db lookup failed', e?.message || e)
+  }
+  // encrypted large-file storage on disk
+  try {
+    const row = selectStreamMediaByIdStmt.get(safeName)
+    if (row?.storage_path) {
+      const mediaPath = path.resolve(path.join(MEDIA_DIR, row.storage_path))
+      if (!mediaPath.startsWith(path.resolve(MEDIA_DIR))) return res.status(403).json({ error: 'forbidden' })
+      if (!fs.existsSync(mediaPath)) return res.status(404).json({ error: 'not_found' })
+      if (req.query?.download === '1') {
+        res.setHeader('Content-Disposition', `attachment; filename="${String(row.filename).replace(/"/g, '')}"`)
+        res.setHeader('Content-Type', 'application/octet-stream')
+      } else {
+        res.setHeader('Content-Type', row.mime || 'application/octet-stream')
+      }
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+      return createEncryptedMediaReadStream(mediaPath).pipe(res)
+    }
+  } catch (e) {
+    warn('[MEDIA] stream-file lookup failed', e?.message || e)
   }
   // fallback to file on disk (legacy)
   const mediaPath = path.resolve(path.join(MEDIA_DIR, safeName))
@@ -2158,6 +2277,12 @@ app.patch('/api/messages/:id', auth, (req, res) => {
   if (!rawContent) return res.status(400).json({ error: 'content_required' })
   const message = selectMessageFullById.get(req.params.id)
   if (!message) return res.status(404).json({ error: 'not_found' })
+  if (!isEditableMessageContent(message.content)) {
+    return res.status(400).json({ error: 'message_not_editable' })
+  }
+  if (!isEditableMessageContent(rawContent)) {
+    return res.status(400).json({ error: 'invalid_message_content' })
+  }
   let isChannelOwner = false
   if (!message.channel_id.startsWith('dm:')) {
     const channel = selectChannelByIdStmt.get(message.channel_id)
@@ -2244,6 +2369,144 @@ const insertMessage = (() => {
 })()
 
 const typingState = new Map()
+const activeCalls = new Map()
+const callByUser = new Map()
+const CALL_RING_TIMEOUT_MS = Math.max(15000, parseInt(process.env.CALL_RING_TIMEOUT_MS || '', 10) || 30000)
+
+const publicCallUser = (userId) => {
+  const user = selectUserById.get(userId)
+  return {
+    id: userId,
+    username: user?.username || '',
+    displayName: user?.display_name || '',
+    avatarUrl: user?.avatar_url || '',
+    avatarUpdatedAt: user?.avatar_updated_at || 0,
+    nameStyle: normalizeNameStyle(user?.name_style ?? ''),
+  }
+}
+
+const formatCallPayload = (call) => ({
+  callId: call.id,
+  channelId: call.channelId,
+  callerId: call.callerId,
+  calleeId: call.calleeId,
+  status: call.status,
+  createdAt: call.createdAt,
+  acceptedAt: call.acceptedAt || 0,
+  caller: publicCallUser(call.callerId),
+  callee: publicCallUser(call.calleeId),
+})
+
+const clearCallTimer = (call) => {
+  if (!call?.timeoutId) return
+  clearTimeout(call.timeoutId)
+  call.timeoutId = null
+}
+
+const cleanupCall = (callId) => {
+  const call = activeCalls.get(callId)
+  if (!call) return null
+  clearCallTimer(call)
+  activeCalls.delete(callId)
+  if (callByUser.get(call.callerId) === callId) callByUser.delete(call.callerId)
+  if (callByUser.get(call.calleeId) === callId) callByUser.delete(call.calleeId)
+  return call
+}
+
+const buildCallHistoryContent = ({ direction, status, durationSec = 0, partnerId = '', endedBy = '' }) =>
+  `MSGJSON:${JSON.stringify({
+    text: '',
+    attachments: [],
+    voice: null,
+    call: {
+      direction,
+      status,
+      durationSec,
+      partnerId,
+      endedBy,
+    },
+  })}`
+
+const isEditableMessageContent = (content) => {
+  if (typeof content !== 'string') return false
+  const trimmed = content.trim()
+  if (!trimmed) return false
+  const prefix = 'MSGJSON:'
+  if (!trimmed.startsWith(prefix)) return true
+  try {
+    const parsed = JSON.parse(trimmed.slice(prefix.length))
+    const text = typeof parsed?.text === 'string' ? parsed.text.trim() : ''
+    const attachments = Array.isArray(parsed?.attachments) ? parsed.attachments : []
+    const voice = parsed?.voice && typeof parsed.voice === 'object' ? parsed.voice : null
+    const call = parsed?.call && typeof parsed.call === 'object' ? parsed.call : null
+    return Boolean(text) && attachments.length === 0 && !voice && !call
+  } catch (_) {
+    return false
+  }
+}
+
+const publishCallHistoryMessage = (call, reason, endedBy = null) => {
+  if (!call?.channelId || !call.callerId || !call.calleeId) return
+  const durationSec = call.acceptedAt ? Math.max(0, Math.round((Date.now() - call.acceptedAt) / 1000)) : 0
+  const callerStatus =
+    reason === 'missed'
+      ? 'missed'
+      : reason === 'declined'
+        ? 'declined'
+        : reason === 'cancelled'
+          ? 'cancelled'
+          : reason === 'disconnected'
+            ? 'disconnected'
+            : 'completed'
+  const calleeStatus =
+    reason === 'missed'
+      ? 'missed'
+      : reason === 'declined'
+        ? 'declined'
+        : reason === 'cancelled'
+          ? 'cancelled'
+          : reason === 'disconnected'
+            ? 'disconnected'
+            : 'completed'
+
+  const messagesToInsert = [
+    {
+      senderId: call.callerId,
+      content: buildCallHistoryContent({
+        direction: 'outgoing',
+        status: callerStatus,
+        durationSec,
+        partnerId: call.calleeId,
+        endedBy: endedBy || '',
+      }),
+    },
+    {
+      senderId: call.calleeId,
+      content: buildCallHistoryContent({
+        direction: 'incoming',
+        status: calleeStatus,
+        durationSec,
+        partnerId: call.callerId,
+        endedBy: endedBy || '',
+      }),
+    },
+  ]
+
+  const room = io.sockets.adapter.rooms.get(call.channelId) || new Set()
+  for (const entry of messagesToInsert) {
+    const id = uuidv4()
+    const now = Date.now()
+    insertMessage.run(id, call.channelId, entry.senderId, entry.content, now, null)
+    const inserted = selectMessageFullById.get(id)
+    const payload = publicMessage(inserted)
+    io.to(call.channelId).emit('message:new', payload)
+    ;[call.callerId, call.calleeId].forEach((participantId) => {
+      const sid = onlineUsers.get(participantId)
+      if (!sid || room.has(sid)) return
+      io.to(sid).emit('message:new', payload)
+    })
+  }
+}
 
 const generateInviteCode = (length = INVITE_CODE_LENGTH) => {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -2389,6 +2652,21 @@ io.on('connection', (socket) => {
       typingState.delete(key)
       sendTypingUpdate(channelId, false)
     }
+  }
+
+  const terminateCall = (callId, reason, endedBy = null) => {
+    const existing = activeCalls.get(callId)
+    if (!existing) return
+    publishCallHistoryMessage(existing, reason, endedBy)
+    const payload = {
+      ...formatCallPayload(existing),
+      reason: reason || 'ended',
+      endedBy: endedBy || '',
+    }
+    cleanupCall(callId)
+    emitToUser(existing.callerId, 'call:ended', payload)
+    emitToUser(existing.calleeId, 'call:ended', payload)
+    log('[CALL] ended', 'call=' + callId, 'reason=' + payload.reason, 'by=' + (payload.endedBy || '-'))
   }
 
   const accessibleChannels = getAccessibleChannelsForUser(userRecord)
@@ -2541,7 +2819,126 @@ io.on('connection', (socket) => {
     }
   })
 
+  socket.on('call:start', ({ channelId } = {}, ack) => {
+    const reply = typeof ack === 'function' ? ack : () => {}
+    if (!channelId || !channelId.startsWith('dm:')) {
+      reply({ ok: false, error: 'direct_call_only' })
+      return
+    }
+    if (!canAccessDirectChannel(channelId, userId)) {
+      reply({ ok: false, error: 'forbidden' })
+      return
+    }
+    if (callByUser.has(userId)) {
+      reply({ ok: false, error: 'call_busy' })
+      return
+    }
+    const normalizedChannelId = normalizeDirectChannelId(channelId)
+    const parsed = parseDirectChannelId(normalizedChannelId)
+    const calleeId = parsed?.first === userId ? parsed.second : parsed?.first
+    if (!calleeId) {
+      reply({ ok: false, error: 'invalid_channel' })
+      return
+    }
+    if (callByUser.has(calleeId)) {
+      reply({ ok: false, error: 'peer_busy' })
+      return
+    }
+    const calleeSocketId = onlineUsers.get(calleeId)
+    if (!calleeSocketId) {
+      reply({ ok: false, error: 'peer_offline' })
+      return
+    }
+    const call = {
+      id: uuidv4(),
+      channelId: normalizedChannelId,
+      callerId: userId,
+      calleeId,
+      status: 'ringing',
+      createdAt: Date.now(),
+      acceptedAt: 0,
+      timeoutId: null,
+    }
+    call.timeoutId = setTimeout(() => {
+      terminateCall(call.id, 'missed', null)
+    }, CALL_RING_TIMEOUT_MS)
+    activeCalls.set(call.id, call)
+    callByUser.set(call.callerId, call.id)
+    callByUser.set(call.calleeId, call.id)
+    const payload = formatCallPayload(call)
+    socket.emit('call:outgoing', payload)
+    emitToUser(calleeId, 'call:incoming', payload)
+    log('[CALL] start', 'call=' + call.id, 'caller=' + userId, 'callee=' + calleeId, 'channel=' + normalizedChannelId)
+    reply({ ok: true, callId: call.id })
+  })
+
+  socket.on('call:accept', ({ callId } = {}, ack) => {
+    const reply = typeof ack === 'function' ? ack : () => {}
+    const call = activeCalls.get(callId)
+    if (!call) {
+      reply({ ok: false, error: 'call_not_found' })
+      return
+    }
+    if (call.calleeId !== userId) {
+      reply({ ok: false, error: 'forbidden' })
+      return
+    }
+    if (call.status !== 'ringing') {
+      reply({ ok: false, error: 'call_not_ringing' })
+      return
+    }
+    call.status = 'accepted'
+    call.acceptedAt = Date.now()
+    clearCallTimer(call)
+    const payload = formatCallPayload(call)
+    emitToUser(call.callerId, 'call:accepted', payload)
+    emitToUser(call.calleeId, 'call:accepted', payload)
+    log('[CALL] accepted', 'call=' + call.id, 'callee=' + userId)
+    reply({ ok: true })
+  })
+
+  socket.on('call:decline', ({ callId } = {}, ack) => {
+    const reply = typeof ack === 'function' ? ack : () => {}
+    const call = activeCalls.get(callId)
+    if (!call) {
+      reply({ ok: false, error: 'call_not_found' })
+      return
+    }
+    if (call.callerId !== userId && call.calleeId !== userId) {
+      reply({ ok: false, error: 'forbidden' })
+      return
+    }
+    const reason = call.calleeId === userId ? 'declined' : 'cancelled'
+    terminateCall(call.id, reason, userId)
+    reply({ ok: true })
+  })
+
+  socket.on('call:end', ({ callId } = {}, ack) => {
+    const reply = typeof ack === 'function' ? ack : () => {}
+    const call = activeCalls.get(callId)
+    if (!call) {
+      reply({ ok: true })
+      return
+    }
+    if (call.callerId !== userId && call.calleeId !== userId) {
+      reply({ ok: false, error: 'forbidden' })
+      return
+    }
+    terminateCall(call.id, 'ended', userId)
+    reply({ ok: true })
+  })
+
   socket.on('disconnect', () => {
+    const activeCallId = callByUser.get(userId)
+    if (activeCallId) {
+      const call = activeCalls.get(activeCallId)
+      if (call) {
+        const reason = call.status === 'accepted' ? 'disconnected' : 'cancelled'
+        terminateCall(activeCallId, reason, userId)
+      } else {
+        callByUser.delete(userId)
+      }
+    }
     onlineUsers.delete(userId)
     const keysToClear = []
     typingState.forEach((_, key) => {

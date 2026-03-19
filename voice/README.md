@@ -21,7 +21,9 @@ npm start
 - `VOICE_HOST` - bind host
 - `VOICE_ORIGIN` - CORS origins (через запятую)
 - `VOICE_ANNOUNCED_IP` - внешний IP сервера (обязательно за NAT)
+- `VOICE_WEBRTC_PORT` - фиксированный UDP/TCP порт для WebRTC-медиа
 - `VOICE_RTC_MIN_PORT` / `VOICE_RTC_MAX_PORT` - UDP/TCP диапазон mediasoup
+- `VOICE_TRANSPORT_MODE` - оставьте пустым для UDP+TCP (рекомендуется), `tcp-only` только как запасной режим
 
 ## Socket Events API
 
@@ -71,5 +73,7 @@ ack({ ok: false, error: '...' })
 ## Важно для продакшена
 
 - Добавьте TURN-сервер (`coturn`) для стабильной связи за сложным NAT/Firewall.
-- Откройте диапазон `VOICE_RTC_MIN_PORT..VOICE_RTC_MAX_PORT`.
+- Откройте `VOICE_WEBRTC_PORT` в firewall/router. Это важнее всего для прохождения аудио.
+- Если используете старую схему без общего WebRTC-сервера, откройте диапазон `VOICE_RTC_MIN_PORT..VOICE_RTC_MAX_PORT`.
+- Не включайте TCP-only без необходимости: для локальной сети и обычного интернета стабильнее режим UDP+TCP с приоритетом UDP.
 - Используйте TLS на edge (reverse proxy) и авторизацию сокета (JWT).

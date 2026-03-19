@@ -8,6 +8,7 @@ import mediasoup from 'mediasoup'
 const PORT = Number(process.env.VOICE_PORT || 4010)
 const HOST = process.env.VOICE_HOST || '0.0.0.0'
 const ANNOUNCED_IP = process.env.VOICE_ANNOUNCED_IP || undefined
+const WEBRTC_PORT = Number(process.env.VOICE_WEBRTC_PORT || 44444)
 const ORIGINS = (process.env.VOICE_ORIGIN || '*')
   .split(',')
   .map((v) => v.trim())
@@ -27,6 +28,7 @@ const io = new Server(server, {
 
 const rooms = new Map()
 let worker
+let webRtcServer
 
 const mediaCodecs = [
   {
@@ -48,6 +50,27 @@ const createWorker = async () => {
     warn('mediasoup worker died, exiting process')
     setTimeout(() => process.exit(1), 1500)
   })
+  return created
+}
+
+const createSharedWebRtcServer = async () => {
+  const created = await worker.createWebRtcServer({
+    listenInfos: [
+      {
+        protocol: 'udp',
+        ip: '0.0.0.0',
+        announcedAddress: ANNOUNCED_IP,
+        port: WEBRTC_PORT,
+      },
+      {
+        protocol: 'tcp',
+        ip: '0.0.0.0',
+        announcedAddress: ANNOUNCED_IP,
+        port: WEBRTC_PORT,
+      },
+    ],
+  })
+  log('webrtc server started', `${ANNOUNCED_IP || HOST}:${WEBRTC_PORT}`)
   return created
 }
 
@@ -112,24 +135,39 @@ const closePeerResources = (room, peerId) => {
   room.peers.delete(peerId)
 }
 
+const transportMode = String(process.env.VOICE_TRANSPORT_MODE || process.env.VOICE_FORCE_TCP || '')
+  .trim()
+  .toLowerCase()
+const TCP_ONLY = transportMode === 'tcp-only' || transportMode === 'only'
+
 const createWebRtcTransport = async (router) => {
   const transport = await router.createWebRtcTransport({
-    listenIps: [{ ip: '0.0.0.0', announcedIp: ANNOUNCED_IP }],
-    enableUdp: true,
+    webRtcServer,
+    enableUdp: !TCP_ONLY,
     enableTcp: true,
-    preferUdp: true,
+    preferUdp: !TCP_ONLY,
   })
 
   transport.on('dtlsstatechange', (state) => {
+    log('transport dtlsstate', transport.id, state)
     if (state === 'closed') {
       try { transport.close() } catch (_) {}
     }
   })
 
   transport.on('icestatechange', (state) => {
-    if (state === 'disconnected' || state === 'closed') {
-      log('transport state', transport.id, state)
+    log('transport icestate', transport.id, state)
+    if (state === 'connected') {
+      const tuple = transport.iceSelectedTuple
+      if (tuple) {
+        log('transport tuple', transport.id, `${tuple.localIp}:${tuple.localPort} -> ${tuple.remoteIp}:${tuple.remotePort} ${tuple.protocol}`)
+      }
     }
+  })
+
+  transport.on('trace', (trace) => {
+    if (!trace) return
+    log('transport trace', transport.id, trace.type || '-', trace.direction || '-', JSON.stringify(trace.info || {}))
   })
 
   return transport
@@ -234,6 +272,9 @@ io.on('connection', (socket) => {
     if (!transportRecord) throw new Error('transport_not_found')
 
     const producer = await transportRecord.transport.produce({ kind, rtpParameters, appData })
+    try {
+      await producer.enableTraceEvent(['rtp', 'keyframe', 'nack', 'pli', 'fir'])
+    } catch (_) {}
 
     room.producers.set(producer.id, { producer, roomId, peerId: socket.id })
     peer.producers.add(producer.id)
@@ -241,6 +282,13 @@ io.on('connection', (socket) => {
     producer.on('transportclose', () => {
       room.producers.delete(producer.id)
       peer.producers.delete(producer.id)
+    })
+    producer.on('score', (score) => {
+      log('producer score', producer.id, JSON.stringify(score))
+    })
+    producer.on('trace', (trace) => {
+      if (!trace) return
+      log('producer trace', producer.id, trace.type || '-', trace.direction || '-', JSON.stringify(trace.info || {}))
     })
 
     io.to(roomId).emit('newProducer', { peerId: socket.id, producerId: producer.id, kind })
@@ -337,6 +385,7 @@ io.on('connection', (socket) => {
 
 const bootstrap = async () => {
   worker = await createWorker()
+  webRtcServer = await createSharedWebRtcServer()
   server.listen(PORT, HOST, () => {
     log(`voice SFU started on ${HOST}:${PORT}`)
   })
