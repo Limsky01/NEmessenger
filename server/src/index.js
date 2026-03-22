@@ -444,6 +444,9 @@ ensureColumn('users', 'avatar_url', 'TEXT DEFAULT ""')
 ensureColumn('users', 'avatar_updated_at', 'INTEGER DEFAULT 0')
 ensureColumn('users', 'avatar_mime', 'TEXT DEFAULT ""')
 ensureColumn('users', 'public_key', 'TEXT DEFAULT ""')
+ensureColumn('users', 'e2e_identity_box', 'TEXT DEFAULT ""')
+ensureColumn('users', 'e2e_identity_salt', 'TEXT DEFAULT ""')
+ensureColumn('users', 'e2e_identity_iv', 'TEXT DEFAULT ""')
 ensureColumn('users', 'display_name', 'TEXT DEFAULT ""')
 ensureColumn('users', 'name_style', 'TEXT DEFAULT ""')
 ensureColumn('users', 'profile_status', 'TEXT DEFAULT ""')
@@ -480,6 +483,15 @@ try {
 } catch (err) {}
 try {
   db.prepare('ALTER TABLE users ADD COLUMN avatar_mime TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN e2e_identity_box TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN e2e_identity_salt TEXT DEFAULT ""').run()
+} catch (err) {}
+try {
+  db.prepare('ALTER TABLE users ADD COLUMN e2e_identity_iv TEXT DEFAULT ""').run()
 } catch (err) {}
 try {
   db.prepare('ALTER TABLE invites ADD COLUMN claim_token TEXT DEFAULT ""').run()
@@ -552,6 +564,7 @@ const selectUserById = db.prepare('SELECT * FROM users WHERE id=?')
 const selectUserByUsername = db.prepare('SELECT * FROM users WHERE username=?')
 const updateAvatarInfoStmt = db.prepare('UPDATE users SET avatar_url=?, avatar_updated_at=?, avatar_mime=? WHERE id=?')
 const updatePublicKeyStmt = db.prepare('UPDATE users SET public_key=? WHERE id=?')
+const updateE2EIdentityBackupStmt = db.prepare('UPDATE users SET e2e_identity_box=?, e2e_identity_salt=?, e2e_identity_iv=? WHERE id=?')
 const updatePasswordStmt = db.prepare('UPDATE users SET password_hash=? WHERE id=?')
 const updateUserRoleStmt = db.prepare('UPDATE users SET role=? WHERE id=?')
 const updateNameStyleStmt = db.prepare('UPDATE users SET name_style=? WHERE id=?')
@@ -856,6 +869,25 @@ const publicUser = (u) => {
     nameStyle,
     name_style: nameStyle,
   }
+}
+
+const normalizeE2EBackupPayload = (raw) => {
+  const box = typeof raw?.box === 'string' ? raw.box.trim() : ''
+  const salt = typeof raw?.salt === 'string' ? raw.salt.trim() : ''
+  const iv = typeof raw?.iv === 'string' ? raw.iv.trim() : ''
+  if (!box || !salt || !iv) return null
+  if (box.length > 20000 || salt.length > 1024 || iv.length > 1024) return null
+  return { box, salt, iv }
+}
+
+const buildE2EBackupResponse = (user) => {
+  if (!user) return null
+  const backup = normalizeE2EBackupPayload({
+    box: user.e2e_identity_box,
+    salt: user.e2e_identity_salt,
+    iv: user.e2e_identity_iv,
+  })
+  return backup || null
 }
 
 const isValidPublicKey = (value) => {
@@ -1499,10 +1531,18 @@ app.delete('/api/friends/:userId', auth, (req, res) => {
 })
 
 app.post('/api/register', (req, res) => {
-  const { username: rawUsername, password: rawPassword, inviteCode: rawInviteCode, inviteClaimToken, publicKey: rawPublicKey } = req.body || {}
+  const {
+    username: rawUsername,
+    password: rawPassword,
+    inviteCode: rawInviteCode,
+    inviteClaimToken,
+    publicKey: rawPublicKey,
+    e2eBackup: rawE2EBackup,
+  } = req.body || {}
   const username = typeof rawUsername === 'string' ? rawUsername.trim() : ''
   const password = typeof rawPassword === 'string' ? rawPassword : ''
   const publicKey = typeof rawPublicKey === 'string' ? rawPublicKey.trim() : ''
+  const e2eBackup = normalizeE2EBackupPayload(rawE2EBackup)
   if (!username || !password) {
     warn('[REGISTER] invalid payload', req.ip)
     return res.status(400).json({ error: 'username_and_password_required' })
@@ -1560,6 +1600,9 @@ app.post('/api/register', (req, res) => {
     warn('[REGISTER] username_taken', username)
     return res.status(400).json({ error: 'username_taken' })
   }
+  if (e2eBackup) {
+    updateE2EIdentityBackupStmt.run(e2eBackup.box, e2eBackup.salt, e2eBackup.iv, id)
+  }
   db.prepare('INSERT OR IGNORE INTO workspace_members (workspace_id,user_id) VALUES (?,?)').run(defaultWs.id, id)
   if (invite) {
     markInviteUsedStmt.run(id, Date.now(), invite.id)
@@ -1580,7 +1623,7 @@ app.post('/api/register', (req, res) => {
   const refreshToken = jwt.sign({ id, type: 'refresh' }, JWT_SECRET, { expiresIn: '10y' })
   const user = publicUser({ id, username, role, avatar_seed: avatarSeed })
   log('[REGISTER] success', username, 'role=' + role, invite ? 'invite=' + invite.code : 'no_invite')
-  res.json({ accessToken, refreshToken, user })
+  res.json({ accessToken, refreshToken, user, e2e_backup: buildE2EBackupResponse(selectUserById.get(id)) })
   io.emit('user:update', user)
 })
 
@@ -1625,7 +1668,12 @@ app.post('/api/login', (req, res) => {
     }
   }
   
-  const response = { accessToken, refreshToken, user: publicUser(userRecord) }
+  const response = {
+    accessToken,
+    refreshToken,
+    user: publicUser(userRecord),
+    e2e_backup: buildE2EBackupResponse(userRecord),
+  }
   if (deviceId) response.device_id = deviceId
   if (sessionId) response.session_id = sessionId
   res.json(response)
@@ -1981,6 +2029,14 @@ app.post('/api/profile/e2e-key', auth, (req, res) => {
   if (!user) return res.status(404).json({ error: 'not_found' })
   log('[E2E] public key updated', req.user.id)
   res.json({ user: publicUser(user) })
+})
+
+app.post('/api/profile/e2e-backup', auth, (req, res) => {
+  const backup = normalizeE2EBackupPayload(req.body)
+  if (!backup) return res.status(400).json({ error: 'invalid_backup' })
+  updateE2EIdentityBackupStmt.run(backup.box, backup.salt, backup.iv, req.user.id)
+  log('[E2E] identity backup updated', req.user.id)
+  res.json({ ok: true })
 })
 
 app.get('/api/channels/:id/e2e-key', auth, (req, res) => {
