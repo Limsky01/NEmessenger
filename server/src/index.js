@@ -2740,17 +2740,26 @@ const publicCallUser = (userId) => {
   }
 }
 
-const formatCallPayload = (call) => ({
-  callId: call.id,
-  channelId: call.channelId,
-  callerId: call.callerId,
-  calleeId: call.calleeId,
-  status: call.status,
-  createdAt: call.createdAt,
-  acceptedAt: call.acceptedAt || 0,
-  caller: publicCallUser(call.callerId),
-  callee: publicCallUser(call.calleeId),
-})
+const formatCallPayload = (call) => {
+  const caller = publicCallUser(call.callerId)
+  const callee = publicCallUser(call.calleeId)
+  return {
+    callId: call.id,
+    channelId: call.channelId,
+    callerId: call.callerId,
+    calleeId: call.calleeId,
+    status: call.status,
+    createdAt: call.createdAt,
+    acceptedAt: call.acceptedAt || 0,
+    callType: 'audio',
+    caller,
+    callee,
+    callerDisplayName: caller?.displayName || caller?.username || '',
+    calleeDisplayName: callee?.displayName || callee?.username || '',
+    callerAvatarUrl: caller?.avatarUrl || '',
+    calleeAvatarUrl: callee?.avatarUrl || '',
+  }
+}
 
 const clearCallTimer = (call) => {
   if (!call?.timeoutId) return
