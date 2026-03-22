@@ -596,6 +596,7 @@ const listOutgoingFriendRequestsStmt = db.prepare(
 const selectFriendshipStmt = db.prepare('SELECT 1 FROM friends WHERE user_id=? AND friend_id=?')
 const insertFriendStmt = db.prepare('INSERT OR IGNORE INTO friends (user_id, friend_id, created_at) VALUES (?,?,?)')
 const deleteFriendStmt = db.prepare('DELETE FROM friends WHERE user_id=? AND friend_id=?')
+const deleteAllFriendshipsForUserStmt = db.prepare('DELETE FROM friends WHERE user_id=? OR friend_id=?')
 const insertFriendRequestStmt = db.prepare(
   'INSERT INTO friend_requests (id, from_user_id, to_user_id, created_at) VALUES (?,?,?,?)'
 )
@@ -604,6 +605,7 @@ const selectFriendRequestBetweenStmt = db.prepare(
 )
 const selectFriendRequestByIdStmt = db.prepare('SELECT * FROM friend_requests WHERE id=?')
 const deleteFriendRequestByIdStmt = db.prepare('DELETE FROM friend_requests WHERE id=?')
+const deleteAllFriendRequestsForUserStmt = db.prepare('DELETE FROM friend_requests WHERE from_user_id=? OR to_user_id=?')
 const insertInviteStmt = db.prepare(
   'INSERT INTO invites (id, code, created_by, created_at, expires_at, claim_token, claimed_at, used_by, used_at, revoked_at) VALUES (?,?,?,?,?, ?, NULL, NULL, NULL, NULL)'
 )
@@ -634,6 +636,7 @@ const selectActiveSessionsByUserStmt = db.prepare('SELECT * FROM sessions WHERE 
 const updateSessionActivityStmt = db.prepare('UPDATE sessions SET last_activity_at=?, socket_id=? WHERE id=?')
 const terminateSessionStmt = db.prepare('UPDATE sessions SET terminated_at=?, terminated_reason=? WHERE id=?')
 const deleteSessionStmt = db.prepare('DELETE FROM sessions WHERE id=?')
+const deleteSessionsByUserStmt = db.prepare('DELETE FROM sessions WHERE user_id=?')
 
 const upsertChannelKeyStmt = db.prepare(
   'INSERT OR REPLACE INTO channel_keys (channel_id, user_id, wrapped_key, nonce, sender_id, key_version, updated_at) VALUES (?,?,?,?,?,?,?)',
@@ -641,6 +644,7 @@ const upsertChannelKeyStmt = db.prepare(
 const selectChannelKeyStmt = db.prepare(
   'SELECT channel_id, user_id, wrapped_key, nonce, sender_id, key_version, updated_at FROM channel_keys WHERE channel_id=? AND user_id=?',
 )
+const deleteChannelKeysByUserStmt = db.prepare('DELETE FROM channel_keys WHERE user_id=? OR sender_id=?')
 const findMessageById = hasMessageReplyColumn
   ? db.prepare('SELECT id, channel_id, sender_id, reply_to FROM messages WHERE id=?')
   : db.prepare('SELECT id, channel_id, sender_id FROM messages WHERE id=?')
@@ -698,6 +702,7 @@ const listChannelMembersDetailedStmt = db.prepare(
 const insertChannelMemberStmt = db.prepare('INSERT OR REPLACE INTO channel_members (channel_id, user_id, role) VALUES (?,?,?)')
 const deleteChannelMemberStmt = db.prepare('DELETE FROM channel_members WHERE channel_id=? AND user_id=?')
 const deleteChannelMembersStmt = db.prepare('DELETE FROM channel_members WHERE channel_id=?')
+const deleteChannelMembershipsByUserStmt = db.prepare('DELETE FROM channel_members WHERE user_id=?')
 const deleteMessagesByChannelStmt = db.prepare('DELETE FROM messages WHERE channel_id=?')
 const deleteChannelStmt = db.prepare('DELETE FROM channels WHERE id=?')
 const findChannelMemberStmt = db.prepare('SELECT role FROM channel_members WHERE channel_id=? AND user_id=?')
@@ -2420,11 +2425,31 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
       }
     }
   }
+  const affectedFriendIds = new Set()
+  listFriendsStmt.all(id).forEach((row) => {
+    if (row?.id) affectedFriendIds.add(row.id)
+  })
+  listIncomingFriendRequestsStmt.all(id).forEach((row) => {
+    if (row?.id) affectedFriendIds.add(row.id)
+  })
+  listOutgoingFriendRequestsStmt.all(id).forEach((row) => {
+    if (row?.id) affectedFriendIds.add(row.id)
+  })
+  const activeSessions = selectActiveSessionsByUserStmt.all(id) || []
+  const sessionIds = activeSessions.map((session) => session.socket_id).filter(Boolean)
   db.prepare('DELETE FROM messages WHERE sender_id=?').run(id)
+  deleteAllFriendshipsForUserStmt.run(id, id)
+  deleteAllFriendRequestsForUserStmt.run(id, id)
+  deleteChannelMembershipsByUserStmt.run(id)
+  deleteChannelKeysByUserStmt.run(id, id)
   db.prepare('DELETE FROM workspace_members WHERE user_id=?').run(id)
   deletePushSubscriptionsByUserStmt.run(id)
+  deleteSessionsByUserStmt.run(id)
   db.prepare('DELETE FROM users WHERE id=?').run(id)
   const sid = onlineUsers.get(id)
+  sessionIds.forEach((socketId) => {
+    io.to(socketId).emit('account:deleted', { userId: id })
+  })
   if (sid) {
     onlineUsers.delete(id)
     const socket = io.sockets.sockets.get(sid)
@@ -2437,6 +2462,10 @@ app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => {
     }
     io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
   }
+  affectedFriendIds.forEach((friendId) => {
+    emitToUser(friendId, 'friends:requests:update', { reason: 'user_deleted', userId: id })
+  })
+  io.emit('user:deleted', { userId: id })
   log('[ADMIN] user:deleted', 'admin=' + req.user.id, 'target=' + id)
   res.json({ ok: true })
 })
