@@ -2,3 +2,6 @@ client
 server/uploads/
 voice/node_modules/client/
 client/
+upload-keystore.jks
+.github/workflows/android-release.yml
+.vscode/settings.json

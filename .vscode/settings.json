@@ -3,6 +3,10 @@
     "chatgpt.runCodexInWindowsSubsystemForLinux": true,
     "chat.tools.terminal.autoApprove": {
         "npm install": true,
-        "npm start": true
+        "npm start": true,
+        "/^node -e \"const jwt=require\\('jsonwebtoken'\\); console\\.log\\(jwt\\.sign\\(\\{id:'ba680485-dd4d-4059-a892-5ebfc7f9cc6a', username:'admin', role:'admin'\\}, 'dev_secret',\\{expiresIn:'1h'\\}\\)\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

@@ -414,6 +414,29 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   updated_at INTEGER NOT NULL,
   last_seen_at INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS devices (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  device_name TEXT NOT NULL,
+  device_type TEXT NOT NULL,
+  user_agent TEXT DEFAULT '',
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  ip_address TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  socket_id TEXT DEFAULT '',
+  access_token TEXT DEFAULT '',
+  created_at INTEGER NOT NULL,
+  last_activity_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  terminated_at INTEGER,
+  terminated_reason TEXT DEFAULT '',
+  FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+);
 `)
 
 ensureColumn('users', 'avatar_seed', 'TEXT DEFAULT ""')
@@ -495,6 +518,33 @@ try {
   db.prepare('ALTER TABLE messages ADD COLUMN reply_to TEXT REFERENCES messages(id) ON DELETE SET NULL').run()
 } catch (err) {}
 
+// Ensure columns for devices and sessions tables
+ensureColumn('devices', 'id', 'TEXT PRIMARY KEY')
+ensureColumn('devices', 'user_id', 'TEXT NOT NULL')
+ensureColumn('devices', 'device_name', 'TEXT NOT NULL')
+ensureColumn('devices', 'device_type', 'TEXT NOT NULL')
+ensureColumn('devices', 'user_agent', 'TEXT DEFAULT ""')
+ensureColumn('devices', 'created_at', 'INTEGER NOT NULL')
+ensureColumn('devices', 'last_seen_at', 'INTEGER NOT NULL')
+ensureColumn('devices', 'ip_address', 'TEXT DEFAULT ""')
+
+ensureColumn('sessions', 'id', 'TEXT PRIMARY KEY')
+ensureColumn('sessions', 'device_id', 'TEXT NOT NULL')
+ensureColumn('sessions', 'user_id', 'TEXT NOT NULL')
+ensureColumn('sessions', 'socket_id', 'TEXT DEFAULT ""')
+ensureColumn('sessions', 'access_token', 'TEXT DEFAULT ""')
+ensureColumn('sessions', 'created_at', 'INTEGER NOT NULL')
+ensureColumn('sessions', 'last_activity_at', 'INTEGER NOT NULL')
+ensureColumn('sessions', 'expires_at', 'INTEGER NOT NULL')
+ensureColumn('sessions', 'terminated_at', 'INTEGER')
+ensureColumn('sessions', 'terminated_reason', 'TEXT DEFAULT ""')
+
+// Create indices for better performance
+try {
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)').run()
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)').run()
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_sessions_device_id ON sessions(device_id)').run()
+} catch (err) {}
 
 db.prepare('UPDATE users SET avatar_seed = COALESCE(avatar_seed, substr(username,1,2))').run()
 
@@ -551,6 +601,27 @@ const updateInviteClaimStmt = db.prepare('UPDATE invites SET claim_token=?, clai
 const clearInviteClaimStmt = db.prepare("UPDATE invites SET claim_token='', claimed_at=NULL WHERE id=?")
 const markInviteUsedStmt = db.prepare("UPDATE invites SET used_by=?, used_at=?, claim_token='', revoked_at=NULL WHERE id=?")
 const revokeInviteStmt = db.prepare("UPDATE invites SET revoked_at=?, claim_token='' WHERE id=?")
+
+// Device and Session management statements
+const insertDeviceStmt = db.prepare(
+  'INSERT INTO devices (id, user_id, device_name, device_type, user_agent, created_at, last_seen_at, ip_address) VALUES (?,?,?,?,?,?,?,?)'
+)
+const selectDeviceByIdStmt = db.prepare('SELECT * FROM devices WHERE id=?')
+const selectDevicesByUserStmt = db.prepare('SELECT * FROM devices WHERE user_id=? ORDER BY last_seen_at DESC')
+const updateDeviceLastSeenStmt = db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?')
+const deleteDeviceStmt = db.prepare('DELETE FROM devices WHERE id=?')
+
+const insertSessionStmt = db.prepare(
+  'INSERT INTO sessions (id, device_id, user_id, socket_id, access_token, created_at, last_activity_at, expires_at) VALUES (?,?,?,?,?,?,?,?)'
+)
+const selectSessionByIdStmt = db.prepare('SELECT * FROM sessions WHERE id=?')
+const selectSessionsByDeviceStmt = db.prepare('SELECT * FROM sessions WHERE device_id=? ORDER BY created_at DESC')
+const selectSessionsByUserStmt = db.prepare('SELECT s.*, d.device_name, d.device_type, d.created_at as device_created_at FROM sessions s JOIN devices d ON s.device_id=d.id WHERE s.user_id=? AND s.terminated_at IS NULL ORDER BY s.last_activity_at DESC')
+const selectActiveSessionsByUserStmt = db.prepare('SELECT * FROM sessions WHERE user_id=? AND terminated_at IS NULL')
+const updateSessionActivityStmt = db.prepare('UPDATE sessions SET last_activity_at=?, socket_id=? WHERE id=?')
+const terminateSessionStmt = db.prepare('UPDATE sessions SET terminated_at=?, terminated_reason=? WHERE id=?')
+const deleteSessionStmt = db.prepare('DELETE FROM sessions WHERE id=?')
+
 const upsertChannelKeyStmt = db.prepare(
   'INSERT OR REPLACE INTO channel_keys (channel_id, user_id, wrapped_key, nonce, sender_id, key_version, updated_at) VALUES (?,?,?,?,?,?,?)',
 )
@@ -1143,6 +1214,177 @@ app.delete('/api/push/subscribe', auth, (req, res) => {
   res.json({ ok: true })
 })
 
+// Sessions and Devices management endpoints
+app.get('/api/sessions', auth, (req, res) => {
+  try {
+    const sessions = selectSessionsByUserStmt.all(req.user.id)
+    res.json(sessions || [])
+  } catch (err) {
+    logError('[SESSIONS] list failed', err.message)
+    res.status(500).json({ error: 'list_failed' })
+  }
+})
+
+app.get('/api/devices', auth, (req, res) => {
+  try {
+    const devices = selectDevicesByUserStmt.all(req.user.id)
+    res.json(devices || [])
+  } catch (err) {
+    logError('[DEVICES] list failed', err.message)
+    res.status(500).json({ error: 'list_failed' })
+  }
+})
+
+app.post('/api/devices/register', auth, (req, res) => {
+  try {
+    const deviceNameRaw = typeof req.body?.device_name === 'string' ? req.body.device_name : ''
+    const deviceTypeRaw = typeof req.body?.device_type === 'string' ? req.body.device_type : ''
+    const userAgentRaw = typeof req.body?.user_agent === 'string' ? req.body.user_agent : ''
+    
+    const deviceName = deviceNameRaw.trim() || 'Unknown Device'
+    const deviceType = deviceTypeRaw.trim() || 'web'
+    const userAgent = userAgentRaw.trim()
+    const deviceId = uuidv4()
+    const now = Date.now()
+    
+    insertDeviceStmt.run(deviceId, req.user.id, deviceName, deviceType, userAgent, now, now, req.ip || '')
+    
+    res.json({ device_id: deviceId, created_at: now })
+  } catch (err) {
+    logError('[DEVICES] register failed', err.message)
+    res.status(500).json({ error: 'register_failed' })
+  }
+})
+
+app.delete('/api/devices/:deviceId', auth, (req, res) => {
+  try {
+    const { deviceId } = req.params
+    const device = selectDeviceByIdStmt.get(deviceId)
+    
+    if (!device) return res.status(404).json({ error: 'device_not_found' })
+    if (device.user_id !== req.user.id) return res.status(403).json({ error: 'forbidden' })
+    
+    // Delete sessions for this device
+    const sessions = selectSessionsByDeviceStmt.all(deviceId)
+    for (const session of sessions) {
+      terminateSessionStmt.run(Date.now(), 'device_deleted', session.id)
+      
+      // Notify the session if it's still connected
+      if (session.socket_id) {
+        io.to(session.socket_id).emit('session:terminated', {
+          sessionId: session.id,
+          reason: 'device_deleted',
+          message: 'This device has been removed from your account',
+        })
+      }
+    }
+    
+    // Delete device
+    deleteDeviceStmt.run(deviceId)
+    
+    // Notify other active sessions about device deletion
+    const otherSessions = selectActiveSessionsByUserStmt.all(req.user.id)
+    for (const otherSession of otherSessions) {
+      if (otherSession.socket_id) {
+        io.to(otherSession.socket_id).emit('devices:updated', {
+          deletedDeviceId: deviceId,
+          action: 'deleted',
+        })
+      }
+    }
+    
+    res.json({ ok: true })
+  } catch (err) {
+    logError('[DEVICES] delete failed', err.message)
+    res.status(500).json({ error: 'delete_failed' })
+  }
+})
+
+app.post('/api/sessions/create', auth, (req, res) => {
+  try {
+    const deviceIdRaw = typeof req.body?.device_id === 'string' ? req.body.device_id : ''
+    const deviceId = deviceIdRaw.trim()
+    
+    if (!deviceId) return res.status(400).json({ error: 'device_id_required' })
+    
+    const device = selectDeviceByIdStmt.get(deviceId)
+    if (!device) return res.status(404).json({ error: 'device_not_found' })
+    if (device.user_id !== req.user.id) return res.status(403).json({ error: 'forbidden' })
+    
+    const sessionId = uuidv4()
+    const now = Date.now()
+    const expiresAt = now + 90 * 24 * 60 * 60 * 1000 // 90 days
+    
+    insertSessionStmt.run(sessionId, deviceId, req.user.id, '', '', now, now, expiresAt)
+    
+    res.json({ session_id: sessionId, created_at: now, expires_at: expiresAt })
+  } catch (err) {
+    logError('[SESSIONS] create failed', err.message)
+    res.status(500).json({ error: 'create_failed' })
+  }
+})
+
+app.post('/api/sessions/:sessionId/terminate', auth, (req, res) => {
+  try {
+    const { sessionId } = req.params
+    const reasonRaw = typeof req.body?.reason === 'string' ? req.body.reason : ''
+    const reason = reasonRaw.trim() || 'user_terminated'
+    
+    const session = selectSessionByIdStmt.get(sessionId)
+    if (!session) return res.status(404).json({ error: 'session_not_found' })
+    if (session.user_id !== req.user.id) return res.status(403).json({ error: 'forbidden' })
+    
+    const now = Date.now()
+    terminateSessionStmt.run(now, reason, sessionId)
+    
+    // Emit real-time update to other sessions of this user
+    const otherSessions = selectActiveSessionsByUserStmt.all(req.user.id)
+    for (const otherSession of otherSessions) {
+      if (otherSession.socket_id) {
+        io.to(otherSession.socket_id).emit('sessions:updated', {
+          sessionId,
+          terminated: true,
+          reason,
+          terminatedAt: now,
+        })
+      }
+    }
+    
+    // If the terminated session is connected, notify it
+    if (session.socket_id) {
+      io.to(session.socket_id).emit('session:terminated', {
+        sessionId,
+        reason,
+        message: reason === 'user_terminated' 
+          ? 'Your session has been terminated from another device'
+          : `Session terminated: ${reason}`,
+      })
+    }
+    
+    res.json({ ok: true })
+  } catch (err) {
+    logError('[SESSIONS] terminate failed', err.message)
+    res.status(500).json({ error: 'terminate_failed' })
+  }
+})
+
+app.delete('/api/sessions/:sessionId', auth, (req, res) => {
+  try {
+    const { sessionId } = req.params
+    
+    const session = selectSessionByIdStmt.get(sessionId)
+    if (!session) return res.status(404).json({ error: 'session_not_found' })
+    if (session.user_id !== req.user.id) return res.status(403).json({ error: 'forbidden' })
+    
+    deleteSessionStmt.run(sessionId)
+    
+    res.json({ ok: true })
+  } catch (err) {
+    logError('[SESSIONS] delete failed', err.message)
+    res.status(500).json({ error: 'delete_failed' })
+  }
+})
+
 app.post('/api/invites/claim', (req, res) => {
   const codeRaw = typeof req.body?.code === 'string' ? req.body.code : ''
   const code = codeRaw.trim().toUpperCase()
@@ -1343,7 +1585,7 @@ app.post('/api/register', (req, res) => {
 })
 
 app.post('/api/login', (req, res) => {
-  const { username, password } = req.body || {}
+  const { username, password, device_name, device_type, user_agent } = req.body || {}
   log('[LOGIN] attempt', username, 'ip=' + req.ip)
   const userRecord = db.prepare('SELECT * FROM users WHERE username=?').get(username)
   if (!userRecord) {
@@ -1358,7 +1600,35 @@ app.post('/api/login', (req, res) => {
   const accessToken = jwt.sign({ id: userRecord.id, username: userRecord.username, role: userRecord.role, avatar_seed: userRecord.avatar_seed || '' }, JWT_SECRET, { expiresIn: '15m' })
   const refreshToken = jwt.sign({ id: userRecord.id, type: 'refresh' }, JWT_SECRET, { expiresIn: '10y' })
   log('[LOGIN] success', username)
-  res.json({ accessToken, refreshToken, user: publicUser(userRecord) })
+  
+  // Optionally create device and session if device info provided
+  let deviceId = null
+  let sessionId = null
+  if (device_name || device_type) {
+    try {
+      const deviceNameVal = String(device_name || 'Unknown Device').slice(0, 255)
+      const deviceTypeVal = String(device_type || 'web').slice(0, 50)
+      const userAgentVal = String(user_agent || '').slice(0, 500)
+      const now = Date.now()
+      
+      deviceId = uuidv4()
+      insertDeviceStmt.run(deviceId, userRecord.id, deviceNameVal, deviceTypeVal, userAgentVal, now, now, req.ip || '')
+      
+      sessionId = uuidv4()
+      const expiresAt = now + 90 * 24 * 60 * 60 * 1000 // 90 days
+      insertSessionStmt.run(sessionId, deviceId, userRecord.id, '', accessToken, now, now, expiresAt)
+      
+      log('[LOGIN] device registered', 'deviceId=' + deviceId, 'sessionId=' + sessionId)
+    } catch (err) {
+      warn('[LOGIN] device registration failed', err.message)
+      // Don't fail login, just continue without device tracking
+    }
+  }
+  
+  const response = { accessToken, refreshToken, user: publicUser(userRecord) }
+  if (deviceId) response.device_id = deviceId
+  if (sessionId) response.session_id = sessionId
+  res.json(response)
 })
 
 app.post('/api/refresh', (req, res) => {
@@ -2593,6 +2863,26 @@ io.on('connection', (socket) => {
   socket.user.username = userRecord.username
   socket.user.role = userRecord.role
   onlineUsers.set(userId, socket.id)
+  
+  // Update session with socket ID when connected
+  try {
+    const socketIdBase64 = Buffer.from(socket.id).toString('base64')
+    db.prepare('UPDATE sessions SET socket_id=?, last_activity_at=? WHERE socket_id OR socket_id IS NULL LIMIT 1').run(socketIdBase64, Date.now())
+  } catch (err) {
+    warn('[SOCKET] update session failed', err.message)
+  }
+  
+  // Notify all sessions of this user about online status
+  const allSessions = selectSessionsByUserStmt.all(userId) || []
+  for (const sess of allSessions) {
+    if (sess.socket_id) {
+      io.to(sess.socket_id).emit('user:online', {
+        userId,
+        onlineUserIds: Array.from(onlineUsers.keys()),
+      })
+    }
+  }
+  
   io.emit('presence:update', { onlineUserIds: Array.from(onlineUsers.keys()) })
   log('[SOCKET] connected', 'user=' + userId, 'socket=' + socket.id)
 
@@ -2939,6 +3229,15 @@ io.on('connection', (socket) => {
         callByUser.delete(userId)
       }
     }
+    
+    // Clear socket_id from sessions when disconnecting
+    try {
+      db.prepare('UPDATE sessions SET socket_id=NULL, last_activity_at=? WHERE socket_id AND socket_id=?')
+        .run(Date.now(), Buffer.from(socket.id).toString('base64'))
+    } catch (err) {
+      warn('[SOCKET] clear session socket_id failed', err.message)
+    }
+    
     onlineUsers.delete(userId)
     const keysToClear = []
     typingState.forEach((_, key) => {
